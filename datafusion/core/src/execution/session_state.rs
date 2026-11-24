@@ -1737,12 +1737,18 @@ impl SessionStateBuilder {
 
         let content = Arc::new(SessionStateInner {
             session_id: session_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            #[cfg(feature = "vllm")]
+            analyzer: analyzer.unwrap_or_else(crate::vllm::analyzer),
+            #[cfg(not(feature = "vllm"))]
             analyzer: analyzer.unwrap_or_default(),
             expr_planners: expr_planners.unwrap_or_default(),
             #[cfg(feature = "sql")]
             relation_planners: relation_planners.unwrap_or_default(),
             #[cfg(feature = "sql")]
             type_planner,
+            #[cfg(feature = "vllm")]
+            optimizer: optimizer.unwrap_or_else(crate::vllm::optimizer),
+            #[cfg(not(feature = "vllm"))]
             optimizer: optimizer.unwrap_or_default(),
             physical_optimizers: physical_optimizers.unwrap_or_default(),
             query_planner: query_planner
