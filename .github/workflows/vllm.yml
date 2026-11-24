@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+name: vLLM
+
+on:
+  pull_request:
+    paths: &vllm-paths
+      - 'datafusion/core/src/vllm/**'
+      - 'datafusion/core/src/execution/session_state.rs'
+      - 'datafusion/core/src/physical_planner.rs'
+      - 'datafusion/core/tests/vllm.rs'
+      - 'datafusion/core/tests/vllm/**'
+      - 'datafusion/core/Cargo.toml'
+      - 'datafusion/expr/src/logical_plan/extension.rs'
+      - 'datafusion/optimizer/src/optimize_projections/**'
+      - 'datafusion/optimizer/src/optimizer.rs'
+      - 'test-utils/**'
+      - '.cargo/config.toml'
+      - '.github/workflows/vllm.yml'
+      - '.github/actions/setup-rustup/**'
+      - '.github/actions/setup-rust-runtime/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  push:
+    paths: *vllm-paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  feature-check:
+    name: vLLM (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - features: default + Parquet
+            flavor: default
+            args: --features vllm
+          - features: minimal
+            flavor: minimal
+            args: --no-default-features --features sql,string_expressions,vllm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rustup
+      - name: Check formatting
+        if: matrix.flavor == 'default'
+        run: cargo fmt --all -- --check
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: vllm-${{ matrix.flavor }}
+      - name: Clippy
+        if: matrix.flavor == 'default'
+        run: cargo clippy --locked -p datafusion --features vllm --all-targets -- -D warnings
+      - name: Run vLLM contracts and differential fuzz smoke
+        run: cargo test --locked -p datafusion ${{ matrix.args }} --test vllm

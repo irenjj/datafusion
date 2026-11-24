@@ -207,6 +207,11 @@ impl UserDefinedLogicalNodeCore for VllmNode {
         Some(vec![required.into_iter().collect()])
     }
 
+    fn bypass_if_unused(&self, required_columns: &[usize]) -> Option<&LogicalPlan> {
+        let output_index = self.input.schema().fields().len();
+        (!required_columns.contains(&output_index)).then_some(&self.input)
+    }
+
     fn supports_limit_pushdown(&self) -> bool {
         true
     }
@@ -298,7 +303,9 @@ impl OptimizerRule for VllmProjectRule {
         };
 
         let mut input = projection.input;
-        let mut extracted = HashMap::new();
+        // Match by expression equality without storing Expr as a map key. The
+        // cache is scoped to the inference calls in this projection.
+        let mut extracted = Vec::new();
         let mut exprs = Vec::with_capacity(projection.expr.len());
         for expr in projection.expr {
             let name = names.save(&expr);
@@ -316,34 +323,49 @@ impl OptimizerRule for VllmProjectRule {
                 let model = literal_string(&model, "model")?.to_owned();
                 let options =
                     canonical_options(literal_string(&options, "options_json")?)?;
-                let key = (prompt, model, options);
-                let output = if let Some(output) = extracted.get(&key) {
-                    output
-                } else {
-                    let output = loop {
-                        let id = self.next_column.fetch_add(1, AtomicOrdering::Relaxed);
-                        let candidate = format!("__vane_vllm_{id}");
-                        if input
-                            .schema()
-                            .fields()
-                            .iter()
-                            .chain(projection.schema.fields())
-                            .all(|field| field.name() != &candidate)
-                        {
-                            break candidate;
-                        }
-                    };
-                    input = Arc::new(LogicalPlan::Extension(Extension {
-                        node: Arc::new(VllmNode::try_new(
-                            input.as_ref().clone(),
-                            key.0.clone(),
-                            key.1.clone(),
-                            key.2.clone(),
-                            output.clone(),
-                        )?),
-                    }));
-                    extracted.entry(key).or_insert(output)
+                let reusable = !prompt.is_volatile();
+                if reusable
+                    && let Some((_, _, _, output)) = extracted.iter().find(
+                        |(prior_prompt, prior_model, prior_options, _)| {
+                            prior_prompt == &prompt
+                                && prior_model == &model
+                                && prior_options == &options
+                        },
+                    )
+                {
+                    return Ok(Transformed::yes(Expr::Column(Column::from_name(output))));
+                }
+
+                let output = loop {
+                    let id = self.next_column.fetch_add(1, AtomicOrdering::Relaxed);
+                    let candidate = format!("__vane_vllm_{id}");
+                    if input
+                        .schema()
+                        .fields()
+                        .iter()
+                        .chain(projection.schema.fields())
+                        .all(|field| field.name() != &candidate)
+                    {
+                        break candidate;
+                    }
                 };
+                if reusable {
+                    extracted.push((
+                        prompt.clone(),
+                        model.clone(),
+                        options.clone(),
+                        output.clone(),
+                    ));
+                }
+                input = Arc::new(LogicalPlan::Extension(Extension {
+                    node: Arc::new(VllmNode::try_new(
+                        input.as_ref().clone(),
+                        prompt,
+                        model,
+                        options,
+                        output.clone(),
+                    )?),
+                }));
                 Ok(Transformed::yes(Expr::Column(Column::from_name(output))))
             })?;
             exprs.push(name.restore(rewritten.data));
