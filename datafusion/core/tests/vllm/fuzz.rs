@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Write;
 use std::future::{Future, ready};
@@ -17,7 +18,7 @@ use rand::prelude::*;
 use test_utils::fuzz::{self, FuzzTest, RunConfig};
 
 use super::harness::{
-    AnswerRow, assert_rows, run, string_array, submitted, test_context,
+    AnswerRow, answer_rows, assert_rows, run, string_array, submitted, test_context,
 };
 
 const PROMPT_COLUMNS: [(&str, DataType); 3] = [
@@ -59,7 +60,7 @@ struct Case {
 impl Case {
     fn generate(rng: &mut SmallRng, nrows: usize) -> Self {
         let order_by_response = rng.random_bool(0.5);
-        Self {
+        let mut case = Self {
             column: rng.random_range(0..PROMPT_COLUMNS.len()),
             min_id: rng
                 .random_bool(0.6)
@@ -68,11 +69,14 @@ impl Case {
             nested: rng.random_bool(0.5),
             filter_response: rng.random_bool(0.5),
             order_by_response,
-            // Sorting by the response makes the input to this limit deterministic.
-            // It also requires inference on every input row even with top-k execution.
-            output_limit: (order_by_response && rng.random_bool(0.6))
-                .then(|| rng.random_range(1..nrows)),
-        }
+            output_limit: None,
+        };
+        // An unordered limit on a response filter may have to infer additional
+        // rows before it finds enough matches.
+        case.output_limit = ((order_by_response || !case.filter_response)
+            && rng.random_bool(0.6))
+        .then(|| rng.random_range(1..nrows));
+        case
     }
 
     fn sql(&self) -> String {
@@ -151,9 +155,9 @@ impl Case {
                     .then_with(|| a.cmp(b))
                     .then_with(|| id_b.cmp(id_a))
             });
-        }
-        if let Some(limit) = self.output_limit {
-            result.truncate(limit);
+            if let Some(limit) = self.output_limit {
+                result.truncate(limit);
+            }
         }
         (result, submitted)
     }
@@ -242,12 +246,35 @@ impl FuzzTest for VllmFuzz {
         ctx.register_table("t", dataset.table.clone())?;
         let (plan, batches) = run(&ctx, &sql).await?;
         let (expected, count) = case.reference(&dataset.rows);
-        assert_rows(&batches, expected, case.order_by_response);
-        assert_eq!(
-            submitted(plan.as_ref()),
-            count,
-            "prompt submissions for {case:?}"
-        );
+        let observed = submitted(plan.as_ref());
+        if let Some(limit) = case.output_limit.filter(|_| !case.order_by_response) {
+            // The selected rows can vary across partitions. Validate the whole
+            // eligible set and charge only the non-NULL rows actually returned.
+            let actual = answer_rows(&batches);
+            let mut eligible = expected.into_iter().collect::<HashMap<_, _>>();
+            assert_eq!(actual.len(), eligible.len().min(limit));
+            for (id, answer) in &actual {
+                assert_eq!(
+                    eligible.remove(id).as_ref(),
+                    Some(answer),
+                    "ineligible row, duplicate id, or incorrect answer for id {id}"
+                );
+            }
+            let calls_per_prompt = if case.nested { 2 } else { 1 };
+            assert!(
+                observed <= limit * calls_per_prompt,
+                "{observed} submissions for {case:?}"
+            );
+            let non_null = actual.iter().filter(|(_, answer)| answer.is_some()).count();
+            assert_eq!(
+                observed,
+                non_null * calls_per_prompt,
+                "prompt submissions for {case:?}"
+            );
+        } else {
+            assert_rows(&batches, expected, case.order_by_response);
+            assert_eq!(observed, count, "prompt submissions for {case:?}");
+        }
         Ok(())
     }
 }

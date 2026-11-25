@@ -61,7 +61,7 @@ struct InFlight<'a> {
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        let mut counts = self.counts.lock().unwrap();
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
         counts.in_flight -= 1;
         counts.cancelled_attempts += usize::from(!self.completed);
     }

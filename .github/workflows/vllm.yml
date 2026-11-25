@@ -9,6 +9,8 @@ on:
     paths: &vllm-paths
       - 'datafusion/core/src/vllm/**'
       - 'datafusion/core/src/execution/session_state.rs'
+      - 'datafusion/core/src/execution/session_state_defaults.rs'
+      - 'datafusion/core/src/lib.rs'
       - 'datafusion/core/src/physical_planner.rs'
       - 'datafusion/core/tests/vllm.rs'
       - 'datafusion/core/tests/vllm/**'
@@ -61,5 +63,12 @@ jobs:
       - name: Clippy
         if: matrix.flavor == 'default'
         run: cargo clippy --locked -p datafusion --features vllm --all-targets -- -D warnings
+      - name: Run projection optimizer unit tests
+        if: matrix.flavor == 'default'
+        run: cargo test --locked -p datafusion-optimizer --lib optimize_projections
+      - name: Run vLLM unit tests
+        if: matrix.flavor == 'default'
+        run: |
+          cargo test --locked -p datafusion ${{ matrix.args }} --lib vllm::
       - name: Run vLLM contracts and differential fuzz smoke
         run: cargo test --locked -p datafusion ${{ matrix.args }} --test vllm

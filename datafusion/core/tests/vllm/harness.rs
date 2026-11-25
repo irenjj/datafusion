@@ -173,12 +173,8 @@ pub(super) fn string_array(data_type: &DataType, values: Vec<Option<&str>>) -> A
 
 pub(super) type AnswerRow = (i64, Option<String>);
 
-pub(super) fn assert_rows(
-    batches: &[RecordBatch],
-    mut expected: Vec<AnswerRow>,
-    ordered: bool,
-) {
-    let ids = batches.iter().flat_map(|batch| {
+pub(super) fn int_values(batches: &[RecordBatch]) -> impl Iterator<Item = i64> + '_ {
+    batches.iter().flat_map(|batch| {
         batch
             .column(0)
             .as_any()
@@ -187,14 +183,25 @@ pub(super) fn assert_rows(
             .values()
             .iter()
             .copied()
-    });
-    let mut actual = ids
+    })
+}
+
+pub(super) fn answer_rows(batches: &[RecordBatch]) -> Vec<AnswerRow> {
+    int_values(batches)
         .zip(
             strings(batches, 1)
                 .into_iter()
                 .map(|answer| answer.map(str::to_owned)),
         )
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+pub(super) fn assert_rows(
+    batches: &[RecordBatch],
+    mut expected: Vec<AnswerRow>,
+    ordered: bool,
+) {
+    let mut actual = answer_rows(batches);
     if !ordered {
         // Sorting the whole vector keeps duplicate rows visible.
         actual.sort_unstable();

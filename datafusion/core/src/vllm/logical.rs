@@ -208,6 +208,8 @@ impl UserDefinedLogicalNodeCore for VllmNode {
     }
 
     fn bypass_if_unused(&self, required_columns: &[usize]) -> Option<&LogicalPlan> {
+        // An unused output skips inference and evaluation of its prompt,
+        // including any volatile subexpressions.
         let output_index = self.input.schema().fields().len();
         (!required_columns.contains(&output_index)).then_some(&self.input)
     }
@@ -323,6 +325,9 @@ impl OptimizerRule for VllmProjectRule {
                 let model = literal_string(&model, "model")?.to_owned();
                 let options =
                     canonical_options(literal_string(&options, "options_json")?)?;
+                // Within one SELECT, identical non-volatile prompts share inference
+                // for the same model and canonical options. If Step 2 needs
+                // independent sampling, add an explicit option to disable reuse.
                 let reusable = !prompt.is_volatile();
                 if reusable
                     && let Some((_, _, _, output)) = extracted.iter().find(

@@ -3,15 +3,16 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::Result;
 use datafusion::common::stats::ColumnStatistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{Result, ScalarValue};
 use datafusion::datasource::MemTable;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{ColumnarValue, LogicalPlan, Volatility, create_udf};
 use datafusion::optimizer::OptimizerContext;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
@@ -24,7 +25,7 @@ use datafusion::prelude::SessionContext;
 
 use super::harness::{
     assert_below, assert_plan_error, assert_rows, context, exec_nodes, explain,
-    register_text, run, strings, submitted, test_context,
+    int_values, register_text, run, strings, submitted, test_context,
 };
 
 fn register_wide(ctx: &SessionContext) -> Result<()> {
@@ -407,29 +408,29 @@ async fn invalid_configuration_fails_in_planning() -> Result<()> {
     Ok(())
 }
 
+fn register_seq(ctx: &SessionContext) -> Arc<AtomicUsize> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seq = Arc::clone(&calls);
+    ctx.register_udf(create_udf(
+        "seq",
+        vec![],
+        DataType::Utf8,
+        Volatility::Volatile,
+        Arc::new(move |_| {
+            let n = seq.fetch_add(1, Ordering::Relaxed);
+            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                n.to_string(),
+            ))))
+        }),
+    ));
+    calls
+}
+
 #[tokio::test]
 async fn volatile_prompt_occurrences_are_evaluated_independently() -> Result<()> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use datafusion::common::ScalarValue;
-    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
-
     for (prompt, prefix) in [("seq()", ""), ("concat('p:', seq())", "p:")] {
         let ctx = context()?;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let seq = Arc::clone(&calls);
-        ctx.register_udf(create_udf(
-            "seq",
-            vec![],
-            DataType::Utf8,
-            Volatility::Volatile,
-            Arc::new(move |_| {
-                let n = seq.fetch_add(1, Ordering::Relaxed);
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-                    n.to_string(),
-                ))))
-            }),
-        ));
+        let calls = register_seq(&ctx);
 
         let (plan, batches) = run(
             &ctx,
@@ -451,34 +452,43 @@ async fn volatile_prompt_occurrences_are_evaluated_independently() -> Result<()>
 #[tokio::test]
 async fn unused_inference_is_pruned_with_its_prompt_dependencies() -> Result<()> {
     let ctx = context()?;
-    for sql in [
-        "SELECT id FROM (SELECT id, vllm(text, 'm', '{}') AS r FROM t) q",
-        "SELECT id FROM (SELECT id, vllm(vllm(text, 'm1', '{}'), 'm2', '{}') AS r FROM t) q WHERE id > 0",
+    let calls = register_seq(&ctx);
+    let ids = [1, 11, 12, 13];
+    for (sql, expected_plan, expected_rows) in [
+        (
+            "SELECT id FROM (SELECT id, vllm(text, 'm', '{}') AS r FROM t) q",
+            "projection=[id]",
+            ids.as_slice(),
+        ),
+        (
+            "SELECT id FROM (SELECT id, vllm(vllm(text, 'm1', '{}'), 'm2', '{}') AS r FROM t) q WHERE id > 0",
+            "projection=[id]",
+            ids.as_slice(),
+        ),
+        (
+            "SELECT COUNT(*) FROM (SELECT id, vllm(text, 'm', '{}') AS r FROM t) q",
+            "Aggregate:",
+            &[4],
+        ),
+        (
+            "SELECT id FROM (SELECT id, vllm(concat('p:', seq()), 'm', '{}') AS r FROM t) q",
+            "projection=[id]",
+            ids.as_slice(),
+        ),
     ] {
         let (logical, physical) = explain(&ctx, sql, "Unused inference").await?;
         assert!(!logical.contains("VllmProject:"), "{logical}");
         assert!(!physical.contains("VllmExec:"), "{physical}");
-        assert!(logical.contains("projection=[id]"), "{logical}");
+        assert!(logical.contains(expected_plan), "{logical}");
 
         let (plan, batches) = run(&ctx, sql).await?;
         assert!(exec_nodes(plan.as_ref()).is_empty());
         assert_eq!(submitted(plan.as_ref()), 0);
-        let mut ids = batches
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .values()
-                    .iter()
-                    .copied()
-            })
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        assert_eq!(ids, [1, 11, 12, 13]);
+        let mut rows = int_values(&batches).collect::<Vec<_>>();
+        rows.sort_unstable();
+        assert_eq!(rows, expected_rows);
     }
+    assert_eq!(calls.load(Ordering::Relaxed), 0, "unused volatile prompt");
     Ok(())
 }
 
