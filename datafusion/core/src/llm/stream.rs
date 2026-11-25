@@ -25,6 +25,9 @@ use super::{
     CancellationToken, LlmBackendError, LlmOptions, LlmRequest, LlmResponse, OnError,
 };
 
+// Bound time spent holding concurrency slots at the provider's request.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 #[derive(Debug)]
 pub(super) struct Dispatch {
     pub(super) model: String,
@@ -140,7 +143,7 @@ impl Dispatch {
             };
             let retry_after = match &error {
                 LlmBackendError::RateLimited { retry_after, .. } => {
-                    retry_after.unwrap_or(delay)
+                    retry_after.unwrap_or(delay).min(MAX_RETRY_AFTER)
                 }
                 LlmBackendError::Transient { .. } => delay,
                 _ => return Err(error),

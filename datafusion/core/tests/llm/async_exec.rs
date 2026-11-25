@@ -49,9 +49,9 @@ fn register_script(
     Ok((registry, probe))
 }
 
-fn rate_limited() -> LlmBackendError {
+fn rate_limited(seconds: u64) -> LlmBackendError {
     LlmBackendError::RateLimited {
-        retry_after: Some(Duration::from_secs(8)),
+        retry_after: Some(Duration::from_secs(seconds)),
         message: "try again".into(),
     }
 }
@@ -217,7 +217,7 @@ async fn drop_during_retry_backoff_releases_both_limits() -> Result<()> {
         .next_attempt()
         .await
         .reply
-        .send(Err(rate_limited()))
+        .send(Err(rate_limited(8)))
         .unwrap();
     wait_for(|| probe.counts().in_flight == 0).await;
     assert_eq!(registry.available_permits("script"), Some(0));
@@ -281,7 +281,7 @@ async fn retry_after_preserves_permits_and_counts_attempts_and_usage() -> Result
         .next_attempt()
         .await
         .reply
-        .send(Err(rate_limited()))
+        .send(Err(rate_limited(8)))
         .unwrap();
     wait_for(|| probe.counts().in_flight == 0).await;
 
@@ -312,6 +312,38 @@ async fn retry_after_preserves_permits_and_counts_attempts_and_usage() -> Result
     ] {
         assert_eq!(metric(plan.as_ref(), name), expected, "{name}");
     }
+    assert_eq!(registry.available_permits("script"), Some(1));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn long_retry_after_is_capped_at_sixty_seconds() -> Result<()> {
+    let ctx = test_context(8, 1);
+    let (registry, mut probe) = register_script(&ctx, 1)?;
+    let plan = plan(&ctx, r#"SELECT llm('one', 'm', '{"provider":"script"}')"#).await?;
+    let mut stream = execute_stream(Arc::clone(&plan), ctx.task_ctx())?;
+    assert!(poll!(stream.next()).is_pending());
+    probe
+        .next_attempt()
+        .await
+        .reply
+        .send(Err(rate_limited(3600)))
+        .unwrap();
+    wait_for(|| probe.counts().in_flight == 0).await;
+
+    tokio::time::advance(Duration::from_secs(59)).await;
+    tokio::task::yield_now().await;
+    probe.assert_no_new_attempt();
+    assert_eq!(registry.available_permits("script"), Some(0));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let retry = tokio::time::timeout(Duration::from_millis(10), probe.next_attempt())
+        .await
+        .expect("retry should start at the 60-second cap");
+    retry.succeed("answer:", None);
+    let batches = stream.try_collect::<Vec<_>>().await?;
+    assert_eq!(strings(&batches, 0), [Some("answer:one")]);
+    assert_eq!(metric(plan.as_ref(), "backend_attempts"), 2);
+    assert_eq!(metric(plan.as_ref(), "retries"), 1);
     assert_eq!(registry.available_permits("script"), Some(1));
     Ok(())
 }

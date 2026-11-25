@@ -26,13 +26,21 @@ struct Capture {
 }
 
 enum Reply {
-    Status(&'static str, &'static str, &'static str),
+    Status(&'static str, &'static str, String),
     Hang,
 }
 
 impl Reply {
+    fn status(
+        status: &'static str,
+        headers: &'static str,
+        body: impl Into<String>,
+    ) -> Self {
+        Self::Status(status, headers, body.into())
+    }
+
     fn success() -> Self {
-        Self::Status("200 OK", "", SUCCESS)
+        Self::status("200 OK", "", SUCCESS)
     }
 }
 
@@ -167,7 +175,7 @@ async fn chat_request_and_token_usage() -> Result<()> {
 #[tokio::test]
 async fn rate_limited_http_request_retries() -> Result<()> {
     let server = MockServer::start(vec![
-        Reply::Status("429 Too Many Requests", "Retry-After: 0\r\n", "{}"),
+        Reply::status("429 Too Many Requests", "Retry-After: 0\r\n", "{}"),
         Reply::success(),
     ])
     .await?;
@@ -186,8 +194,8 @@ async fn rate_limited_http_request_retries() -> Result<()> {
 #[tokio::test]
 async fn server_errors_exhaust_retries_and_return_null() -> Result<()> {
     let server = MockServer::start(vec![
-        Reply::Status("500 Internal Server Error", "", "{}"),
-        Reply::Status("500 Internal Server Error", "", "{}"),
+        Reply::status("500 Internal Server Error", "", "{}"),
+        Reply::status("500 Internal Server Error", "", "{}"),
     ])
     .await?;
     let ctx = server.context(None)?;
@@ -201,13 +209,48 @@ async fn server_errors_exhaust_retries_and_return_null() -> Result<()> {
 
 #[tokio::test]
 async fn bad_request_is_permanent_and_hides_response_body() -> Result<()> {
-    let server = MockServer::start(vec![Reply::Status(
+    let oversized = format!(
+        r#"{{"padding":"{}","error":{{"message":"private-server-body"}}}}"#,
+        "x".repeat(8 * 1024)
+    );
+    for body in ["private-server-body".to_owned(), oversized] {
+        let server =
+            MockServer::start(vec![Reply::status("400 Bad Request", "", body)]).await?;
+        let ctx = server.context(None)?;
+        let plan = ctx
+            .sql(r#"SELECT llm('question', 'm', '{"provider":"http","max_retries":2}')"#)
+            .await?
+            .create_physical_plan()
+            .await?;
+        let error = collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.find_root(),
+            DataFusionError::Execution(message)
+                if message == "llm backend failed: HTTP 400: chat completions request rejected"
+        ));
+        assert_attempts(plan.as_ref(), 1);
+        assert_eq!(server.captures().await.len(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn bad_request_reports_sanitized_bounded_reason_without_echoed_credentials()
+-> Result<()> {
+    let key = "runtime-test-key";
+    let reason = format!(
+        "model 'bad' not found\n\r\tcredential: Bearer {key}\u{0}\u{202e} {} should be truncated",
+        "界".repeat(200)
+    );
+    let server = MockServer::start(vec![Reply::status(
         "400 Bad Request",
         "",
-        "private-server-body",
+        json!({"error": {"message": reason}}).to_string(),
     )])
     .await?;
-    let ctx = server.context(None)?;
+    let ctx = server.context(Some(key))?;
     let plan = ctx
         .sql(r#"SELECT llm('question', 'm', '{"provider":"http","max_retries":2}')"#)
         .await?
@@ -215,10 +258,19 @@ async fn bad_request_is_permanent_and_hides_response_body() -> Result<()> {
         .await?;
     let error = collect(Arc::clone(&plan), ctx.task_ctx())
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("HTTP 400"), "{error}");
-    assert!(!error.contains("private-server-body"), "{error}");
+        .unwrap_err();
+    let DataFusionError::Execution(message) = error.find_root() else {
+        panic!("expected execution error");
+    };
+    let detail = message
+        .strip_prefix("llm backend failed: HTTP 400: chat completions request rejected: ")
+        .expect("expected the server reason in the error");
+    let suffix = detail
+        .strip_prefix("model 'bad' not found credential: Bearer [REDACTED] ")
+        .expect("expected a single line with the key redacted");
+    assert!((254..=256).contains(&detail.len()));
+    assert!(suffix.chars().all(|ch| ch == '界'));
+    assert!(!message.contains(key));
     assert_attempts(plan.as_ref(), 1);
     assert_eq!(server.captures().await.len(), 1);
     Ok(())

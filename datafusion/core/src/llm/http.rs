@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderValue, RETRY_AFTER};
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -167,27 +167,8 @@ impl OpenAiHttpBackend {
         }
         let response = http.send().await.map_err(|error| transport_error(&error))?;
         let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(LlmBackendError::RateLimited {
-                retry_after: response
-                    .headers()
-                    .get(RETRY_AFTER)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| retry_after(value, SystemTime::now())),
-                message: "HTTP 429".into(),
-            });
-        }
-        if status == StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
-            return Err(LlmBackendError::Transient {
-                status: Some(status.as_u16()),
-                message: "chat completions request failed".into(),
-            });
-        }
         if !status.is_success() {
-            return Err(permanent(
-                Some(status.as_u16()),
-                "chat completions request rejected",
-            ));
+            return Err(response_error(response, self.authorization.as_ref()).await);
         }
 
         let bytes = response
@@ -256,6 +237,107 @@ fn sensitive_query_key(key: &str) -> bool {
         || key.contains("signature")
         || key.contains("credential")
         || matches!(key.as_str(), "key" | "authorization" | "auth" | "sig")
+}
+
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+const MAX_ERROR_DETAIL_BYTES: usize = 256;
+
+async fn response_error(
+    response: Response,
+    authorization: Option<&HeaderValue>,
+) -> LlmBackendError {
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| retry_after(value, SystemTime::now()));
+    let transient = status == StatusCode::REQUEST_TIMEOUT || status.is_server_error();
+    let fallback = if status == StatusCode::TOO_MANY_REQUESTS {
+        "HTTP 429"
+    } else if transient {
+        "chat completions request failed"
+    } else {
+        "chat completions request rejected"
+    };
+    // Diagnostics are best-effort. A stalled error body should not delay
+    // classification indefinitely after the status and headers have arrived.
+    let detail = tokio::time::timeout(
+        Duration::from_millis(250),
+        read_error_detail(response, authorization),
+    )
+    .await
+    .ok()
+    .flatten();
+    let message = match detail {
+        Some(detail) => format!("{fallback}: {detail}"),
+        None => fallback.into(),
+    };
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        LlmBackendError::RateLimited {
+            retry_after,
+            message,
+        }
+    } else if transient {
+        LlmBackendError::Transient {
+            status: Some(status.as_u16()),
+            message,
+        }
+    } else {
+        LlmBackendError::Permanent {
+            status: Some(status.as_u16()),
+            message,
+        }
+    }
+}
+
+async fn read_error_detail(
+    mut response: Response,
+    authorization: Option<&HeaderValue>,
+) -> Option<String> {
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_BODY_BYTES {
+        let Some(chunk) = response.chunk().await.ok()? else {
+            break;
+        };
+        let available = MAX_ERROR_BODY_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(available)]);
+    }
+    let body: Value = serde_json::from_slice(&body).ok()?;
+    let message = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())?;
+
+    let mut detail = single_line(message);
+    if let Some(authorization) = authorization {
+        let key = std::str::from_utf8(authorization.as_bytes())
+            .ok()?
+            .strip_prefix("Bearer ")?;
+        let normalized_key = single_line(key);
+        if normalized_key.is_empty() {
+            return None;
+        }
+        // JSON decoding and whitespace normalization can expose an echoed key
+        // even when the wire representation escapes it.
+        detail = detail.replace(&normalized_key, "[REDACTED]");
+        if detail.contains(key) || detail.contains(&normalized_key) {
+            return None;
+        }
+    }
+    detail.truncate(detail.floor_char_boundary(MAX_ERROR_DETAIL_BYTES));
+    let detail = detail.trim_end();
+    (!detail.is_empty()).then(|| detail.to_owned())
+}
+
+fn single_line(value: &str) -> String {
+    value
+        .split(|ch: char| {
+            ch.is_control() || ch.is_whitespace()
+                || matches!(ch, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn retry_after(value: &str, now: SystemTime) -> Option<Duration> {
