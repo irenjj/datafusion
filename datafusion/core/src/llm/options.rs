@@ -8,7 +8,8 @@ use crate::common::{DataFusionError, Result};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
-pub(crate) fn canonical_options(options: &str) -> Result<String> {
+/// Canonicalize LLM options and reject credential keys.
+pub fn canonical_options(options: &str) -> Result<String> {
     let Options(mut value) = serde_json::from_str(options).map_err(|error| {
         DataFusionError::Plan(format!("invalid llm() options_json: {error}"))
     })?;

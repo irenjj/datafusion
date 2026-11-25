@@ -400,6 +400,37 @@ impl ParquetSource {
         &self.table_parquet_options
     }
 
+    /// Clone scan configuration and the reader factory, with independent counters.
+    ///
+    /// # Public Only for Internal Use
+    ///
+    /// This API is for internal use only. See [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn with_fresh_metrics(&self) -> Self {
+        Self {
+            metrics: ExecutionPlanMetricsSet::new(),
+            ..self.clone()
+        }
+    }
+
+    /// Whether encryption configuration or a runtime encryption factory is present.
+    ///
+    /// # Public Only for Internal Use
+    ///
+    /// This API is for internal use only. See [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn uses_encryption(&self) -> bool {
+        #[cfg(feature = "parquet_encryption")]
+        if self.encryption_factory.is_some() {
+            return true;
+        }
+        self.table_parquet_options.crypto != Default::default()
+    }
+
     /// return the optional file reader factory
     pub fn parquet_file_reader_factory(
         &self,

@@ -14,6 +14,7 @@ use crate::is_spark_path;
 use crate::memory_drift::rewrap_replaced_pool;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::common::collect;
 use datafusion::physical_plan::execute_stream;
 use datafusion::prelude::SessionContext;
@@ -194,6 +195,8 @@ async fn run_query(
     sql: impl Into<String>,
 ) -> Result<DFOutput> {
     let df = ctx.sql(sql.into().as_str()).await?;
+    let verbose_explain =
+        matches!(df.logical_plan(), LogicalPlan::Explain(explain) if explain.verbose);
     let task_ctx = Arc::new(df.task_ctx());
     let plan = df.create_physical_plan().await?;
     let schema = plan.schema();
@@ -201,7 +204,22 @@ async fn run_query(
     let stream = execute_stream(plan, task_ctx)?;
     let types = normalize::convert_schema_to_types(stream.schema().fields());
     let results: Vec<RecordBatch> = collect(stream).await?;
-    let rows = normalize::convert_batches(&schema, results, is_spark_path)?;
+    let mut rows = normalize::convert_batches(&schema, results, is_spark_path)?;
+    if verbose_explain {
+        // Feature unification can add LLM rules to the workspace test build.
+        // Keep shared snapshots stable when those rules leave the plan unchanged.
+        rows.retain(|row| {
+            !matches!(
+                row.as_slice(),
+                [stage, plan] if plan == "SAME TEXT AS ABOVE"
+                    && matches!(
+                        stage.as_str(),
+                        "logical_plan after validate_llm_usage"
+                            | "logical_plan after extract_llm_project"
+                    )
+            )
+        });
+    }
 
     if rows.is_empty() && types.is_empty() {
         Ok(DBOutput::StatementComplete(0))

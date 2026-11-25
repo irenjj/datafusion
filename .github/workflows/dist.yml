@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+name: Distributed Map-Only
+
+on:
+  pull_request:
+    paths: &dist-paths
+      - 'datafusion/dist/**'
+      - 'datafusion/core/src/llm/**'
+      - 'datafusion/core/src/execution/session_state.rs'
+      - 'datafusion/core/src/lib.rs'
+      - 'datafusion/core/Cargo.toml'
+      - 'datafusion/datasource/**'
+      - 'datafusion/datasource-parquet/**'
+      - 'datafusion/proto/**'
+      - 'datafusion/proto-common/**'
+      - 'datafusion/proto-models/**'
+      - 'test-utils/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/config.toml'
+      - '.github/actions/setup-rustup/**'
+      - '.github/workflows/dist.yml'
+  push:
+    paths: *dist-paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dist-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rustup
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: dist
+      - name: Clippy
+        run: cargo clippy --locked -p datafusion-dist --all-targets -- -D warnings
+      - name: Run distribution contracts and differential fuzz smoke
+        run: cargo test --locked -p datafusion-dist
+      - name: Run LLM unit tests
+        run: |
+          cargo test --locked -p datafusion --features llm --lib llm::

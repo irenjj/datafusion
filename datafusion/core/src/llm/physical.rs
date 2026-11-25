@@ -5,7 +5,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::arrow::array::{Array, StringArray, StringBuilder};
+use crate::arrow::array::{
+    Array, LargeStringArray, StringArray, StringBuilder, StringViewArray,
+};
 use crate::arrow::datatypes::{FieldRef, Schema, SchemaRef};
 use crate::arrow::record_batch::RecordBatch;
 use crate::common::stats::{ColumnStatistics, Precision};
@@ -60,8 +62,9 @@ pub(crate) fn plan_llm(
     ))))
 }
 
+/// Append the result of inference for each non-null prompt.
 #[derive(Debug)]
-struct LlmExec {
+pub struct LlmExec {
     input: Arc<dyn ExecutionPlan>,
     prompt: Arc<dyn PhysicalExpr>,
     model: String,
@@ -72,7 +75,8 @@ struct LlmExec {
 }
 
 impl LlmExec {
-    fn new(
+    /// Construct the operator with a prompt bound to the input schema and validated configuration.
+    pub fn new(
         input: Arc<dyn ExecutionPlan>,
         prompt: Arc<dyn PhysicalExpr>,
         model: String,
@@ -106,6 +110,26 @@ impl LlmExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// The bound prompt expression.
+    pub fn prompt(&self) -> &Arc<dyn PhysicalExpr> {
+        &self.prompt
+    }
+
+    /// The inference model identifier.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The inference options as JSON.
+    pub fn options_json(&self) -> &str {
+        &self.options_json
+    }
+
+    /// The appended column's name.
+    pub fn output_col(&self) -> &str {
+        &self.output_col
     }
 }
 
@@ -227,21 +251,33 @@ impl ExecutionPlan for LlmExec {
         let stream = input.map(move |batch| {
             let batch = batch?;
             let values = prompt.evaluate(&batch)?.into_array(batch.num_rows())?;
-            let Some(prompts) = values.as_any().downcast_ref::<StringArray>() else {
+            let mut responses = StringBuilder::new();
+            let mut append_prompts = |prompts: &mut dyn Iterator<Item = Option<&str>>| {
+                for value in prompts {
+                    match value {
+                        Some(value) => {
+                            submitted.add(1);
+                            responses.append_value(mock_infer(&model, value));
+                        }
+                        None => responses.append_null(),
+                    }
+                }
+            };
+            if let Some(prompts) = values.as_any().downcast_ref::<StringArray>() {
+                append_prompts(&mut prompts.iter());
+            } else if let Some(prompts) =
+                values.as_any().downcast_ref::<StringViewArray>()
+            {
+                append_prompts(&mut prompts.iter());
+            } else if let Some(prompts) =
+                values.as_any().downcast_ref::<LargeStringArray>()
+            {
+                append_prompts(&mut prompts.iter());
+            } else {
                 return internal_err!(
                     "LlmExec expected Utf8 prompts, got {}",
                     values.data_type()
                 );
-            };
-            let mut responses = StringBuilder::new();
-            for value in prompts.iter() {
-                match value {
-                    Some(value) => {
-                        submitted.add(1);
-                        responses.append_value(mock_infer(&model, value));
-                    }
-                    None => responses.append_null(),
-                }
             }
             let mut columns = batch.columns().to_vec();
             columns.push(Arc::new(responses.finish()));
@@ -308,4 +344,76 @@ fn unique_field_index(
         .filter(|(_, field)| predicate(field));
     let (index, _) = matches.next()?;
     matches.next().is_none().then_some(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::arrow::array::{ArrayRef, Int64Array};
+    use crate::arrow::datatypes::{DataType, Field};
+    use crate::physical_plan::collect;
+    use crate::prelude::SessionContext;
+    use datafusion_datasource::memory::MemorySourceConfig;
+
+    #[tokio::test]
+    async fn accepts_each_string_array_and_rejects_non_strings() -> Result<()> {
+        let ctx = SessionContext::new();
+        let prompts = vec![Some("prompt"), None, Some("prompt")];
+        let expected = StringArray::from(vec![
+            Some("mock[m]: prompt"),
+            None,
+            Some("mock[m]: prompt"),
+        ]);
+        let inputs: [ArrayRef; 4] = [
+            Arc::new(StringArray::from(prompts.clone())),
+            Arc::new(StringViewArray::from(prompts.clone())),
+            Arc::new(LargeStringArray::from(prompts)),
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+        ];
+        for values in inputs {
+            let data_type = values.data_type().clone();
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "prompt",
+                data_type.clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values])?;
+            let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)?;
+            let exec = Arc::new(LlmExec::new(
+                input,
+                Arc::new(Column::new("prompt", 0)),
+                "m".into(),
+                "{}".into(),
+                "response".into(),
+            ));
+            let result = collect(exec.clone(), ctx.task_ctx()).await;
+            if data_type == DataType::Int64 {
+                let error = result.unwrap_err();
+                assert!(matches!(
+                    error.find_root(),
+                    crate::common::DataFusionError::Internal(_)
+                ));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("expected Utf8 prompts, got Int64"),
+                    "{error}"
+                );
+            } else {
+                let batches = result?;
+                assert_eq!(batches.len(), 1);
+                assert_eq!(batches[0].column(1).as_ref(), &expected);
+                assert_eq!(
+                    exec.metrics()
+                        .unwrap()
+                        .sum_by_name("submitted_prompts")
+                        .unwrap()
+                        .as_usize(),
+                    2
+                );
+            }
+        }
+        Ok(())
+    }
 }

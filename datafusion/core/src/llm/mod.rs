@@ -3,6 +3,12 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 //! Native SQL planning and mock execution for the opt-in `llm` feature.
+//!
+//! # Public Only for Internal Use
+//!
+//! This API is for internal use only. See [API policy] for details.
+//!
+//! [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
 
 mod logical;
 mod options;
@@ -14,6 +20,8 @@ use datafusion_expr::ScalarUDF;
 use datafusion_optimizer::simplify_expressions::SimplifyExpressions;
 use datafusion_optimizer::{Analyzer, Optimizer, OptimizerRule};
 
+pub use options::canonical_options;
+pub use physical::LlmExec;
 pub(crate) use physical::plan_llm;
 
 pub(crate) fn marker_udf() -> Arc<ScalarUDF> {

@@ -2590,7 +2590,6 @@ mod tests {
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::Expr;
     use datafusion_expr::HigherOrderUDF;
-    use datafusion_optimizer::Optimizer;
     use datafusion_optimizer::optimizer::OptimizerRule;
     use datafusion_physical_plan::display::DisplayableExecutionPlan;
     use datafusion_session::Session;
@@ -2759,15 +2758,13 @@ mod tests {
 
         assert_eq!(state.optimizers().len(), 1);
 
-        // test adding rules to default recommendations
+        // test adding rules to the session's feature-specific defaults
+        let defaults = SessionStateBuilder::new().build();
         let state = SessionStateBuilder::new()
             .with_optimizer_rule(Arc::new(DummyRule {}))
             .build();
 
-        assert_eq!(
-            state.optimizers().len(),
-            Optimizer::default().rules.len() + 1
-        );
+        assert_eq!(state.optimizers().len(), defaults.optimizers().len() + 1);
     }
 
     #[test]
