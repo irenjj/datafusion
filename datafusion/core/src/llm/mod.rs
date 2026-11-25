@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-//! Native SQL planning and mock execution for the opt-in `vllm` feature.
+//! Native SQL planning and mock execution for the opt-in `llm` feature.
 
 mod logical;
 mod options;
@@ -14,15 +14,15 @@ use datafusion_expr::ScalarUDF;
 use datafusion_optimizer::simplify_expressions::SimplifyExpressions;
 use datafusion_optimizer::{Analyzer, Optimizer, OptimizerRule};
 
-pub(crate) use physical::plan_vllm;
+pub(crate) use physical::plan_llm;
 
 pub(crate) fn marker_udf() -> Arc<ScalarUDF> {
-    Arc::new(ScalarUDF::from(logical::VllmMarkerUdf::default()))
+    Arc::new(ScalarUDF::from(logical::LlmMarkerUdf::default()))
 }
 
 pub(crate) fn analyzer() -> Analyzer {
     let mut analyzer = Analyzer::new();
-    analyzer.rules.push(Arc::new(logical::ValidateVllm));
+    analyzer.rules.push(Arc::new(logical::ValidateLlm));
     analyzer
 }
 
@@ -35,6 +35,6 @@ pub(crate) fn optimizer() -> Optimizer {
         .expect("Default optimizer includes SimplifyExpressions");
     optimizer
         .rules
-        .insert(simplify + 1, Arc::new(logical::VllmProjectRule::default()));
+        .insert(simplify + 1, Arc::new(logical::LlmProjectRule::default()));
     optimizer
 }

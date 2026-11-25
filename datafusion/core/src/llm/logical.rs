@@ -24,11 +24,11 @@ use crate::logical_expr::{
 use crate::optimizer::{AnalyzerRule, ApplyOrder, OptimizerConfig, OptimizerRule};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub(super) struct VllmMarkerUdf {
+pub(super) struct LlmMarkerUdf {
     signature: Signature,
 }
 
-impl Default for VllmMarkerUdf {
+impl Default for LlmMarkerUdf {
     fn default() -> Self {
         Self {
             signature: Signature::exact(vec![DataType::Utf8; 3], Volatility::Volatile),
@@ -36,9 +36,9 @@ impl Default for VllmMarkerUdf {
     }
 }
 
-impl ScalarUDFImpl for VllmMarkerUdf {
+impl ScalarUDFImpl for LlmMarkerUdf {
     fn name(&self) -> &str {
-        "vllm"
+        "llm"
     }
 
     fn signature(&self) -> &Signature {
@@ -57,12 +57,12 @@ impl ScalarUDFImpl for VllmMarkerUdf {
             // None means any non-literal, including concat of string literals. The analyzer
             // detects column dependencies and the extraction rule checks the folded result.
         }
-        Ok(vllm_field(self.name()))
+        Ok(llm_field(self.name()))
     }
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         internal_err!(
-            "vllm() can only be used in a projection and must be planned as a VllmNode operator"
+            "llm() can only be used in a projection and must be planned as a LlmNode operator"
         )
     }
 }
@@ -73,17 +73,17 @@ fn required_string<'a>(value: &'a ScalarValue, name: &str) -> Result<&'a str> {
     match value {
         ScalarValue::Utf8(Some(value)) if !value.trim().is_empty() => Ok(value),
         _ => {
-            plan_err!("vllm() {name} must be a non-empty, non-NULL constant Utf8 string")
+            plan_err!("llm() {name} must be a non-empty, non-NULL constant Utf8 string")
         }
     }
 }
 
-pub(super) fn vllm_field(name: &str) -> FieldRef {
+pub(super) fn llm_field(name: &str) -> FieldRef {
     Arc::new(Field::new(name, DataType::Utf8, true))
 }
 
 #[derive(Debug, Eq, PartialEq, Hash)]
-pub(super) struct VllmNode {
+pub(super) struct LlmNode {
     pub(super) input: LogicalPlan,
     pub(super) prompt_expr: Expr,
     pub(super) model: String,
@@ -92,7 +92,7 @@ pub(super) struct VllmNode {
     schema: DFSchemaRef,
 }
 
-impl PartialOrd for VllmNode {
+impl PartialOrd for LlmNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         (
             &self.input,
@@ -112,7 +112,7 @@ impl PartialOrd for VllmNode {
     }
 }
 
-impl VllmNode {
+impl LlmNode {
     fn try_new(
         input: LogicalPlan,
         prompt_expr: Expr,
@@ -122,7 +122,7 @@ impl VllmNode {
     ) -> Result<Self> {
         let input_schema = input.schema();
         let output_schema = DFSchema::from_unqualified_fields(
-            vec![vllm_field(&output_col)].into(),
+            vec![llm_field(&output_col)].into(),
             HashMap::new(),
         )?;
         let schema = input_schema
@@ -141,9 +141,9 @@ impl VllmNode {
     }
 }
 
-impl UserDefinedLogicalNodeCore for VllmNode {
+impl UserDefinedLogicalNodeCore for LlmNode {
     fn name(&self) -> &str {
-        "VllmProject"
+        "LlmProject"
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
@@ -161,7 +161,7 @@ impl UserDefinedLogicalNodeCore for VllmNode {
     fn fmt_for_explain(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "VllmProject: model={}, output={}",
+            "LlmProject: model={}, output={}",
             self.model, self.output_col
         )
     }
@@ -175,7 +175,7 @@ impl UserDefinedLogicalNodeCore for VllmNode {
             (exprs.try_into(), inputs.try_into())
         else {
             return internal_err!(
-                "VllmProject requires one prompt expression and one input"
+                "LlmProject requires one prompt expression and one input"
             );
         };
         Self::try_new(
@@ -221,7 +221,7 @@ impl UserDefinedLogicalNodeCore for VllmNode {
 
 fn marker(expr: &Expr) -> Option<&ScalarFunction> {
     match expr {
-        Expr::ScalarFunction(call) if call.func.inner().is::<VllmMarkerUdf>() => {
+        Expr::ScalarFunction(call) if call.func.inner().is::<LlmMarkerUdf>() => {
             Some(call)
         }
         _ => None,
@@ -235,19 +235,19 @@ fn validate_usage(plan: &LogicalPlan) -> Result<bool> {
         root.apply(|expr| {
             if expr.short_circuits() {
                 if expr.exists(|child| Ok(marker(child).is_some()))? {
-                    return plan_err!("vllm() is not supported inside CASE, AND/OR, or COALESCE short-circuit expressions");
+                    return plan_err!("llm() is not supported inside CASE, AND/OR, or COALESCE short-circuit expressions");
                 }
                 return Ok(TreeNodeRecursion::Jump);
             }
             if let Some(call) = marker(expr) {
                 if !projection {
-                    return plan_err!("vllm() can only be used in a projection");
+                    return plan_err!("llm() can only be used in a projection");
                 }
                 for (index, name) in CONFIG_ARGS {
                     if call.args.get(index).is_some_and(|arg| {
                         arg.any_column_refs() || arg.contains_outer() || arg.is_volatile()
                     }) {
-                        return plan_err!("vllm() {name} must be a non-empty, non-NULL constant Utf8 string");
+                        return plan_err!("llm() {name} must be a non-empty, non-NULL constant Utf8 string");
                     }
                 }
                 found = true;
@@ -261,11 +261,11 @@ fn validate_usage(plan: &LogicalPlan) -> Result<bool> {
 // Validate before simplification can erase a dead CASE/AND/OR branch or fold away
 // other evidence of an unsupported context. Extraction still runs after folding.
 #[derive(Debug)]
-pub(super) struct ValidateVllm;
+pub(super) struct ValidateLlm;
 
-impl AnalyzerRule for ValidateVllm {
+impl AnalyzerRule for ValidateLlm {
     fn name(&self) -> &str {
-        "validate_vllm_usage"
+        "validate_llm_usage"
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
@@ -278,13 +278,13 @@ impl AnalyzerRule for ValidateVllm {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct VllmProjectRule {
+pub(super) struct LlmProjectRule {
     next_column: AtomicU64,
 }
 
-impl OptimizerRule for VllmProjectRule {
+impl OptimizerRule for LlmProjectRule {
     fn name(&self) -> &str {
-        "extract_vllm_project"
+        "extract_llm_project"
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {
@@ -301,7 +301,7 @@ impl OptimizerRule for VllmProjectRule {
         }
         let names = NamePreserver::new_for_projection();
         let LogicalPlan::Projection(projection) = plan else {
-            return internal_err!("Validated vllm() call outside a projection");
+            return internal_err!("Validated llm() call outside a projection");
         };
 
         let mut input = projection.input;
@@ -320,7 +320,7 @@ impl OptimizerRule for VllmProjectRule {
                 };
                 let Ok([prompt, model, options]): Result<[_; 3], _> = args.try_into()
                 else {
-                    return plan_err!("vllm() requires prompt, model, and options_json");
+                    return plan_err!("llm() requires prompt, model, and options_json");
                 };
                 let model = literal_string(&model, "model")?.to_owned();
                 let options =
@@ -343,7 +343,7 @@ impl OptimizerRule for VllmProjectRule {
 
                 let output = loop {
                     let id = self.next_column.fetch_add(1, AtomicOrdering::Relaxed);
-                    let candidate = format!("__vane_vllm_{id}");
+                    let candidate = format!("__df_llm_{id}");
                     if input
                         .schema()
                         .fields()
@@ -363,7 +363,7 @@ impl OptimizerRule for VllmProjectRule {
                     ));
                 }
                 input = Arc::new(LogicalPlan::Extension(Extension {
-                    node: Arc::new(VllmNode::try_new(
+                    node: Arc::new(LlmNode::try_new(
                         input.as_ref().clone(),
                         prompt,
                         model,
@@ -386,7 +386,7 @@ fn literal_string<'a>(expr: &'a Expr, name: &str) -> Result<&'a str> {
     match expr {
         Expr::Literal(value, _) => required_string(value, name),
         _ => {
-            plan_err!("vllm() {name} must be a non-empty, non-NULL constant Utf8 string")
+            plan_err!("llm() {name} must be a non-empty, non-NULL constant Utf8 string")
         }
     }
 }

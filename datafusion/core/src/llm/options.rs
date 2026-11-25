@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 
 pub(crate) fn canonical_options(options: &str) -> Result<String> {
     let Options(mut value) = serde_json::from_str(options).map_err(|error| {
-        DataFusionError::Plan(format!("invalid vllm() options_json: {error}"))
+        DataFusionError::Plan(format!("invalid llm() options_json: {error}"))
     })?;
     value.sort_all_objects();
     Ok(value.to_string())

@@ -133,7 +133,7 @@ Optional features:
 - `backtrace`: include backtrace information in error messages
 - `parquet_encryption`: support for using [Parquet Modular Encryption]
 - `serde`: enable arrow-schema's `serde` feature
-- `vllm`: enable the experimental projection-only SQL function `vllm(prompt, model, options_json)` with deterministic mock inference.
+- `llm`: enable the experimental projection-only SQL function `llm(prompt, model, options_json)` with deterministic mock inference.
 
 [apache avro]: https://avro.apache.org/
 [apache parquet]: https://parquet.apache.org/

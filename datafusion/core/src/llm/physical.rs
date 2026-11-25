@@ -28,9 +28,9 @@ use crate::physical_planner::PhysicalPlanner;
 use datafusion_session::Session;
 use futures::StreamExt;
 
-use super::logical::{VllmNode, vllm_field};
+use super::logical::{LlmNode, llm_field};
 
-pub(crate) fn plan_vllm(
+pub(crate) fn plan_llm(
     planner: &dyn PhysicalPlanner,
     node: &dyn UserDefinedLogicalNode,
     logical_inputs: &[&LogicalPlan],
@@ -38,11 +38,11 @@ pub(crate) fn plan_vllm(
     session: &dyn Session,
     planning_context: &PhysicalPlanningContext,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    let Some(node) = node.as_any().downcast_ref::<VllmNode>() else {
+    let Some(node) = node.as_any().downcast_ref::<LlmNode>() else {
         return Ok(None);
     };
     let ([logical_input], [input]) = (logical_inputs, physical_inputs) else {
-        return internal_err!("VllmProject requires one input");
+        return internal_err!("LlmProject requires one input");
     };
     // Bind qualified column names before the conversion to Arrow drops table qualifiers.
     let prompt = planner.create_physical_expr(
@@ -51,7 +51,7 @@ pub(crate) fn plan_vllm(
         session,
         planning_context,
     )?;
-    Ok(Some(Arc::new(VllmExec::new(
+    Ok(Some(Arc::new(LlmExec::new(
         Arc::clone(input),
         prompt,
         node.model.clone(),
@@ -61,7 +61,7 @@ pub(crate) fn plan_vllm(
 }
 
 #[derive(Debug)]
-struct VllmExec {
+struct LlmExec {
     input: Arc<dyn ExecutionPlan>,
     prompt: Arc<dyn PhysicalExpr>,
     model: String,
@@ -71,7 +71,7 @@ struct VllmExec {
     metrics: ExecutionPlanMetricsSet,
 }
 
-impl VllmExec {
+impl LlmExec {
     fn new(
         input: Arc<dyn ExecutionPlan>,
         prompt: Arc<dyn PhysicalExpr>,
@@ -84,7 +84,7 @@ impl VllmExec {
             .fields()
             .iter()
             .cloned()
-            .chain(std::iter::once(vllm_field(&output_col)))
+            .chain(std::iter::once(llm_field(&output_col)))
             .collect::<Vec<_>>();
         let output_schema =
             Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
@@ -109,7 +109,7 @@ impl VllmExec {
     }
 }
 
-impl DisplayAs for VllmExec {
+impl DisplayAs for LlmExec {
     fn fmt_as(
         &self,
         _kind: DisplayFormatType,
@@ -117,15 +117,15 @@ impl DisplayAs for VllmExec {
     ) -> fmt::Result {
         write!(
             f,
-            "VllmExec: model={}, output={}, prompt={}",
+            "LlmExec: model={}, output={}, prompt={}",
             self.model, self.output_col, self.prompt
         )
     }
 }
 
-impl ExecutionPlan for VllmExec {
+impl ExecutionPlan for LlmExec {
     fn name(&self) -> &str {
-        "VllmExec"
+        "LlmExec"
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -149,7 +149,7 @@ impl ExecutionPlan for VllmExec {
         _options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let Ok([input]): Result<[_; 1], _> = children.try_into() else {
-            return internal_err!("VllmExec requires one input");
+            return internal_err!("LlmExec requires one input");
         };
         let prompt = rebind_prompt(
             Arc::clone(&self.prompt),
@@ -229,7 +229,7 @@ impl ExecutionPlan for VllmExec {
             let values = prompt.evaluate(&batch)?.into_array(batch.num_rows())?;
             let Some(prompts) = values.as_any().downcast_ref::<StringArray>() else {
                 return internal_err!(
-                    "VllmExec expected Utf8 prompts, got {}",
+                    "LlmExec expected Utf8 prompts, got {}",
                     values.data_type()
                 );
             };
@@ -270,7 +270,7 @@ fn rebind_prompt(
                 return Ok(Transformed::no(expr));
             };
             let Some(source) = old.fields().get(column.index()) else {
-                return internal_err!("VllmExec prompt column '{}' is outside the input schema", column.name());
+                return internal_err!("LlmExec prompt column '{}' is outside the input schema", column.name());
             };
             // Projections typically reuse Arrow fields. Prefer their identity so
             // two same-named fields from a join can still be told apart.
@@ -284,7 +284,7 @@ fn rebind_prompt(
                 });
             let Some(index) = index else {
                 return plan_err!(
-                    "VllmExec cannot rebind prompt column '{}' to a unique field in the replacement input",
+                    "LlmExec cannot rebind prompt column '{}' to a unique field in the replacement input",
                     column.name()
                 );
             };
