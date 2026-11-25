@@ -774,7 +774,7 @@ pub mod prelude;
 pub mod scalar;
 
 #[cfg(feature = "llm")]
-mod llm;
+pub mod llm;
 
 // Re-export dependencies that are part of DataFusion public API (e.g. via DataFusionError)
 pub use arrow;

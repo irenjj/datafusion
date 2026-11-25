@@ -10,3 +10,9 @@ mod fuzz;
 mod harness;
 #[path = "llm/scripted_backend.rs"]
 mod scripted_backend;
+
+#[path = "llm/async_exec.rs"]
+mod async_exec;
+#[cfg(feature = "llm-http")]
+#[path = "llm/http.rs"]
+mod http;

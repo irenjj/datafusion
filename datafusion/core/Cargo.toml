@@ -102,8 +102,9 @@ unicode_expressions = [
     "datafusion-sql?/unicode_expressions",
     "datafusion-functions/unicode_expressions",
 ]
-# Enables the native projection-only llm operator with mock inference.
-llm = ["dep:serde", "dep:serde_json", "sql", "string_expressions"]
+# Enables the native projection-only llm operator and pluggable backends.
+llm = ["dep:serde", "dep:serde_json", "dep:tokio-util", "sql", "string_expressions", "tokio/time"]
+llm-http = ["llm", "dep:reqwest", "dep:httpdate"]
 extended_tests = []
 
 [dependencies]
@@ -140,6 +141,7 @@ datafusion-session = { workspace = true }
 datafusion-sql = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 futures = { workspace = true }
+httpdate = { version = "1.0", optional = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 liblzma = { workspace = true, optional = true }
@@ -147,11 +149,13 @@ log = { workspace = true }
 object_store = { workspace = true }
 parking_lot = { workspace = true }
 parquet = { workspace = true, optional = true, default-features = true }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"], optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true, optional = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4", "js"] }
 zstd = { workspace = true, optional = true }
@@ -179,7 +183,7 @@ rstest = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = "0.40.3"
 test-utils = { path = "../../test-utils" }
-tokio = { workspace = true, features = ["rt-multi-thread", "parking_lot", "fs"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "parking_lot", "fs", "test-util"] }
 unicode-width = "0.2"
 
 [package.metadata.cargo-machete]

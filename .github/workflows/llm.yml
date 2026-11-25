@@ -8,6 +8,7 @@ on:
   pull_request:
     paths: &llm-paths
       - 'datafusion/core/src/llm/**'
+      - 'datafusion/core/src/execution/context/mod.rs'
       - 'datafusion/core/src/execution/session_state.rs'
       - 'datafusion/core/src/execution/session_state_defaults.rs'
       - 'datafusion/core/src/lib.rs'
@@ -45,9 +46,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - features: default + Parquet
+          - features: default + HTTP
             flavor: default
-            args: --features llm
+            args: --features llm-http
           - features: minimal
             flavor: minimal
             args: --no-default-features --features sql,string_expressions,llm
@@ -62,7 +63,9 @@ jobs:
           shared-key: llm-${{ matrix.flavor }}
       - name: Clippy
         if: matrix.flavor == 'default'
-        run: cargo clippy --locked -p datafusion --features llm --all-targets -- -D warnings
+        run: |
+          cargo clippy --locked -p datafusion --features llm-http --all-targets -- -D warnings
+          cargo clippy --locked -p datafusion --features llm --all-targets -- -D warnings
       - name: Run projection optimizer unit tests
         if: matrix.flavor == 'default'
         run: cargo test --locked -p datafusion-optimizer --lib optimize_projections
@@ -72,3 +75,6 @@ jobs:
           cargo test --locked -p datafusion ${{ matrix.args }} --lib llm::
       - name: Run LLM contracts and differential fuzz smoke
         run: cargo test --locked -p datafusion ${{ matrix.args }} --test llm
+      - name: Run LLM contracts without HTTP
+        if: matrix.flavor == 'default'
+        run: cargo test --locked -p datafusion --features llm --test llm

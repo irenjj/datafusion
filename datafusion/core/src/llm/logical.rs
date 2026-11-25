@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use super::options::canonical_options;
+use super::{LlmOptions, LlmProviderRegistry};
 use crate::arrow::datatypes::{DataType, Field, FieldRef};
 use crate::common::config::ConfigOptions;
 use crate::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -19,7 +19,8 @@ use crate::logical_expr::expr::ScalarFunction;
 use crate::logical_expr::expr_rewriter::NamePreserver;
 use crate::logical_expr::{
     ColumnarValue, Expr, Extension, LogicalPlan, Projection, ReturnFieldArgs,
-    ScalarFunctionArgs, ScalarUDFImpl, Signature, UserDefinedLogicalNodeCore, Volatility,
+    ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
+    UserDefinedLogicalNodeCore, Volatility,
 };
 use crate::optimizer::{AnalyzerRule, ApplyOrder, OptimizerConfig, OptimizerRule};
 
@@ -31,7 +32,15 @@ pub(super) struct LlmMarkerUdf {
 impl Default for LlmMarkerUdf {
     fn default() -> Self {
         Self {
-            signature: Signature::exact(vec![DataType::Utf8; 3], Volatility::Volatile),
+            signature: Signature::one_of(
+                [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View]
+                    .into_iter()
+                    .map(|prompt| {
+                        TypeSignature::Exact(vec![prompt, DataType::Utf8, DataType::Utf8])
+                    })
+                    .collect(),
+                Volatility::Volatile,
+            ),
         }
     }
 }
@@ -277,9 +286,19 @@ impl AnalyzerRule for ValidateLlm {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct LlmProjectRule {
     next_column: AtomicU64,
+    registry: LlmProviderRegistry,
+}
+
+impl LlmProjectRule {
+    pub(super) fn new(registry: LlmProviderRegistry) -> Self {
+        Self {
+            next_column: AtomicU64::new(0),
+            registry,
+        }
+    }
 }
 
 impl OptimizerRule for LlmProjectRule {
@@ -323,12 +342,11 @@ impl OptimizerRule for LlmProjectRule {
                     return plan_err!("llm() requires prompt, model, and options_json");
                 };
                 let model = literal_string(&model, "model")?.to_owned();
-                let options =
-                    canonical_options(literal_string(&options, "options_json")?)?;
-                // Within one SELECT, identical non-volatile prompts share inference
-                // for the same model and canonical options. If Step 2 needs
-                // independent sampling, add an explicit option to disable reuse.
-                let reusable = !prompt.is_volatile();
+                let (typed_options, options) =
+                    LlmOptions::parse(literal_string(&options, "options_json")?)?;
+                self.registry.resolve(typed_options.provider.as_deref())?;
+                let reusable =
+                    typed_options.deduplicate.unwrap_or(true) && !prompt.is_volatile();
                 if reusable
                     && let Some((_, _, _, output)) = extracted.iter().find(
                         |(prior_prompt, prior_model, prior_options, _)| {

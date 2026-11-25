@@ -5,20 +5,20 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::arrow::array::{Array, StringArray, StringBuilder};
+use super::stream::{Dispatch, LlmMetrics, LlmStream};
+use super::{LlmOptions, LlmProviderRegistry};
 use crate::arrow::datatypes::{FieldRef, Schema, SchemaRef};
-use crate::arrow::record_batch::RecordBatch;
 use crate::common::stats::{ColumnStatistics, Precision};
 use crate::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use crate::common::{Result, Statistics, internal_err, plan_err};
+use crate::execution::session_state::SessionState;
 use crate::execution::{SendableRecordBatchStream, TaskContext};
 use crate::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use crate::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use crate::physical_expr::expressions::Column;
 use crate::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use crate::physical_plan::execution_plan::CardinalityEffect;
-use crate::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
-use crate::physical_plan::stream::RecordBatchStreamAdapter;
+use crate::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use crate::physical_plan::{
     ChildStats, ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
     LimitBehavior, PlanProperties, ReplaceChildrenOptions, StatisticsArgs,
@@ -26,7 +26,6 @@ use crate::physical_plan::{
 };
 use crate::physical_planner::PhysicalPlanner;
 use datafusion_session::Session;
-use futures::StreamExt;
 
 use super::logical::{LlmNode, llm_field};
 
@@ -51,11 +50,20 @@ pub(crate) fn plan_llm(
         session,
         planning_context,
     )?;
+    let (options, _) = LlmOptions::parse(&node.options_json)?;
+    let fallback;
+    let registry = if let Some(state) = session.as_any().downcast_ref::<SessionState>() {
+        state.llm_provider_registry()
+    } else {
+        fallback = LlmProviderRegistry::default();
+        &fallback
+    };
+    let provider = registry.resolve(options.provider.as_deref())?;
+    let dispatch = Dispatch::try_new(node.model.clone(), options, provider)?;
     Ok(Some(Arc::new(LlmExec::new(
         Arc::clone(input),
         prompt,
-        node.model.clone(),
-        node.options_json.clone(),
+        Arc::new(dispatch),
         node.output_col.clone(),
     ))))
 }
@@ -64,8 +72,7 @@ pub(crate) fn plan_llm(
 struct LlmExec {
     input: Arc<dyn ExecutionPlan>,
     prompt: Arc<dyn PhysicalExpr>,
-    model: String,
-    options_json: String,
+    dispatch: Arc<Dispatch>,
     output_col: String,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -75,8 +82,7 @@ impl LlmExec {
     fn new(
         input: Arc<dyn ExecutionPlan>,
         prompt: Arc<dyn PhysicalExpr>,
-        model: String,
-        options_json: String,
+        dispatch: Arc<Dispatch>,
         output_col: String,
     ) -> Self {
         let schema = input.schema();
@@ -100,8 +106,7 @@ impl LlmExec {
         Self {
             input,
             prompt,
-            model,
-            options_json,
+            dispatch,
             output_col,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -118,7 +123,7 @@ impl DisplayAs for LlmExec {
         write!(
             f,
             "LlmExec: model={}, output={}, prompt={}",
-            self.model, self.output_col, self.prompt
+            self.dispatch.model, self.output_col, self.prompt
         )
     }
 }
@@ -159,8 +164,7 @@ impl ExecutionPlan for LlmExec {
         Ok(Arc::new(Self::new(
             input,
             prompt,
-            self.model.clone(),
-            self.options_json.clone(),
+            Arc::clone(&self.dispatch),
             self.output_col.clone(),
         )))
     }
@@ -218,41 +222,14 @@ impl ExecutionPlan for LlmExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input = self.input.execute(partition, context)?;
-        let submitted =
-            MetricBuilder::new(&self.metrics).counter("submitted_prompts", partition);
-        let model = self.model.clone();
-        let prompt = Arc::clone(&self.prompt);
-        let schema = self.schema();
-        let output_schema = Arc::clone(&schema);
-        let stream = input.map(move |batch| {
-            let batch = batch?;
-            let values = prompt.evaluate(&batch)?.into_array(batch.num_rows())?;
-            let Some(prompts) = values.as_any().downcast_ref::<StringArray>() else {
-                return internal_err!(
-                    "LlmExec expected Utf8 prompts, got {}",
-                    values.data_type()
-                );
-            };
-            let mut responses = StringBuilder::new();
-            for value in prompts.iter() {
-                match value {
-                    Some(value) => {
-                        submitted.add(1);
-                        responses.append_value(mock_infer(&model, value));
-                    }
-                    None => responses.append_null(),
-                }
-            }
-            let mut columns = batch.columns().to_vec();
-            columns.push(Arc::new(responses.finish()));
-            Ok(RecordBatch::try_new(Arc::clone(&output_schema), columns)?)
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        Ok(Box::pin(LlmStream::new(
+            self.schema(),
+            input,
+            Arc::clone(&self.prompt),
+            Arc::clone(&self.dispatch),
+            LlmMetrics::new(&self.metrics, partition),
+        )))
     }
-}
-
-fn mock_infer(model: &str, prompt: &str) -> String {
-    format!("mock[{model}]: {prompt}")
 }
 
 fn rebind_prompt(

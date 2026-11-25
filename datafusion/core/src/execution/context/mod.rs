@@ -1687,6 +1687,22 @@ impl SessionContext {
         self.state.write().register_udtf(name, fun)
     }
 
+    /// Returns the registry shared by this session's LLM queries.
+    #[cfg(feature = "llm")]
+    pub fn llm_provider_registry(&self) -> crate::llm::LlmProviderRegistry {
+        self.state.read().llm_provider_registry().clone()
+    }
+
+    /// Registers a named LLM backend. The name "default" replaces the built-in mock.
+    #[cfg(feature = "llm")]
+    pub fn register_llm_provider(
+        &self,
+        name: impl Into<String>,
+        backend: Arc<dyn crate::llm::LlmBackend>,
+    ) -> Result<()> {
+        self.llm_provider_registry().register(name, backend)
+    }
+
     /// Registers a scalar UDF within this context.
     ///
     /// Note in SQL queries, function names are looked up using

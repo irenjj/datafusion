@@ -6,14 +6,22 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt::Write;
 use std::future::{Future, ready};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::iter::once;
 use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
 
 use datafusion::arrow::array::Int64Array;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result;
 use datafusion::datasource::MemTable;
+use datafusion::llm::{
+    CancellationToken, LlmBackend, LlmBackendError, LlmRequest, LlmResponse,
+    MockLlmBackend,
+};
 use rand::prelude::*;
 use test_utils::fuzz::{self, FuzzTest, RunConfig};
 
@@ -79,11 +87,11 @@ impl Case {
         case
     }
 
-    fn sql(&self) -> String {
+    fn sql(&self, options: &str) -> String {
         let column = PROMPT_COLUMNS[self.column].0;
-        let mut prompt = format!("llm({column}, 'inner', '{{}}')");
+        let mut prompt = format!("llm({column}, 'inner', '{options}')");
         if self.nested {
-            prompt = format!("llm({prompt}, 'outer', '{{}}')");
+            prompt = format!("llm({prompt}, 'outer', '{options}')");
         }
 
         let id_filter = self.min_id.map(|min_id| format!("id >= {min_id}"));
@@ -220,6 +228,24 @@ impl Dataset {
     }
 }
 
+#[derive(Debug)]
+struct DelayedMock(u64);
+
+#[async_trait]
+impl LlmBackend for DelayedMock {
+    async fn generate(
+        &self,
+        request: LlmRequest,
+        cancel: CancellationToken,
+    ) -> std::result::Result<LlmResponse, LlmBackendError> {
+        let mut hash = DefaultHasher::new();
+        (self.0, &request.model, &request.prompts).hash(&mut hash);
+        let delay = SmallRng::seed_from_u64(hash.finish()).random_range(0..=8_000);
+        tokio::time::sleep(Duration::from_micros(delay)).await;
+        MockLlmBackend.generate(request, cancel).await
+    }
+}
+
 struct LlmFuzz;
 
 impl FuzzTest for LlmFuzz {
@@ -240,46 +266,57 @@ impl FuzzTest for LlmFuzz {
         let mut rng = SmallRng::seed_from_u64(case_seed);
         let case = Case::generate(&mut rng, dataset.rows.len());
         let batch_size = rng.random_range(1..=16);
-        let sql = case.sql();
-        eprintln!("SQL: {sql}\nBatch size: {batch_size}");
+        let request_batch = rng.random_range(1..=5);
+        let inflight = rng.random_range(1..=6);
+        let delayed_options = format!(
+            r#"{{"provider":"delayed","batch_size":{request_batch},"inflight_limit":{inflight}}}"#
+        );
         let ctx = test_context(batch_size, dataset.partitions);
+        ctx.register_llm_provider("delayed", Arc::new(DelayedMock(case_seed)))?;
         ctx.register_table("t", dataset.table.clone())?;
-        let (plan, batches) = run(&ctx, &sql).await?;
-        let (expected, count) = case.reference(&dataset.rows);
-        let observed = submitted(plan.as_ref());
-        if let Some(limit) = case.output_limit.filter(|_| !case.order_by_response) {
-            // The selected rows can vary across partitions. Validate the whole
-            // eligible set and charge only the non-NULL rows actually returned.
-            let actual = answer_rows(&batches);
-            let mut eligible = expected.into_iter().collect::<HashMap<_, _>>();
-            assert_eq!(actual.len(), eligible.len().min(limit));
-            for (id, answer) in &actual {
-                assert_eq!(
-                    eligible.remove(id).as_ref(),
-                    Some(answer),
-                    "ineligible row, duplicate id, or incorrect answer for id {id}"
-                );
-            }
-            let calls_per_prompt = if case.nested { 2 } else { 1 };
-            assert!(
-                observed <= limit * calls_per_prompt,
-                "{observed} submissions for {case:?}"
-            );
-            let non_null = actual.iter().filter(|(_, answer)| answer.is_some()).count();
-            assert_eq!(
-                observed,
-                non_null * calls_per_prompt,
-                "prompt submissions for {case:?}"
-            );
-        } else {
-            assert_rows(&batches, expected, case.order_by_response);
-            assert_eq!(observed, count, "prompt submissions for {case:?}");
+        for options in ["{}", &delayed_options] {
+            let sql = case.sql(options);
+            eprintln!("SQL: {sql}\nBatch size: {batch_size}");
+            let (plan, batches) = run(&ctx, &sql).await?;
+            check_rows(&case, dataset, &batches, submitted(plan.as_ref()));
         }
         Ok(())
     }
 }
 
-#[tokio::test]
+fn check_rows(case: &Case, dataset: &Dataset, batches: &[RecordBatch], observed: usize) {
+    let (expected, count) = case.reference(&dataset.rows);
+    if let Some(limit) = case.output_limit.filter(|_| !case.order_by_response) {
+        // The selected rows can vary across partitions. Validate the whole
+        // eligible set and charge only the non-NULL rows actually returned.
+        let actual = answer_rows(batches);
+        let mut eligible = expected.into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(actual.len(), eligible.len().min(limit));
+        for (id, answer) in &actual {
+            assert_eq!(
+                eligible.remove(id).as_ref(),
+                Some(answer),
+                "ineligible row, duplicate id, or incorrect answer for id {id}"
+            );
+        }
+        let calls_per_prompt = if case.nested { 2 } else { 1 };
+        assert!(
+            observed <= limit * calls_per_prompt,
+            "{observed} submissions for {case:?}"
+        );
+        let non_null = actual.iter().filter(|(_, answer)| answer.is_some()).count();
+        assert_eq!(
+            observed,
+            non_null * calls_per_prompt,
+            "prompt submissions for {case:?}"
+        );
+    } else {
+        assert_rows(batches, expected, case.order_by_response);
+        assert_eq!(observed, count, "prompt submissions for {case:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn differential_fuzz() -> Result<()> {
     if let Ok(replay) = env::var("LLM_FUZZ_REPLAY") {
         let (dataset_seed, case_seed) =

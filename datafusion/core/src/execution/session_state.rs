@@ -18,6 +18,8 @@ use crate::datasource::file_format::FileFormatFactory;
 use crate::datasource::provider_as_source;
 use crate::execution::SessionStateDefaults;
 use crate::execution::context::{EmptySerializerRegistry, FunctionFactory, QueryPlanner};
+#[cfg(feature = "llm")]
+use crate::llm::LlmProviderRegistry;
 use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 #[cfg(feature = "sql")]
 use arrow_schema::DataType;
@@ -148,6 +150,8 @@ struct SessionStateInner {
     session_id: String,
     /// Responsible for analyzing and rewrite a logical plan before optimization
     analyzer: Analyzer,
+    #[cfg(feature = "llm")]
+    llm_provider_registry: LlmProviderRegistry,
     /// Provides support for customizing the SQL planner, e.g. to add support for custom operators like `->>` or `?`
     expr_planners: Vec<Arc<dyn ExprPlanner>>,
     #[cfg(feature = "sql")]
@@ -742,6 +746,12 @@ impl SessionState {
         &self.inner.analyzer
     }
 
+    /// Returns the session registry for [`crate::llm::LlmBackend`] implementations.
+    #[cfg(feature = "llm")]
+    pub fn llm_provider_registry(&self) -> &LlmProviderRegistry {
+        &self.inner.llm_provider_registry
+    }
+
     /// Returns the [`Optimizer`] for this session
     pub fn optimizer(&self) -> &Optimizer {
         &self.inner.optimizer
@@ -1156,6 +1166,8 @@ impl SessionState {
 pub struct SessionStateBuilder {
     session_id: Option<String>,
     analyzer: Option<Analyzer>,
+    #[cfg(feature = "llm")]
+    llm_provider_registry: Option<LlmProviderRegistry>,
     expr_planners: Option<Vec<Arc<dyn ExprPlanner>>>,
     #[cfg(feature = "sql")]
     relation_planners: Option<Vec<Arc<dyn RelationPlanner>>>,
@@ -1200,6 +1212,8 @@ impl SessionStateBuilder {
         Self {
             session_id: None,
             analyzer: None,
+            #[cfg(feature = "llm")]
+            llm_provider_registry: None,
             expr_planners: None,
             #[cfg(feature = "sql")]
             relation_planners: None,
@@ -1262,6 +1276,8 @@ impl SessionStateBuilder {
         Self {
             session_id: None,
             analyzer: Some(existing.analyzer),
+            #[cfg(feature = "llm")]
+            llm_provider_registry: Some(existing.llm_provider_registry),
             expr_planners: Some(existing.expr_planners),
             #[cfg(feature = "sql")]
             relation_planners: Some(existing.relation_planners),
@@ -1569,6 +1585,13 @@ impl SessionStateBuilder {
         self
     }
 
+    /// Use a preconfigured registry for SQL LLM calls.
+    #[cfg(feature = "llm")]
+    pub fn with_llm_provider_registry(mut self, registry: LlmProviderRegistry) -> Self {
+        self.llm_provider_registry = Some(registry);
+        self
+    }
+
     /// Set the [`TableOptions`]
     pub fn with_table_options(mut self, table_options: TableOptions) -> Self {
         self.table_options = Some(table_options);
@@ -1701,6 +1724,8 @@ impl SessionStateBuilder {
         let Self {
             session_id,
             analyzer,
+            #[cfg(feature = "llm")]
+            llm_provider_registry,
             expr_planners,
             #[cfg(feature = "sql")]
             relation_planners,
@@ -1735,6 +1760,9 @@ impl SessionStateBuilder {
         let config = config.unwrap_or_default();
         let runtime_env = runtime_env.unwrap_or_else(|| Arc::new(RuntimeEnv::default()));
 
+        #[cfg(feature = "llm")]
+        let llm_provider_registry = llm_provider_registry.unwrap_or_default();
+
         let content = Arc::new(SessionStateInner {
             session_id: session_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
             #[cfg(feature = "llm")]
@@ -1747,7 +1775,9 @@ impl SessionStateBuilder {
             #[cfg(feature = "sql")]
             type_planner,
             #[cfg(feature = "llm")]
-            optimizer: optimizer.unwrap_or_else(crate::llm::optimizer),
+            optimizer: crate::llm::optimizer(optimizer, &llm_provider_registry),
+            #[cfg(feature = "llm")]
+            llm_provider_registry,
             #[cfg(not(feature = "llm"))]
             optimizer: optimizer.unwrap_or_default(),
             physical_optimizers: physical_optimizers.unwrap_or_default(),
