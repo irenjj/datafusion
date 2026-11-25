@@ -298,6 +298,11 @@ async fn rejects_non_map_only_operators_and_file_extensions() -> Result<()> {
     ] {
         rejected(optimized(&ctx, sql).await?, operator);
     }
+    let virtual_scan = optimized(&ctx, "SELECT file_row_index(), id FROM t").await?;
+    let (_, parquet) = scan_node(virtual_scan.as_ref());
+    assert!(!parquet.table_schema().virtual_columns().is_empty());
+    rejected(virtual_scan, "virtual columns");
+
     let scan = optimized(&ctx, "SELECT * FROM t").await?;
     let (config, parquet) = scan_node(scan.as_ref());
     let limited_scan = DataSourceExec::from_data_source(

@@ -262,6 +262,8 @@ pub(super) fn assert_attempts(expected: &[Split], outputs: &[SplitOutput]) {
 }
 
 pub(super) fn rows(batches: &[RecordBatch]) -> Result<HashMap<Vec<ScalarValue>, usize>> {
+    // Arrow memory accounting does not affect ScalarValue hashing.
+    #[allow(clippy::allow_attributes, clippy::mutable_key_type)]
     let mut counts = HashMap::new();
     for batch in batches {
         for row in 0..batch.num_rows() {

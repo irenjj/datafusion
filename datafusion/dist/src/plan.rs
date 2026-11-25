@@ -336,6 +336,11 @@ fn rewrite_map_plan(
                 "Map-only distribution does not support FileScanConfig.limit"
             );
         }
+        if !parquet.table_schema().virtual_columns().is_empty() {
+            return plan_err!(
+                "Map-only distribution does not support Parquet scans with virtual columns"
+            );
+        }
         if scan.preserve_order
             || !scan.output_ordering.is_empty()
             || scan.output_partitioning.is_some()
