@@ -92,7 +92,7 @@ impl SessionStateDefaults {
     /// returns the list of default [`ScalarUDF`]s
     pub fn default_scalar_functions() -> Vec<Arc<ScalarUDF>> {
         #[cfg_attr(
-            not(any(feature = "nested_expressions", feature = "vllm")),
+            not(any(feature = "nested_expressions", feature = "llm")),
             expect(unused_mut)
         )]
         let mut functions: Vec<Arc<ScalarUDF>> = functions::all_default_functions();
@@ -100,8 +100,8 @@ impl SessionStateDefaults {
         #[cfg(feature = "nested_expressions")]
         functions.append(&mut functions_nested::all_default_nested_functions());
 
-        #[cfg(feature = "vllm")]
-        functions.push(crate::vllm::marker_udf());
+        #[cfg(feature = "llm")]
+        functions.push(crate::llm::marker_udf());
 
         functions
     }

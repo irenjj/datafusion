@@ -66,7 +66,7 @@ pub(super) fn strings(batches: &[RecordBatch], index: usize) -> Vec<Option<&str>
 
 pub(super) fn exec_nodes(plan: &dyn ExecutionPlan) -> Vec<&dyn ExecutionPlan> {
     let mut result = Vec::new();
-    if plan.name() == "VllmExec" {
+    if plan.name() == "LlmExec" {
         result.push(plan);
     }
     for child in plan.children() {

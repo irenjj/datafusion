@@ -81,9 +81,9 @@ impl Case {
 
     fn sql(&self) -> String {
         let column = PROMPT_COLUMNS[self.column].0;
-        let mut prompt = format!("vllm({column}, 'inner', '{{}}')");
+        let mut prompt = format!("llm({column}, 'inner', '{{}}')");
         if self.nested {
-            prompt = format!("vllm({prompt}, 'outer', '{{}}')");
+            prompt = format!("llm({prompt}, 'outer', '{{}}')");
         }
 
         let id_filter = self.min_id.map(|min_id| format!("id >= {min_id}"));
@@ -220,13 +220,13 @@ impl Dataset {
     }
 }
 
-struct VllmFuzz;
+struct LlmFuzz;
 
-impl FuzzTest for VllmFuzz {
+impl FuzzTest for LlmFuzz {
     type Dataset = Dataset;
 
     fn name(&self) -> &str {
-        "vllm_sql_oracle"
+        "llm_sql_oracle"
     }
 
     fn prepare_dataset(
@@ -281,24 +281,24 @@ impl FuzzTest for VllmFuzz {
 
 #[tokio::test]
 async fn differential_fuzz() -> Result<()> {
-    if let Ok(replay) = env::var("VLLM_FUZZ_REPLAY") {
+    if let Ok(replay) = env::var("LLM_FUZZ_REPLAY") {
         let (dataset_seed, case_seed) =
             replay.split_once(',').expect("Use dataset_seed,case_seed");
-        return VllmFuzz
+        return LlmFuzz
             .reproduce(dataset_seed.parse().unwrap(), case_seed.parse().unwrap())
             .await;
     }
 
-    let cases = env::var("VLLM_FUZZ_CASES").ok().map_or(36, |value| {
+    let cases = env::var("LLM_FUZZ_CASES").ok().map_or(36, |value| {
         value
             .parse()
-            .expect("VLLM_FUZZ_CASES must be a positive integer")
+            .expect("LLM_FUZZ_CASES must be a positive integer")
     });
-    let seed = env::var("VLLM_FUZZ_SEED").ok().map_or(2026, |value| {
-        value.parse().expect("VLLM_FUZZ_SEED must be a u64")
+    let seed = env::var("LLM_FUZZ_SEED").ok().map_or(2026, |value| {
+        value.parse().expect("LLM_FUZZ_SEED must be a u64")
     });
     let stats = fuzz::run(
-        &VllmFuzz,
+        &LlmFuzz,
         RunConfig {
             run_seed: Some(seed),
             max_cases: Some(cases),
@@ -307,6 +307,6 @@ async fn differential_fuzz() -> Result<()> {
         },
     )
     .await?;
-    println!("vLLM differential fuzz: {stats:?}");
+    println!("LLM differential fuzz: {stats:?}");
     Ok(())
 }
