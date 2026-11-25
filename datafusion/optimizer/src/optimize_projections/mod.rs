@@ -350,6 +350,11 @@ fn optimize_projections(
                 .collect()
         }
         LogicalPlan::Extension(extension) => {
+            if let Some(input) = extension.node.bypass_if_unused(indices.indices()) {
+                return Transformed::yes(input.clone()).transform_data(|input| {
+                    optimize_projections(input, config, indices)
+                });
+            }
             if let Some(necessary_children_indices) =
                 extension.node.necessary_children_exprs(indices.indices())
             {
