@@ -63,7 +63,7 @@ You can also run the full lint suite used by CI:
 # or auto-fix: ./dev/rust_lint.sh --write --allow-dirty
 ```
 
-When creating a PR, you MUST follow the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
+When creating a PR, you MUST follow the [PR template](.github/pull_request_template.md).
 
 ## Testing
 
