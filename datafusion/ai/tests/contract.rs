@@ -3,11 +3,14 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use std::io::Cursor;
+use std::sync::Arc;
 
+use arrow::array::{BooleanArray, RecordBatch, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
 use datafusion_ai::{AiError, AiErrorType, ErrorCode, MediaRef, MediaRefType};
+use datafusion_common::DataFusionError;
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
@@ -29,7 +32,12 @@ proptest! {
         error_message in any::<String>(),
         retryable in any::<bool>(),
     ) {
-        let envelope = AiError { value, error_code, error_message, retryable };
+        let envelope = AiError {
+            value,
+            error_code: Some(error_code),
+            error_message: Some(error_message),
+            retryable: Some(retryable),
+        };
         let wire = serde_json::to_string(&envelope).unwrap();
         prop_assert_eq!(serde_json::from_str::<Value>(&wire).unwrap(), json!({
             "value": envelope.value,
@@ -85,9 +93,9 @@ proptest! {
         prop_assert_eq!(error.try_extension_type::<AiErrorType>().unwrap(), error_type);
         prop_assert_eq!(error.data_type(), &DataType::Struct(vec![
             Field::new("value", value_type, true),
-            Field::new("error_code", DataType::Utf8, false),
-            Field::new("error_message", DataType::Utf8, false),
-            Field::new("retryable", DataType::Boolean, false),
+            Field::new("error_code", DataType::Utf8, true),
+            Field::new("error_message", DataType::Utf8, true),
+            Field::new("retryable", DataType::Boolean, true),
         ].into()));
 
         let media = decoded.field(1);
@@ -101,6 +109,104 @@ proptest! {
             Field::new("etag", DataType::Utf8, true),
             Field::new("mime", DataType::Utf8, true),
         ].into()));
+    }
+}
+
+#[test]
+fn ai_error_success_and_failure_round_trip() {
+    let success = AiError {
+        value: Some("result".to_owned()),
+        error_code: None,
+        error_message: None,
+        retryable: None,
+    };
+    let failure = AiError {
+        value: None,
+        error_code: Some(ErrorCode::Timeout),
+        error_message: Some("request timed out".to_owned()),
+        retryable: Some(false),
+    };
+    for (envelope, expected) in [
+        (
+            &success,
+            json!({
+                "value": "result",
+                "error_code": null,
+                "error_message": null,
+                "retryable": null,
+            }),
+        ),
+        (
+            &failure,
+            json!({
+                "value": null,
+                "error_code": "TIMEOUT",
+                "error_message": "request timed out",
+                "retryable": false,
+            }),
+        ),
+    ] {
+        envelope.validate().unwrap();
+        let wire = serde_json::to_value(envelope).unwrap();
+        assert_eq!(wire, expected);
+        assert_eq!(
+            serde_json::from_value::<AiError<String>>(wire).unwrap(),
+            *envelope
+        );
+    }
+
+    let field = AiErrorType::new(DataType::Utf8)
+        .field("result", false)
+        .unwrap();
+    let DataType::Struct(fields) = field.data_type() else {
+        panic!("expected struct storage");
+    };
+    let column = StructArray::try_new(
+        fields.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![Some("result"), None])),
+            Arc::new(StringArray::from(vec![None, Some("TIMEOUT")])),
+            Arc::new(StringArray::from(vec![None, Some("request timed out")])),
+            Arc::new(BooleanArray::from(vec![None, Some(false)])),
+        ],
+        None,
+    )
+    .unwrap();
+    let schema = Arc::new(Schema::new(vec![field]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(column)]).unwrap();
+    let mut writer = StreamWriter::try_new(Vec::new(), &schema).unwrap();
+    writer.write(&batch).unwrap();
+    let mut reader =
+        StreamReader::try_new(Cursor::new(writer.into_inner().unwrap()), None).unwrap();
+    assert_eq!(reader.next().unwrap().unwrap(), batch);
+}
+
+#[test]
+fn ai_error_validate_rejects_partial_error_fields() {
+    let partial: AiError<String> = serde_json::from_value(json!({
+        "value": null,
+        "error_code": "TIMEOUT",
+        "error_message": null,
+        "retryable": false,
+    }))
+    .unwrap();
+
+    assert!(matches!(partial.validate(), Err(DataFusionError::Plan(_))));
+}
+
+#[test]
+fn ai_error_arrow_fields_are_nullable() {
+    for nullable in [false, true] {
+        let field = AiErrorType::new(DataType::Utf8)
+            .field("result", nullable)
+            .unwrap();
+        assert_eq!(field.is_nullable(), nullable);
+        let DataType::Struct(fields) = field.data_type() else {
+            panic!("expected struct storage");
+        };
+        for name in ["value", "error_code", "error_message", "retryable"] {
+            assert!(fields.find(name).unwrap().1.is_nullable(), "{name}");
+        }
     }
 }
 

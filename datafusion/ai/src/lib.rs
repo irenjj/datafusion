@@ -6,7 +6,7 @@
 
 use arrow::datatypes::{DataType, Field};
 use arrow_schema::{ArrowError, extension::ExtensionType};
-use datafusion_common::Result;
+use datafusion_common::{Result, plan_err};
 use serde::{Deserialize, Serialize};
 
 /// Stable wire codes for inference failures.
@@ -35,7 +35,10 @@ pub enum ErrorCode {
     Cancelled,
 }
 
-/// A failed row and its optional value, stored in Arrow as [`AiErrorType`].
+/// A success or failure row, stored in Arrow as [`AiErrorType`].
+///
+/// In the same column, `error_code IS NOT NULL` identifies a failure row, and
+/// all three error fields are NULL for a success row.
 ///
 /// # Public Only for Internal Use:
 ///
@@ -44,14 +47,34 @@ pub enum ErrorCode {
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiError<T> {
-    /// Value associated with the error, if available.
+    /// Value associated with the row, if available.
     pub value: Option<T>,
     /// Stable failure classification.
-    pub error_code: ErrorCode,
+    pub error_code: Option<ErrorCode>,
     /// Diagnostic for the failed row.
-    pub error_message: String,
+    pub error_message: Option<String>,
     /// Whether the failure can be retried.
-    pub retryable: bool,
+    pub retryable: Option<bool>,
+}
+
+impl<T> AiError<T> {
+    /// Validate that the error fields are either all present or all absent before writing.
+    ///
+    /// # Errors
+    /// Returns a planning error if only some error fields are present.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn validate(&self) -> Result<()> {
+        match (&self.error_code, &self.error_message, &self.retryable) {
+            (Some(_), Some(_), Some(_)) | (None, None, None) => Ok(()),
+            _ => plan_err!(
+                "df.ai_error fields error_code, error_message, and retryable must all be present or all absent"
+            ),
+        }
+    }
 }
 
 /// A reference to media bytes, stored in Arrow as [`MediaRefType`].
@@ -109,9 +132,9 @@ impl AiErrorType {
         DataType::Struct(
             vec![
                 Field::new("value", self.value_type.clone(), true),
-                Field::new("error_code", DataType::Utf8, false),
-                Field::new("error_message", DataType::Utf8, false),
-                Field::new("retryable", DataType::Boolean, false),
+                Field::new("error_code", DataType::Utf8, true),
+                Field::new("error_message", DataType::Utf8, true),
+                Field::new("retryable", DataType::Boolean, true),
             ]
             .into(),
         )
