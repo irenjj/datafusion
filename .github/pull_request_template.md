@@ -7,6 +7,7 @@
 
 <!--
 We generally require a GitHub issue to be filed for all bug fixes and enhancements and this helps us generate change logs for our releases. You can link an issue to this PR using the GitHub syntax. For example `Closes #123` indicates that this PR will close issue #123.
+Use `Refs #123` for related or partial work and explain what remains.
 -->
 
 - Closes #.
@@ -45,10 +46,37 @@ If this PR does not add tests, explain why. For example, if the change is alread
 You should also check the `codecov` bot reply on this PR to confirm the changed code is exercised.
 -->
 
+### Test evidence
+
+<!--
+Record every gate selected by docs/VERIFICATION.md for the change surfaces
+touched by this PR. Use a source-bound evidence manifest where available:
+scripts/evidence.sh --name <lane> --output-dir evidence/ -- <command...>
+Record commands that did not run and why instead of leaving rows blank.
+-->
+
+| Change surface | Command | Result (exit code) | Evidence JSON path or artifact |
+| -------------- | ------- | ------------------ | ------------------------------ |
+|                |         |                    |                                |
+
+### Checks not run and why
+
+<!--
+List applicable gates that were not run, including TODO targets, unavailable
+fixtures, and nightly-only scope. A planned check is not a passing check.
+-->
+
 ## Are there any user-facing changes?
 
 <!--
 If there are user-facing changes then we may require documentation to be updated before approving the PR.
 
 If there are any breaking changes to public APIs, please add the `api change` label.
+-->
+
+## Compatibility and rollback impact
+
+<!--
+Describe serialized-format, codec, or public API compatibility and how to roll
+back. Write "None" only after checking those surfaces.
 -->
