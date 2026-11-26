@@ -2075,6 +2075,18 @@ impl DefaultPhysicalPlanner {
                         .await?;
                 }
 
+                #[cfg(feature = "llm")]
+                if maybe_plan.is_none() {
+                    maybe_plan = crate::llm::plan_llm(
+                        self,
+                        node.as_ref(),
+                        &logical_input,
+                        &children,
+                        session,
+                        planning_ctx,
+                    )?;
+                }
+
                 let plan = match maybe_plan {
                     Some(v) => Ok(v),
                     _ => plan_err!(

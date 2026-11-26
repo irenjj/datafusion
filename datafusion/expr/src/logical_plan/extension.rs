@@ -102,6 +102,16 @@ pub trait UserDefinedLogicalNode: fmt::Debug + Send + Sync {
         None
     }
 
+    /// Returns the input that can replace this node during projection pruning.
+    ///
+    /// The replacement must preserve row cardinality, ordering guarantees, and the
+    /// fields and values at all `required_columns` indices. Only opt in when
+    /// evaluating the discarded outputs has no required side effects.
+    #[doc(hidden)]
+    fn bypass_if_unused(&self, _required_columns: &[usize]) -> Option<&LogicalPlan> {
+        None
+    }
+
     /// Update the hash `state` with this node requirements from
     /// [`Hash`].
     ///
@@ -290,6 +300,16 @@ pub trait UserDefinedLogicalNodeCore:
         None
     }
 
+    /// Returns the input that can replace this node during projection pruning.
+    ///
+    /// The replacement must preserve row cardinality, ordering guarantees, and the
+    /// fields and values at all `required_columns` indices. Only opt in when
+    /// evaluating the discarded outputs has no required side effects.
+    #[doc(hidden)]
+    fn bypass_if_unused(&self, _required_columns: &[usize]) -> Option<&LogicalPlan> {
+        None
+    }
+
     /// Returns `true` if a limit can be safely pushed down through this
     /// `UserDefinedLogicalNode` node.
     ///
@@ -349,6 +369,10 @@ impl<T: UserDefinedLogicalNodeCore> UserDefinedLogicalNode for T {
         output_columns: &[usize],
     ) -> Option<Vec<Vec<usize>>> {
         self.necessary_children_exprs(output_columns)
+    }
+
+    fn bypass_if_unused(&self, required_columns: &[usize]) -> Option<&LogicalPlan> {
+        self.bypass_if_unused(required_columns)
     }
 
     fn dyn_hash(&self, state: &mut dyn Hasher) {

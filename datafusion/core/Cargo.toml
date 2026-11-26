@@ -102,6 +102,8 @@ unicode_expressions = [
     "datafusion-sql?/unicode_expressions",
     "datafusion-functions/unicode_expressions",
 ]
+# Enables the native projection-only llm operator with mock inference.
+llm = ["dep:serde", "dep:serde_json", "sql", "string_expressions"]
 extended_tests = []
 
 [dependencies]
@@ -146,6 +148,7 @@ object_store = { workspace = true }
 parking_lot = { workspace = true }
 parquet = { workspace = true, optional = true, default-features = true }
 serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
@@ -184,6 +187,11 @@ ignored = ["datafusion-doc", "datafusion-macros", "dashmap"]
 
 [target.'cfg(not(target_os = "windows"))'.dev-dependencies]
 nix = { version = "0.31.3", features = ["fs"] }
+
+[[test]]
+name = "llm"
+path = "tests/llm.rs"
+required-features = ["llm"]
 
 [[test]]
 name = "extended_tests"
