@@ -4,6 +4,7 @@
 
 [workspace]
 members = [
+    "datafusion/ai",
     "datafusion/common",
     "datafusion/common-runtime",
     "datafusion/catalog",
@@ -111,6 +112,7 @@ criterion = "0.8"
 ctor = "1.0.7"
 dashmap = "6.2.1"
 datafusion = { path = "datafusion/core", version = "57.0.0-dev", default-features = false }
+datafusion-ai = { path = "datafusion/ai", version = "57.0.0-dev", default-features = false }
 datafusion-catalog = { path = "datafusion/catalog", version = "57.0.0-dev" }
 datafusion-catalog-listing = { path = "datafusion/catalog-listing", version = "57.0.0-dev" }
 datafusion-common = { path = "datafusion/common", version = "57.0.0-dev", default-features = false }
