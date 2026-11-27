@@ -1811,6 +1811,8 @@ version = "57.0.0-dev"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "async-trait",
+ "bytes",
  "datafusion-common",
  "proptest",
  "serde",
