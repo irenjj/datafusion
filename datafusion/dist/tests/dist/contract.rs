@@ -859,6 +859,67 @@ async fn rejects_non_map_only_operators_and_file_extensions() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "parquet_encryption")]
+#[test]
+fn rejects_direct_parquet_encryption_factory() {
+    use datafusion::arrow::datatypes::SchemaRef;
+    use datafusion::common::config::EncryptionFactoryOptions;
+    use datafusion::execution::parquet_encryption::EncryptionFactory;
+    use datafusion::object_store::path::Path;
+    use datafusion::parquet::encryption::{
+        decrypt::FileDecryptionProperties, encrypt::FileEncryptionProperties,
+    };
+    use futures::future::BoxFuture;
+
+    #[derive(Debug)]
+    struct TestEncryptionFactory;
+
+    impl EncryptionFactory for TestEncryptionFactory {
+        fn get_file_encryption_properties<'factory, 'config, 'schema, 'path, 'future>(
+            &'factory self,
+            _config: &'config EncryptionFactoryOptions,
+            _schema: &'schema SchemaRef,
+            _path: &'path Path,
+        ) -> BoxFuture<'future, Result<Option<Arc<FileEncryptionProperties>>>>
+        where
+            'factory: 'future,
+            'config: 'future,
+            'schema: 'future,
+            'path: 'future,
+            Self: 'future,
+        {
+            unreachable!("plan admission must not call the encryption factory")
+        }
+
+        fn get_file_decryption_properties<'factory, 'config, 'path, 'future>(
+            &'factory self,
+            _config: &'config EncryptionFactoryOptions,
+            _path: &'path Path,
+        ) -> BoxFuture<'future, Result<Option<Arc<FileDecryptionProperties>>>>
+        where
+            'factory: 'future,
+            'config: 'future,
+            'path: 'future,
+            Self: 'future,
+        {
+            unreachable!("plan admission must not call the encryption factory")
+        }
+    }
+
+    let source = ParquetSource::new(Arc::new(Schema::empty()))
+        .with_encryption_factory(Arc::new(TestEncryptionFactory));
+    assert_eq!(source.table_parquet_options().crypto, Default::default());
+    let plan = DataSourceExec::from_data_source(
+        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(source))
+            .with_file_groups(vec![FileGroup::new(vec![PartitionedFile::new(
+                "encrypted.parquet",
+                1024,
+            )])])
+            .build(),
+    );
+    rejected(plan, "Parquet encryption");
+}
+
 #[tokio::test]
 async fn rejects_invalid_split_descriptors_and_nonempty_templates() -> Result<()> {
     let dir = tempdir()?;

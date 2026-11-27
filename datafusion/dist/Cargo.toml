@@ -14,6 +14,9 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+parquet_encryption = ["datafusion/parquet_encryption"]
+
 [dependencies]
 datafusion = { workspace = true, features = ["parquet"] }
 datafusion-proto = { workspace = true, features = ["parquet"] }

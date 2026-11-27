@@ -653,7 +653,7 @@ fn rewrite_map_plan(
                 "Map-only distribution does not support ordered, explicitly partitioned, or custom-adapter Parquet scans"
             );
         }
-        if parquet.table_parquet_options().crypto != Default::default() {
+        if parquet.uses_encryption() {
             return plan_err!(
                 "Map-only distribution does not support Parquet encryption settings"
             );
