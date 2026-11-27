@@ -400,6 +400,22 @@ impl ParquetSource {
         &self.table_parquet_options
     }
 
+    /// Whether encryption configuration or a runtime encryption factory is present.
+    ///
+    /// # Public Only for Internal Use
+    ///
+    /// This API is for internal use only. See [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn uses_encryption(&self) -> bool {
+        #[cfg(feature = "parquet_encryption")]
+        if self.encryption_factory.is_some() {
+            return true;
+        }
+        self.table_parquet_options.crypto != Default::default()
+    }
+
     /// return the optional file reader factory
     pub fn parquet_file_reader_factory(
         &self,
@@ -1399,6 +1415,56 @@ mod tests {
     use super::*;
     use arrow::datatypes::Schema;
     use datafusion_physical_expr::expressions::lit;
+
+    #[test]
+    fn uses_encryption() {
+        let source = ParquetSource::new(Arc::new(Schema::empty()));
+        assert!(!source.uses_encryption());
+
+        let mut options = TableParquetOptions::default();
+        options.crypto.factory_id = Some("test-factory".into());
+        assert!(
+            source
+                .clone()
+                .with_table_parquet_options(options)
+                .uses_encryption()
+        );
+
+        #[cfg(feature = "parquet_encryption")]
+        {
+            use arrow::datatypes::SchemaRef;
+            use datafusion_common::Result;
+            use object_store::path::Path;
+            use parquet::encryption::encrypt::FileEncryptionProperties;
+
+            #[derive(Debug)]
+            struct TestEncryptionFactory;
+
+            #[async_trait::async_trait]
+            impl EncryptionFactory for TestEncryptionFactory {
+                async fn get_file_encryption_properties(
+                    &self,
+                    _config: &EncryptionFactoryOptions,
+                    _schema: &SchemaRef,
+                    _path: &Path,
+                ) -> Result<Option<Arc<FileEncryptionProperties>>> {
+                    unreachable!("checking configuration must not call the factory")
+                }
+
+                async fn get_file_decryption_properties(
+                    &self,
+                    _config: &EncryptionFactoryOptions,
+                    _path: &Path,
+                ) -> Result<Option<Arc<FileDecryptionProperties>>> {
+                    unreachable!("checking configuration must not call the factory")
+                }
+            }
+
+            let source = source.with_encryption_factory(Arc::new(TestEncryptionFactory));
+            assert_eq!(source.table_parquet_options().crypto, Default::default());
+            assert!(source.uses_encryption());
+        }
+    }
 
     #[test]
     fn partition_metrics_exclude_derived_plan_metrics() {
