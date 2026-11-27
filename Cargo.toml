@@ -30,6 +30,7 @@ members = [
     "datafusion/functions-nested",
     "datafusion/functions-window",
     "datafusion/functions-window-common",
+    "datafusion/lake",
     "datafusion/optimizer",
     "datafusion/physical-expr",
     "datafusion/physical-expr-adapter",
@@ -68,7 +69,7 @@ license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/apache/datafusion"
 # Define Minimum Supported Rust Version (MSRV)
-rust-version = "1.95.0"
+rust-version = "1.98.0"
 # Define DataFusion version
 version = "57.0.0-dev"
 
@@ -136,6 +137,7 @@ datafusion-functions-nested = { path = "datafusion/functions-nested", version = 
 datafusion-functions-table = { path = "datafusion/functions-table", version = "57.0.0-dev" }
 datafusion-functions-window = { path = "datafusion/functions-window", version = "57.0.0-dev" }
 datafusion-functions-window-common = { path = "datafusion/functions-window-common", version = "57.0.0-dev" }
+datafusion-lake = { path = "datafusion/lake", version = "57.0.0-dev", default-features = false }
 datafusion-macros = { path = "datafusion/macros", version = "57.0.0-dev" }
 datafusion-optimizer = { path = "datafusion/optimizer", version = "57.0.0-dev", default-features = false }
 datafusion-physical-expr = { path = "datafusion/physical-expr", version = "57.0.0-dev", default-features = false }
@@ -163,12 +165,14 @@ indexmap = "2.14.0"
 insta = { version = "1.47.2", features = ["glob", "filters"] }
 itertools = "0.15"
 itoa = "1.0"
+lance = { git = "https://github.com/irenjj/lance.git", rev = "d7774c85fd5416ea5e10f1b5fe861bda7a603672", default-features = false }
 liblzma = { version = "0.4.6", features = ["static"] }
 log = "^0.4"
 loom = "0.7"
 memchr = "2.8.1"
 num-traits = { version = "0.2" }
 object_store = { version = "0.14.2", default-features = false }
+paimon = { git = "https://github.com/irenjj/paimon-rust.git", rev = "b2a0bdae93db74a98a5afe11e614fb491f7a8857", default-features = false, features = ["storage-memory", "storage-fs"] }
 parking_lot = "0.13"
 parquet = { version = "60.2.0", default-features = false, features = [
     "arrow",
@@ -202,6 +206,25 @@ tokio-util = "0.7"
 url = "2.5.7"
 uuid = "1.23"
 zstd = { version = "0.14", default-features = false }
+
+# Unify the crates.io DataFusion dependencies of Lance with the workspace.
+[patch.crates-io]
+datafusion-catalog = { path = "datafusion/catalog" }
+datafusion-common = { path = "datafusion/common" }
+datafusion-common-runtime = { path = "datafusion/common-runtime" }
+datafusion-datasource = { path = "datafusion/datasource" }
+datafusion-execution = { path = "datafusion/execution" }
+datafusion-expr = { path = "datafusion/expr" }
+datafusion-functions = { path = "datafusion/functions" }
+datafusion-functions-aggregate = { path = "datafusion/functions-aggregate" }
+datafusion-functions-nested = { path = "datafusion/functions-nested" }
+datafusion-functions-window = { path = "datafusion/functions-window" }
+datafusion-optimizer = { path = "datafusion/optimizer" }
+datafusion-physical-expr = { path = "datafusion/physical-expr" }
+datafusion-physical-optimizer = { path = "datafusion/physical-optimizer" }
+datafusion-physical-plan = { path = "datafusion/physical-plan" }
+datafusion-session = { path = "datafusion/session" }
+datafusion-sql = { path = "datafusion/sql" }
 
 # Keep this list sorted alphabetically.
 # See https://github.com/apache/datafusion/issues/18467 for the ongoing effort of
@@ -281,6 +304,7 @@ implicit_clone = "allow"                     # 198 hits
 implicit_hasher = "allow"                    # 17 hits; some sites feed arrow APIs that require the default hasher
 inline_always = "allow"                      # 45 hits
 items_after_statements = "allow"             # 171 hits
+manual_bit_width = "allow"                   # 1 upstream test hit after the MSRV bump
 manual_string_new = "allow"                  # 84 hits
 many_single_char_names = "allow"             # 12 hits; short names are idiomatic in the numeric kernels
 map_unwrap_or = "allow"                      # 198 hits
