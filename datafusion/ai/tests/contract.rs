@@ -2,15 +2,25 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::fmt::Debug;
+use std::future::Future;
 use std::io::Cursor;
+use std::pin::pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 use arrow::array::{BooleanArray, RecordBatch, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
-use datafusion_ai::{AiError, AiErrorType, ErrorCode, MediaRef, MediaRefType};
-use datafusion_common::DataFusionError;
+use async_trait::async_trait;
+use bytes::Bytes;
+use datafusion_ai::{
+    AiError, AiErrorType, CheckpointOutputColumn, CheckpointableTarget, ErrorCode,
+    MediaByteRange, MediaRef, MediaRefType, MediaResolver, ResolvedMedia,
+    validate_checkpoint_target,
+};
+use datafusion_common::{DataFusionError, Result, plan_err};
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
@@ -265,4 +275,383 @@ fn arrow_rejects_unrecognized_metadata_and_storage() {
         Field::new("error", DataType::Struct(fields[..3].to_vec().into()), true)
             .with_metadata(error.metadata().clone());
     assert!(truncated.try_extension_type::<AiErrorType>().is_err());
+}
+
+fn assert_plan_error<T: Debug>(result: Result<T>, expected: &str) {
+    let error = result.unwrap_err();
+    let DataFusionError::Plan(message) = error else {
+        panic!("expected a planning error, got {error}");
+    };
+    assert!(message.contains(expected), "{message}");
+}
+
+fn media_ref(byte_offset: Option<u64>, byte_len: Option<u64>) -> MediaRef {
+    MediaRef {
+        uri: "memory://media".to_owned(),
+        byte_offset,
+        byte_len,
+        etag: None,
+        mime: None,
+    }
+}
+
+#[test]
+fn media_ref_rejects_invalid_fields() {
+    for blank in ["", " \t\n\u{2003}"] {
+        let media = MediaRef {
+            uri: blank.to_owned(),
+            ..media_ref(None, None)
+        };
+        assert_plan_error(media.validate(), "URI");
+        assert_plan_error(media.byte_range(), "URI");
+
+        let media = MediaRef {
+            mime: Some(blank.to_owned()),
+            ..media_ref(None, None)
+        };
+        assert_plan_error(media.validate(), "MIME type");
+        assert_plan_error(media.byte_range(), "MIME type");
+    }
+    for (offset, len) in [(u64::MAX, 1), (1, u64::MAX)] {
+        let media = media_ref(Some(offset), Some(len));
+        assert_plan_error(media.validate(), "overflows");
+        assert_plan_error(media.byte_range(), "overflows");
+    }
+}
+
+#[test]
+fn media_ref_normalizes_ranges() {
+    use MediaByteRange::{Bounded, FromOffset, Full};
+
+    for (offset, len, expected) in [
+        (None, None, Full),
+        (Some(5), None, FromOffset(5)),
+        (Some(u64::MAX), None, FromOffset(u64::MAX)),
+        (None, Some(0), Bounded(0..0)),
+        (Some(0), Some(0), Bounded(0..0)),
+        (Some(u64::MAX), Some(0), Bounded(u64::MAX..u64::MAX)),
+        (None, Some(4), Bounded(0..4)),
+        (Some(2), Some(4), Bounded(2..6)),
+        (Some(1), Some(u64::MAX - 1), Bounded(1..u64::MAX)),
+    ] {
+        let media = media_ref(offset, len);
+        media.validate().unwrap();
+        assert_eq!(media.byte_range().unwrap(), expected);
+    }
+}
+
+#[test]
+fn media_ref_accepts_opaque_etags() {
+    for etag in ["", "\"abc\"", "W/\"weak\"", " 影片🦀\0\n"] {
+        let media = MediaRef {
+            etag: Some(etag.to_owned()),
+            ..media_ref(None, None)
+        };
+        media.validate().unwrap();
+        assert_eq!(media.byte_range().unwrap(), MediaByteRange::Full);
+    }
+}
+
+#[derive(Debug)]
+struct InMemoryMediaResolver(ResolvedMedia);
+
+#[async_trait]
+impl MediaResolver for InMemoryMediaResolver {
+    async fn resolve(
+        &self,
+        media: &MediaRef,
+        max_bytes: Option<u64>,
+    ) -> Result<ResolvedMedia> {
+        let object_len = self.0.bytes.len() as u64;
+        let range = match media.byte_range()? {
+            MediaByteRange::Full => 0..object_len,
+            MediaByteRange::FromOffset(offset) => offset..object_len,
+            MediaByteRange::Bounded(range) => range,
+        };
+        if media.etag.is_some() && media.etag != self.0.etag {
+            return plan_err!("media ETag mismatch");
+        }
+        if range.start > range.end {
+            return plan_err!("media range starts past EOF");
+        }
+        let len = range.end - range.start;
+        if max_bytes.is_some_and(|limit| len > limit) {
+            return plan_err!("media range exceeds max_bytes");
+        }
+        let bytes = if len == 0 {
+            Bytes::new()
+        } else {
+            if range.end > object_len {
+                return plan_err!("media range ends past EOF");
+            }
+            self.0.bytes.slice(range.start as usize..range.end as usize)
+        };
+        Ok(ResolvedMedia {
+            bytes,
+            mime: self.0.mime.clone(),
+            etag: self.0.etag.clone(),
+        })
+    }
+}
+
+const OBJECT_ETAG: &str = "W/\"影片\"";
+
+fn in_memory_resolver() -> Arc<dyn MediaResolver> {
+    Arc::new(InMemoryMediaResolver(ResolvedMedia {
+        bytes: Bytes::from_static(b"abcdef"),
+        mime: Some("video/test".to_owned()),
+        etag: Some(OBJECT_ETAG.to_owned()),
+    }))
+}
+
+fn poll_ready<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let Poll::Ready(output) = future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("in-memory resolver must be ready on the first poll");
+    };
+    output
+}
+
+#[test]
+fn media_resolver_reads_ranges_and_metadata() {
+    let resolver = in_memory_resolver();
+    for (offset, len, expected) in [
+        (None, None, b"abcdef".as_slice()),
+        (Some(2), None, b"cdef"),
+        (Some(1), Some(3), b"bcd"),
+        (Some(u64::MAX), Some(0), b""),
+    ] {
+        let media = media_ref(offset, len);
+        let resolved = poll_ready(resolver.resolve(&media, None)).unwrap();
+        assert_eq!(resolved.bytes.as_ref(), expected);
+        assert_eq!(resolved.mime.as_deref(), Some("video/test"));
+        assert_eq!(resolved.etag.as_deref(), Some(OBJECT_ETAG));
+    }
+}
+
+#[test]
+fn media_resolver_enforces_max_bytes() {
+    let resolver = in_memory_resolver();
+    let media = media_ref(None, None);
+    assert_eq!(
+        poll_ready(resolver.resolve(&media, Some(6))).unwrap().bytes,
+        Bytes::from_static(b"abcdef")
+    );
+    assert_plan_error(poll_ready(resolver.resolve(&media, Some(5))), "max_bytes");
+
+    let media = media_ref(Some(3), Some(0));
+    assert!(
+        poll_ready(resolver.resolve(&media, Some(0)))
+            .unwrap()
+            .bytes
+            .is_empty()
+    );
+}
+
+#[test]
+fn media_resolver_validates_reference_and_etag() {
+    let resolver = in_memory_resolver();
+    let mut media = MediaRef {
+        uri: String::new(),
+        ..media_ref(None, None)
+    };
+    assert_plan_error(poll_ready(resolver.resolve(&media, None)), "URI");
+    let overflow = media_ref(Some(u64::MAX), Some(1));
+    assert_plan_error(poll_ready(resolver.resolve(&overflow, None)), "overflows");
+
+    media = media_ref(None, None);
+    media.etag = Some(OBJECT_ETAG.to_owned());
+    assert_eq!(
+        poll_ready(resolver.resolve(&media, None))
+            .unwrap()
+            .etag
+            .as_deref(),
+        Some(OBJECT_ETAG)
+    );
+    media.etag = Some("\"影片\"".to_owned());
+    assert_plan_error(poll_ready(resolver.resolve(&media, None)), "ETag mismatch");
+}
+
+#[derive(Debug)]
+struct TestCheckpointTarget {
+    passthrough_count: usize,
+    columns: Vec<CheckpointOutputColumn>,
+}
+
+impl CheckpointableTarget for TestCheckpointTarget {
+    fn passthrough_column_count(&self) -> usize {
+        self.passthrough_count
+    }
+
+    fn ai_output_columns(&self) -> Vec<CheckpointOutputColumn> {
+        self.columns.clone()
+    }
+
+    fn preserves_input_order(&self) -> bool {
+        true
+    }
+}
+
+fn checkpoint_column(
+    index: usize,
+    name: &str,
+    is_error_envelope: bool,
+) -> CheckpointOutputColumn {
+    CheckpointOutputColumn {
+        index,
+        name: name.to_owned(),
+        is_error_envelope,
+    }
+}
+
+#[test]
+fn checkpoint_target_accepts_valid_columns() {
+    let target = TestCheckpointTarget {
+        passthrough_count: 0,
+        columns: vec![checkpoint_column(0, "score", false)],
+    };
+    let score = Field::new("score", DataType::Float64, true);
+    validate_checkpoint_target(&target, &Schema::new(vec![score.clone()])).unwrap();
+    assert!(target.preserves_row_cardinality());
+
+    let target = TestCheckpointTarget {
+        passthrough_count: 2,
+        columns: vec![
+            checkpoint_column(3, "score", false),
+            checkpoint_column(4, "result", true),
+        ],
+    };
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("uri", DataType::Utf8, false),
+        Field::new("group", DataType::Utf8, false),
+        score,
+        AiErrorType::new(DataType::Utf8)
+            .field("result", true)
+            .unwrap(),
+    ]);
+    validate_checkpoint_target(&target, &schema).unwrap();
+}
+
+#[test]
+fn checkpoint_target_rejects_invalid_column_declarations() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("score", DataType::Float64, true),
+        Field::new("label", DataType::Utf8, true),
+    ]);
+    let score = checkpoint_column(1, "score", false);
+    for (passthrough_count, columns, expected) in [
+        (4, vec![score.clone()], "exceeds output schema"),
+        (1, vec![], "at least one AI output"),
+        (1, vec![checkpoint_column(0, "id", false)], "overlaps"),
+        (
+            1,
+            vec![checkpoint_column(3, "result", false)],
+            "out of bounds",
+        ),
+        (1, vec![score.clone(), score.clone()], "strictly increasing"),
+        (
+            1,
+            vec![checkpoint_column(2, "label", false), score],
+            "strictly increasing",
+        ),
+        (
+            1,
+            vec![checkpoint_column(1, "label", false)],
+            "declares name",
+        ),
+    ] {
+        let target = TestCheckpointTarget {
+            passthrough_count,
+            columns,
+        };
+        assert_plan_error(validate_checkpoint_target(&target, &schema), expected);
+    }
+}
+
+#[test]
+fn checkpoint_target_rejects_invalid_error_envelopes() {
+    let envelope = AiErrorType::new(DataType::Utf8)
+        .field("result", true)
+        .unwrap();
+    let mut wrong_version = envelope.clone();
+    wrong_version
+        .metadata_mut()
+        .insert(EXTENSION_TYPE_METADATA_KEY, r#"{"version":2}"#);
+    let target = TestCheckpointTarget {
+        passthrough_count: 0,
+        columns: vec![checkpoint_column(0, "result", true)],
+    };
+    for field in [
+        Field::new("result", DataType::Utf8, true),
+        Field::new("result", envelope.data_type().clone(), true),
+        MediaRefType::field("result", true).unwrap(),
+        wrong_version,
+    ] {
+        assert_plan_error(
+            validate_checkpoint_target(&target, &Schema::new(vec![field])),
+            "must use the df.ai_error extension",
+        );
+    }
+}
+
+proptest! {
+    #[test]
+    fn media_ref_range_matches_wide_arithmetic(
+        byte_offset in proptest::option::of(any::<u64>()),
+        byte_len in proptest::option::of(any::<u64>()),
+        etag in proptest::option::of(any::<String>()),
+    ) {
+        let media = MediaRef { etag, ..media_ref(byte_offset, byte_len) };
+        let start = byte_offset.unwrap_or(0);
+        let expected = match byte_len {
+            Some(len) => u64::try_from(u128::from(start) + u128::from(len))
+                .map(|end| MediaByteRange::Bounded(start..end)),
+            None => Ok(byte_offset.map_or(MediaByteRange::Full, MediaByteRange::FromOffset)),
+        };
+        match expected {
+            Ok(range) => {
+                prop_assert!(media.validate().is_ok());
+                prop_assert_eq!(media.byte_range().unwrap(), range);
+            }
+            Err(_) => {
+                prop_assert!(matches!(media.validate(), Err(DataFusionError::Plan(_))));
+                prop_assert!(matches!(media.byte_range(), Err(DataFusionError::Plan(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_target_accepts_generated_schema(
+        passthrough_count in 0usize..8,
+        outputs in proptest::collection::vec(
+            (
+                "[a-z_]{1,12}",
+                proptest::sample::select(vec![DataType::Utf8, DataType::UInt64, DataType::Boolean]),
+                any::<bool>(),
+                any::<bool>(),
+            ),
+            1..8,
+        ),
+    ) {
+        let mut fields: Vec<_> = (0..passthrough_count)
+            .map(|index| Field::new(format!("input_{index}"), DataType::Utf8, false))
+            .collect();
+        let columns = outputs.into_iter().map(|(name, data_type, nullable, is_error_envelope)| {
+            let index = fields.len();
+            let field = if is_error_envelope {
+                AiErrorType::new(data_type).field(&name, nullable).unwrap()
+            } else {
+                Field::new(&name, data_type, nullable)
+            };
+            fields.push(field);
+            CheckpointOutputColumn { index, name, is_error_envelope }
+        }).collect();
+        let target = TestCheckpointTarget { passthrough_count, columns };
+        prop_assert!(validate_checkpoint_target(&target, &Schema::new(fields)).is_ok());
+    }
 }

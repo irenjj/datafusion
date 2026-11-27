@@ -9,6 +9,14 @@ use arrow_schema::{ArrowError, extension::ExtensionType};
 use datafusion_common::{Result, plan_err};
 use serde::{Deserialize, Serialize};
 
+mod checkpoint;
+mod media;
+
+pub use checkpoint::{
+    CheckpointOutputColumn, CheckpointableTarget, validate_checkpoint_target,
+};
+pub use media::{MediaByteRange, MediaResolver, ResolvedMedia};
+
 /// Stable wire codes for inference failures.
 ///
 /// # Public Only for Internal Use:
