@@ -15,6 +15,7 @@ members = [
     "datafusion/datasource-csv",
     "datafusion/datasource-json",
     "datafusion/datasource-parquet",
+    "datafusion/dist",
     "datafusion/core",
     "datafusion/expr",
     "datafusion/expr-common",
@@ -193,6 +194,7 @@ stacker = "0.1.24"
 strum = "0.28.0"
 strum_macros = "0.28.0"
 tempfile = "3"
+test-utils = { path = "test-utils" }
 testcontainers-modules = { version = "0.15" }
 tokio = { version = "1.52", features = ["macros", "rt", "sync"] }
 tokio-stream = "0.1"
