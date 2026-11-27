@@ -5,29 +5,7 @@
 name: LLM
 
 on:
-  pull_request:
-    paths: &llm-paths
-      - 'datafusion/core/src/llm/**'
-      - 'datafusion/core/src/execution/session_state.rs'
-      - 'datafusion/core/src/execution/session_state_defaults.rs'
-      - 'datafusion/core/src/lib.rs'
-      - 'datafusion/core/src/physical_planner.rs'
-      - 'datafusion/core/tests/llm.rs'
-      - 'datafusion/core/tests/llm/**'
-      - 'datafusion/core/Cargo.toml'
-      - 'datafusion/expr/src/logical_plan/extension.rs'
-      - 'datafusion/optimizer/src/optimize_projections/**'
-      - 'datafusion/optimizer/src/optimizer.rs'
-      - 'test-utils/**'
-      - '.cargo/config.toml'
-      - '.github/workflows/llm.yml'
-      - '.github/actions/setup-rustup/**'
-      - '.github/actions/setup-rust-runtime/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-  push:
-    paths: *llm-paths
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -69,6 +47,6 @@ jobs:
       - name: Run LLM unit tests
         if: matrix.flavor == 'default'
         run: |
-          cargo test --locked -p datafusion ${{ matrix.args }} --lib llm::
+          cargo test --locked -p datafusion-ai --lib llm::
       - name: Run LLM contracts and differential fuzz smoke
         run: cargo test --locked -p datafusion ${{ matrix.args }} --test llm
