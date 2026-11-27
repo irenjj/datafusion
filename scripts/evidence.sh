@@ -69,10 +69,75 @@ cargo_features=null
 cargo_profile=''
 nextest_profile=''
 toolchain=()
-capture_cargo_settings() {
-    local executable=$1 mode arg value
+
+df_ci_command_words() {
+    [[ ${1:-} == run ]] || return 0
     shift
+    local command='' found=false
+    while (( $# )); do
+        case "$1" in
+            --command|--command=*)
+                [[ $found == false ]] || return 0
+                found=true
+                if [[ $1 == --command ]]; then
+                    (( $# >= 2 )) || return 0
+                    shift
+                    command=$1
+                else
+                    command=${1#*=}
+                fi
+                ;;
+        esac
+        shift
+    done
+    [[ -n $command ]] && command -v python3 >/dev/null || return 0
+
+    # Read literal shell words without evaluating expansions or operators.
+    python3 - "$command" <<'PY'
+import os
+import shlex
+import sys
+
+command = sys.argv[1]
+punctuation = set("();<>|&")
+if any(char in command for char in "\r\n$`"):
+    sys.exit()
+lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+lexer.whitespace_split = True
+lexer.commenters = ""
+try:
+    words = list(lexer)
+except ValueError:
+    sys.exit()
+for word in filter(None, words):
+    if set(word) <= punctuation or set(word) & set("*?[]{}") or word.startswith(("#", "~")):
+        sys.exit()
+sys.stdout.buffer.write(b"".join(os.fsencode(word) + b"\0" for word in words))
+PY
+}
+
+capture_cargo_settings() {
+    local executable=${1:-} mode arg value
+    if [[ ${executable##*/} == env ]]; then
+        shift
+        while (( $# )); do
+            case "$1" in
+                -u|--unset) (( $# >= 2 )) || return 0; shift 2 ;;
+                -u?*|--unset=*|-i|--ignore-environment|--|*=*) shift ;;
+                *) break ;;
+            esac
+        done
+        executable=${1:-}
+    fi
+    if [[ ${executable##*/} == df-ci ]]; then
+        local -a words=()
+        shift
+        mapfile -d '' -t words < <(df_ci_command_words "$@")
+        set -- "${words[@]}"
+        executable=${1:-}
+    fi
     [[ ${executable##*/} == cargo ]] || return 0
+    shift
     if [[ ${1:-} == +* ]]; then
         toolchain=("$1")
         shift

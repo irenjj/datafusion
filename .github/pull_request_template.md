@@ -1,7 +1,12 @@
 > [!IMPORTANT]
 >
-> **Fork CI setup:** For pull requests from a fork to `main`, enable workflows in your fork's **Actions** tab before you push.
-> See the [fork CI setup guide](https://datafusion.apache.org/contributor-guide/#pull-requests-from-forks).
+> Run verification for `irenjj/datafusion` on the local two-node `df-ci` pool and store evidence outside the checkout.
+>
+> ```bash
+> DF_CI=1 scripts/verify-changed-crates.sh "$(git merge-base origin/main HEAD)" ~/df-ci-data/evidence/my-task/
+> ```
+>
+> For on-demand GitHub Actions verification, use `gh workflow run ci.yml -R irenjj/datafusion --ref my-branch`.
 
 ## Which issue does this PR close?
 
@@ -51,7 +56,7 @@ You should also check the `codecov` bot reply on this PR to confirm the changed 
 <!--
 Record every gate selected by docs/VERIFICATION.md for the change surfaces
 touched by this PR. Use a source-bound evidence manifest where available:
-scripts/evidence.sh --name <lane> --output-dir evidence/ -- <command...>
+scripts/evidence.sh --name <lane> --output-dir ~/df-ci-data/evidence/my-task/ -- <command...>
 Record commands that did not run and why instead of leaving rows blank.
 -->
 

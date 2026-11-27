@@ -10,8 +10,10 @@ if (( $# != 2 )); then
     exit 2
 fi
 
-base=$(git rev-parse --verify "$1^{commit}")
+base=$(git rev-parse --verify --end-of-options "$1^{commit}")
+root_dir=$(git rev-parse --show-toplevel)
 output_dir=$2
+df_ci_bin=${DF_CI_BIN:-/home/renjj/repo/datafusion-ci/bin/df-ci}
 failed=0
 selected=0
 
@@ -21,6 +23,17 @@ run_gate() {
     scripts/evidence.sh --name "$name" --output-dir "$output_dir" -- "$@" || failed=1
 }
 
+run_cargo_gate() {
+    local name=$1 command
+    shift
+    if [[ ${DF_CI:-0} == 1 ]]; then
+        printf -v command '%q ' cargo "$@"
+        run_gate "$name" "$df_ci_bin" run --repo "$root_dir" --ensure-submodules --cat-logs --command "$command"
+    else
+        run_gate "$name" cargo "$@"
+    fi
+}
+
 verify_crate() {
     local lane=$1 package=$2
     shift 2
@@ -28,9 +41,11 @@ verify_crate() {
     if [[ $package == datafusion ]]; then
         targets=(--lib --test core_integration)
     fi
-    run_gate "$lane-clippy" cargo clippy --locked -p "$package" "$@" --all-targets -- -D warnings
-    run_gate "$lane-nextest" cargo nextest run --locked --cargo-profile ci -p "$package" "$@" "${targets[@]}"
+    run_cargo_gate "$lane-clippy" clippy --locked -p "$package" "$@" --all-targets -- -D warnings
+    run_cargo_gate "$lane-nextest" nextest run --locked --cargo-profile ci -p "$package" "$@" "${targets[@]}"
 }
+
+run_gate "large-files" ./ci/scripts/check_large_files.sh --base "$base" --head HEAD
 
 for module in ai lake dist core; do
     directory="datafusion/$module"
