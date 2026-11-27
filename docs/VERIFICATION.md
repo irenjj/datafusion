@@ -31,25 +31,36 @@ For focused mutation testing, run `cargo mutants -p datafusion-ai --no-default-f
 
 ## Evidence
 
-Start from a clean checkout with Bash 5, Git, GNU coreutils and `jq` on PATH. Use a separate lane name per command and a fresh output directory for a rerun.
+Start from a clean checkout with Bash 5, Git, GNU coreutils and `jq` on PATH. Use the local two-node `df-ci` pool for routine verification and store evidence outside the checkout. Use a separate lane name per command and a fresh output directory for a rerun.
 
 ```bash
-scripts/evidence.sh --name ai-contract --output-dir evidence/ -- \
-  cargo nextest run --locked --cargo-profile ci -p datafusion-ai --no-default-features --test contract
-scripts/verify-changed-crates.sh "$(git merge-base origin/main HEAD)" evidence/
+DF_CI=1 scripts/verify-changed-crates.sh "$(git merge-base origin/main HEAD)" ~/df-ci-data/evidence/my-task/
+```
+
+This command checks for oversized Git blobs before selecting crate gates. `DF_CI_BIN` overrides the default `/home/renjj/repo/datafusion-ci/bin/df-ci` path. To capture a single pool job, use its full log as the evidence output.
+
+```bash
+scripts/evidence.sh --name ai-contract --output-dir ~/df-ci-data/evidence/my-task/ -- \
+  df-ci run --repo "$PWD" --ensure-submodules --cat-logs --command \
+  'cargo nextest run --locked --cargo-profile ci -p datafusion-ai --no-default-features --test contract'
+```
+
+GitHub Actions verification runs on demand via `workflow_dispatch`. The `base_ref` input accepts a branch or commit and defaults to `main`.
+
+```bash
+gh workflow run ci.yml -R irenjj/datafusion --ref my-branch
 ```
 
 In the PR, record each command, exit code and evidence manifest or artifact path. Record the reason for every applicable check that did not run, including TODO targets, unavailable fixtures and nightly scope. For randomized runs, include the seed, case count and replay command.
 
-`df-evidence-v1` captures the tested Git revision, dirty status, exact argument vector, Cargo feature flags and build profile, UTC start time, duration, tool versions, host and notes. `nextest_profile` records the nextest runner profile separately. Cargo settings describe direct Cargo invocations. Use `--notes` for fixture or environment details outside the argument vector.
+`df-evidence-v1` captures the tested Git revision, dirty status, exact argument vector, Cargo feature flags and build profile, UTC start time, duration, host tool versions and notes. `nextest_profile` records the nextest runner profile separately. Cargo settings describe direct invocations, invocations prefixed with `env`, and a single literal Cargo command passed to `df-ci run --command`. Use `--notes` for fixture, image or environment details outside the argument vector.
 
 Check the log against its SHA-256 from the manifest directory.
 
 ```bash
-cd evidence
-jq -r '.artifacts[] | "\(.sha256)  \(.path)"' "ai-contract-$(git rev-parse HEAD).json" | sha256sum --check
+revision=$(git rev-parse HEAD)
+cd ~/df-ci-data/evidence/my-task/
+jq -r '.artifacts[] | "\(.sha256)  \(.path)"' "ai-contract-$revision.json" | sha256sum --check
 ```
 
 A failed command leaves its log and returns its exit code. A moved revision or an unexpected dirty tree prevents publication of a manifest. `--allow-dirty` marks local diagnostic evidence `source_dirty: true` if edits are present.
-
-Local baseline `6a3f4adcfa7118f2615caae36ab6fbedc272ca3e` (`origin/main`) passed workspace fmt, strict core Clippy with `llm` and strict all-feature workspace Clippy. The new workflow uses blocking crate-scoped checks to keep the PR build bounded.
