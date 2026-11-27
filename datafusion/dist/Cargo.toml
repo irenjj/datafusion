@@ -26,6 +26,7 @@ prost = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+proptest = { version = "1.12", default-features = false, features = ["std"] }
 rand = { workspace = true }
 tempfile = { workspace = true }
 test-utils = { workspace = true }

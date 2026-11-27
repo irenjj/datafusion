@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use datafusion::common::Result;
+use datafusion::common::{Result, exec_err};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
@@ -16,6 +16,7 @@ use crate::plan::{
     DistCodecs, FileExtensionCodecRegistry, PreparedStage, Split, SplitMetrics,
     SplitOutput, StagePlan, bind_split_to_template, decode_stage_template_with_codecs,
 };
+use crate::scheduler::{LeaseToken, LeasedSplitQueue};
 
 /// A local worker with its own session and runtime by default.
 pub struct LocalWorker {
@@ -91,6 +92,32 @@ impl PreparedStage {
     /// Drain the whole single-partition stream before reporting this attempt.
     pub async fn execute_split(&self, split: &Split) -> Result<SplitOutput> {
         let plan = bind_split_to_template(self, split)?;
+        self.execute_bound_split(split, plan).await
+    }
+
+    /// Verify a claimed split, start its lease, and drain its single partition.
+    /// The caller publishes the output through [`LeasedSplitQueue::commit`].
+    pub async fn execute_lease(
+        &self,
+        queue: &LeasedSplitQueue,
+        split: &Split,
+        token: &LeaseToken,
+    ) -> Result<SplitOutput> {
+        if (split.split_id, split.attempt_id) != (token.split_id, token.attempt_id) {
+            return exec_err!("Split does not match lease token");
+        }
+        queue.verify_leased_split(split, token)?;
+        let plan = bind_split_to_template(self, split)?;
+        queue.validate_plan(plan.as_ref(), &self.codecs.physical)?;
+        queue.start(token)?;
+        self.execute_bound_split(split, plan).await
+    }
+
+    async fn execute_bound_split(
+        &self,
+        split: &Split,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Result<SplitOutput> {
         let batches: Vec<_> = plan
             .execute(0, Arc::clone(&self.task_ctx))?
             .try_collect()

@@ -2470,6 +2470,7 @@ dependencies = [
  "datafusion-proto",
  "futures",
  "hex",
+ "proptest",
  "prost",
  "rand 0.9.4",
  "sha2 0.11.1",

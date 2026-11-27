@@ -6,5 +6,9 @@
 mod contract;
 #[path = "dist/fuzz.rs"]
 mod fuzz;
+#[path = "dist/gated_queue.rs"]
+mod gated_queue;
 #[path = "dist/harness.rs"]
 mod harness;
+#[path = "dist/scheduler_props.rs"]
+mod scheduler_props;
