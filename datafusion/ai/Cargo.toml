@@ -18,6 +18,7 @@ workspace = true
 [features]
 default = ["runtime"]
 runtime = [
+    "datafusion-common/object_store",
     "dep:datafusion-execution",
     "dep:datafusion-expr",
     "dep:datafusion-optimizer",
@@ -26,9 +27,11 @@ runtime = [
     "dep:datafusion-session",
     "dep:futures",
     "dep:log",
+    "dep:object_store",
     "dep:parking_lot",
     "dep:tokio",
     "dep:tokio-util",
+    "dep:url",
 ]
 http = ["runtime", "dep:reqwest", "dep:httpdate"]
 
@@ -47,12 +50,14 @@ datafusion-session = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 httpdate = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true }
 parking_lot = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["macros", "rt", "sync", "time"] }
 tokio-util = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { version = "1.12", default-features = false, features = ["std"] }

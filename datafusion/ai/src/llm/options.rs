@@ -3,10 +3,19 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use std::fmt;
+use std::sync::Arc;
 
+use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion_common::{DataFusionError, Result, plan_err};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
+
+use super::TaskKind;
+use crate::AiErrorType;
+
+const MAX_DIMENSION: u32 = 1 << 20;
+const DEFAULT_MEDIA_BYTES: u64 = 8 << 20;
+const MAX_MEDIA_BYTES: u64 = 32 << 20;
 
 /// Determines how an inference slice handles a terminal backend error.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
@@ -19,6 +28,8 @@ pub enum OnError {
     Log,
     /// Output NULL for the affected rows.
     Ignore,
+    /// Emit the result and per-row diagnostics in a `df.ai_error` extension.
+    Envelope,
 }
 
 /// SQL execution controls and provider generation options.
@@ -38,6 +49,10 @@ pub struct LlmOptions {
     /// Action when a request fails permanently or exhausts retries.
     #[serde(default)]
     pub on_error: OnError,
+    /// Output dimension required for `embed()`.
+    pub dimension: Option<u32>,
+    /// Maximum bytes to read per media reference. Defaults to 8 MiB.
+    pub max_media_bytes: Option<u64>,
     /// Reuse identical calls in a SELECT for non-volatile prompts. Defaults to true.
     pub deduplicate: Option<bool>,
     /// Optional system message.
@@ -56,11 +71,26 @@ pub struct LlmOptions {
 
 impl LlmOptions {
     pub(super) fn parse(json: &str) -> Result<(Self, String)> {
-        // Check every key before materializing the object, including duplicate members.
-        let Options(mut value) =
+        // Check duplicate members before materializing the object. Let serde_json
+        // decode numbers so its arbitrary_precision representation stays internal.
+        let _: CheckedOptions =
+            serde_json::from_str(json).map_err(|error| invalid_options(&error))?;
+        let mut value: Value =
             serde_json::from_str(json).map_err(|error| invalid_options(&error))?;
         if !value.is_object() {
             return plan_err!("invalid llm() options_json: expected a JSON object");
+        }
+        if value.get("max_retries").is_some_and(|value| {
+            value.is_number()
+                && value
+                    .as_u64()
+                    .and_then(|number| usize::try_from(number).ok())
+                    .is_none()
+        }) {
+            return invalid_value(
+                "max_retries",
+                "a nonnegative integer that fits in usize",
+            );
         }
         value.sort_all_objects();
         let canonical = value.to_string();
@@ -86,6 +116,12 @@ impl LlmOptions {
             return invalid_value("max_tokens", "at least 1");
         }
         if options
+            .max_media_bytes
+            .is_some_and(|limit| limit > MAX_MEDIA_BYTES)
+        {
+            return invalid_value("max_media_bytes", "at most 33554432 bytes");
+        }
+        if options
             .temperature
             .is_some_and(|t| !t.is_finite() || t < 0.0)
         {
@@ -102,6 +138,35 @@ impl LlmOptions {
             return invalid_value("stop", "a non-empty list of non-empty strings");
         }
         Ok((options, canonical))
+    }
+
+    pub(super) fn embedding_dimension(&self) -> Result<i32> {
+        match self.dimension {
+            Some(dim) if (1..=MAX_DIMENSION).contains(&dim) => Ok(dim as i32),
+            _ => plan_err!(
+                "embed() requires a dimension between 1 and {MAX_DIMENSION} in options_json"
+            ),
+        }
+    }
+
+    pub(super) fn media_byte_limit(&self) -> u64 {
+        self.max_media_bytes.unwrap_or(DEFAULT_MEDIA_BYTES)
+    }
+
+    pub(super) fn output_field(&self, kind: TaskKind, name: &str) -> Result<FieldRef> {
+        let data_type = match kind {
+            TaskKind::Embed => DataType::FixedSizeList(
+                Arc::new(Field::new_list_field(DataType::Float32, false)),
+                self.embedding_dimension()?,
+            ),
+            TaskKind::Chat | TaskKind::Vision => DataType::Utf8,
+        };
+        let field = if self.on_error == OnError::Envelope {
+            AiErrorType::new(data_type).field(name, false)?
+        } else {
+            Field::new(name, data_type, true)
+        };
+        Ok(Arc::new(field))
     }
 }
 
@@ -127,74 +192,69 @@ pub(super) fn is_sensitive_key(key: &str) -> bool {
     )
 }
 
-struct Options(Value);
+struct CheckedOptions;
 
-impl<'de> Deserialize<'de> for Options {
+impl<'de> Deserialize<'de> for CheckedOptions {
     fn deserialize<D: Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        deserializer.deserialize_any(OptionsVisitor).map(Self)
+        deserializer.deserialize_any(OptionsVisitor).map(|()| Self)
     }
 }
 
 struct OptionsVisitor;
 
 impl<'de> Visitor<'de> for OptionsVisitor {
-    type Value = Value;
+    type Value = ();
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a JSON value")
     }
 
-    fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<Value, E> {
-        Ok(Value::from(value))
+    fn visit_bool<E: de::Error>(self, _value: bool) -> std::result::Result<(), E> {
+        Ok(())
     }
 
-    fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Value, E> {
-        Ok(Value::from(value))
+    fn visit_i64<E: de::Error>(self, _value: i64) -> std::result::Result<(), E> {
+        Ok(())
     }
 
-    fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Value, E> {
-        Ok(Value::from(value))
+    fn visit_u64<E: de::Error>(self, _value: u64) -> std::result::Result<(), E> {
+        Ok(())
     }
 
-    fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Value, E> {
-        Ok(Value::from(value))
+    fn visit_f64<E: de::Error>(self, _value: f64) -> std::result::Result<(), E> {
+        Ok(())
     }
 
-    fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Value, E> {
-        Ok(Value::from(value))
+    fn visit_str<E: de::Error>(self, _value: &str) -> std::result::Result<(), E> {
+        Ok(())
     }
 
-    fn visit_unit<E: de::Error>(self) -> std::result::Result<Value, E> {
-        Ok(Value::Null)
+    fn visit_unit<E: de::Error>(self) -> std::result::Result<(), E> {
+        Ok(())
     }
 
     fn visit_seq<A: SeqAccess<'de>>(
         self,
         mut seq: A,
-    ) -> std::result::Result<Value, A::Error> {
-        let mut values = Vec::new();
-        while let Some(Options(value)) = seq.next_element()? {
-            values.push(value);
-        }
-        Ok(Value::Array(values))
+    ) -> std::result::Result<(), A::Error> {
+        while seq.next_element::<CheckedOptions>()?.is_some() {}
+        Ok(())
     }
 
     fn visit_map<A: MapAccess<'de>>(
         self,
         mut map: A,
-    ) -> std::result::Result<Value, A::Error> {
-        let mut values = Map::new();
+    ) -> std::result::Result<(), A::Error> {
         // Check each key as it is read, including members a duplicate key might overwrite.
         while let Some(key) = map.next_key::<String>()? {
             if is_sensitive_key(&key) {
                 return Err(de::Error::custom("contains a sensitive credential key"));
             }
-            let Options(value) = map.next_value()?;
-            values.insert(key, value);
+            map.next_value::<CheckedOptions>()?;
         }
-        Ok(Value::Object(values))
+        Ok(())
     }
 }
 
@@ -211,7 +271,11 @@ mod tests {
             (r#"{"batch_size":0}"#, "batch_size"),
             (r#"{"inflight_limit":0}"#, "inflight_limit"),
             (r#"{"timeout_ms":0}"#, "timeout_ms"),
-            (r#"{"max_retries":-1}"#, "usize"),
+            (r#"{"max_media_bytes":33554433}"#, "max_media_bytes"),
+            (
+                r#"{"max_retries":-1}"#,
+                "max_retries must be a nonnegative integer",
+            ),
             (r#"{"on_error":"continue"}"#, "unknown variant"),
             (r#"{"deduplicate":0}"#, "boolean"),
             (r#"{"max_tokens":0}"#, "max_tokens"),
@@ -238,15 +302,16 @@ mod tests {
     #[test]
     fn parses_typed_options_and_recursively_sorts_json() {
         let (options, canonical) = LlmOptions::parse(
-            r#"{"top_p":1,"extra_body":{"z":[{"b":1,"a":2}],"a":{}}, "on_error":"ignore","max_retries":0}"#,
+            r#"{"top_p":0.75,"extra_body":{"z":[{"b":0.125,"a":2}],"a":{}}, "on_error":"ignore","max_retries":0,"temperature":0.25}"#,
         )
         .unwrap();
         assert_eq!(options.on_error, OnError::Ignore);
         assert_eq!(options.max_retries, Some(0));
-        assert_eq!(options.top_p, Some(1.0));
+        assert_eq!(options.top_p, Some(0.75));
+        assert_eq!(options.temperature, Some(0.25));
         assert_eq!(
             canonical,
-            r#"{"extra_body":{"a":{},"z":[{"a":2,"b":1}]},"max_retries":0,"on_error":"ignore","top_p":1}"#
+            r#"{"extra_body":{"a":{},"z":[{"a":2,"b":0.125}]},"max_retries":0,"on_error":"ignore","temperature":0.25,"top_p":0.75}"#
         );
     }
 }

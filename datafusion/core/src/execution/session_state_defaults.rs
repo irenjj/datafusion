@@ -84,6 +84,8 @@ impl SessionStateDefaults {
             Arc::new(functions::unicode::planner::UnicodeFunctionPlanner),
             Arc::new(functions_aggregate::planner::AggregateFunctionPlanner),
             Arc::new(functions_window::planner::WindowFunctionPlanner),
+            #[cfg(feature = "ai")]
+            crate::llm::marker_expr_planner(),
         ];
 
         expr_planners
@@ -101,7 +103,10 @@ impl SessionStateDefaults {
         functions.append(&mut functions_nested::all_default_nested_functions());
 
         #[cfg(feature = "ai")]
-        functions.push(crate::llm::marker_udf());
+        {
+            functions.push(crate::llm::marker_udf());
+            functions.extend(crate::llm::multimodal_marker_udfs());
+        }
 
         functions
     }

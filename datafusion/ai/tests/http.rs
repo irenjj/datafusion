@@ -9,9 +9,11 @@ use std::time::{Duration, SystemTime};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion_ai::ResolvedMedia;
 use datafusion_ai::llm::{
     CancellationToken, LlmBackend, LlmBackendError, LlmExec, LlmOptions,
     LlmProviderRegistry, LlmRequest, LlmResponse, OpenAiHttpBackend, OpenAiHttpConfig,
+    TaskKind,
 };
 use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::TaskContext;
@@ -98,6 +100,7 @@ fn config(base_url: String, key: Option<&str>) -> OpenAiHttpConfig {
         base_url,
         api_key: key.map(str::to_owned),
         api_key_env: None,
+        ca_cert_pem: None,
     }
 }
 
@@ -112,8 +115,173 @@ fn request(options: LlmOptions) -> LlmRequest {
     LlmRequest {
         model: "test-model".into(),
         prompts: vec!["prompt".into()],
+        media: vec![None],
         options: Arc::new(options),
     }
+}
+
+#[tokio::test]
+async fn embeddings_reorder_a_full_batch_and_reject_schema_mismatches() {
+    let prompts: Vec<_> = (0..32).map(|index| format!("prompt {index}")).collect();
+    let data: Vec<_> = (0..32)
+        .rev()
+        .map(|index| json!({"index": index, "embedding": [index, 0]}))
+        .collect();
+    let mut wrong_dim = data.clone();
+    wrong_dim[0]["embedding"] = json!([31]);
+    let mut duplicate = data.clone();
+    duplicate[0]["index"] = json!(30);
+    let mut out_of_range = data.clone();
+    out_of_range[0]["index"] = json!(32);
+    for (entries, valid) in [
+        (&data[..], true),
+        (&data[1..], false),
+        (&wrong_dim[..], false),
+        (&duplicate[..], false),
+        (&out_of_range[..], false),
+    ] {
+        let (listener, backend) = bind(Some(KEY)).await;
+        assert_eq!(backend.max_batch_size_for(TaskKind::Embed), Some(32));
+        let options = LlmOptions {
+            dimension: Some(2),
+            ..Default::default()
+        };
+        let request = LlmRequest {
+            prompts: prompts.clone(),
+            media: vec![None; prompts.len()],
+            ..request(options)
+        };
+        let (result, ()) = timeout(TEST_TIMEOUT, async {
+            tokio::join!(backend.embed(request, CancellationToken::new()), async {
+                let (capture, mut socket) = read_request(&listener).await;
+                assert_eq!(
+                    capture.request_line,
+                    "POST /provider/v1/embeddings HTTP/1.1"
+                );
+                assert_eq!(capture.headers["authorization"], format!("Bearer {KEY}"));
+                assert_eq!(
+                    capture.body,
+                    json!({"model": "test-model", "input": prompts})
+                );
+                let body = json!({"data": entries, "usage": {}}).to_string();
+                socket
+                    .write_all(reply("200 OK", "", &body).as_bytes())
+                    .await
+                    .unwrap();
+            },)
+        })
+        .await
+        .unwrap();
+        if valid {
+            let response = result.unwrap();
+            assert_eq!(
+                response.outputs,
+                (0..32)
+                    .map(|index| vec![index as f32, 0.0])
+                    .collect::<Vec<_>>()
+            );
+            let usage = response.usage.unwrap();
+            assert_eq!((usage.input_tokens, usage.output_tokens), (0, 0));
+        } else {
+            assert!(
+                matches!(result, Err(LlmBackendError::SchemaMismatch { .. })),
+                "{result:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn vision_posts_text_and_inline_image_with_authorization() {
+    let (listener, backend) = bind(Some(KEY)).await;
+    for (mime, expected_mime) in [
+        (Some("image/png"), "image/png"),
+        (None, "application/octet-stream"),
+    ] {
+        let request = LlmRequest {
+            media: vec![Some(ResolvedMedia {
+                bytes: bytes::Bytes::from_static(b"\x00\xff"),
+                mime: mime.map(str::to_owned),
+                etag: None,
+            })],
+            ..request(LlmOptions::default())
+        };
+        let (result, ()) = timeout(TEST_TIMEOUT, async {
+            tokio::join!(
+                backend.generate(request, CancellationToken::new()),
+                async {
+                    let (capture, mut socket) = read_request(&listener).await;
+                    capture.assert_request(Some(KEY), &json!({
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": [
+                            {"type": "text", "text": "prompt"},
+                            {"type": "image_url", "image_url": {"url": format!("data:{expected_mime};base64,AP8=")}},
+                        ]}],
+                        "stream": false,
+                        "n": 1,
+                    }));
+                    socket.write_all(success().as_bytes()).await.unwrap();
+                },
+            )
+        }).await.unwrap();
+        assert_eq!(result.unwrap().outputs, [Some("generated".to_owned())]);
+    }
+}
+
+#[test]
+fn invalid_custom_ca_pem_is_a_planning_error() {
+    let error = OpenAiHttpBackend::try_new(OpenAiHttpConfig {
+        ca_cert_pem: Some(b"private-marker".to_vec()),
+        ..config("https://localhost/v1".into(), None)
+    })
+    .unwrap_err();
+    assert!(
+        matches!(error, DataFusionError::Plan(message) if message.contains("ca_cert_pem") && !message.contains("private-marker"))
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Python 3 and the OpenSSL CLI to serve loopback TLS"]
+async fn custom_ca_controls_trust_of_the_loopback_server() {
+    use std::io::{BufRead, Read};
+    use std::process::{Command, Stdio};
+
+    let mut server = Command::new("python3")
+        .arg("-c")
+        .arg(include_str!("tls_loopback.py"))
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = std::io::BufReader::new(server.stdout.take().unwrap());
+    let mut header = String::new();
+    output.read_line(&mut header).unwrap();
+    let (port, pem_len) = header.trim_end().split_once(' ').unwrap();
+    let mut pem = vec![0; pem_len.parse().unwrap()];
+    output.read_exact(&mut pem).unwrap();
+    let config = || config(format!("https://127.0.0.1:{port}/v1"), None);
+    let untrusted = OpenAiHttpBackend::try_new(config()).unwrap();
+    let trusted = OpenAiHttpBackend::try_new(OpenAiHttpConfig {
+        ca_cert_pem: Some(pem),
+        ..config()
+    })
+    .unwrap();
+    let result = timeout(TEST_TIMEOUT, async {
+        let untrusted = untrusted
+            .generate(request(LlmOptions::default()), CancellationToken::new())
+            .await;
+        let trusted = trusted
+            .generate(request(LlmOptions::default()), CancellationToken::new())
+            .await;
+        (untrusted, trusted)
+    })
+    .await;
+    assert!(server.wait().unwrap().success());
+    let (untrusted, trusted) = result.unwrap();
+    assert!(
+        matches!(untrusted, Err(LlmBackendError::Transient { .. })),
+        "{untrusted:?}"
+    );
+    assert_eq!(trusted.unwrap().outputs, [Some("trusted".to_owned())]);
 }
 
 fn basic_body(prompt: &str) -> Value {

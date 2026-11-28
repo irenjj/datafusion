@@ -6,24 +6,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use arrow::array::{Int32Array, StringArray};
+use arrow::array::{
+    Array, AsArray, FixedSizeListArray, Int32Array, StringArray, StructArray, UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion_ai::llm::{
     CancellationToken, LlmBackend, LlmBackendError, LlmExec, LlmProviderRegistry,
-    LlmRequest, LlmResponse, MockLlmBackend, OnError,
+    LlmRequest, LlmResponse, MediaPlan, MockLlmBackend, OnError, TaskKind,
 };
 use datafusion_ai::{
-    CheckpointOutputColumn, CheckpointableTarget, validate_checkpoint_target,
+    AiErrorType, CheckpointOutputColumn, CheckpointableTarget, MediaRef, MediaRefType,
+    MediaResolver, ObjectStoreMediaResolver, ResolvedMedia, validate_checkpoint_target,
 };
 use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::TaskContext;
 use datafusion_execution::config::SessionConfig;
+use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::test::TestMemoryExec;
 use futures::{StreamExt, TryStreamExt, poll};
+use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, advance, timeout};
 
@@ -195,6 +200,8 @@ async fn decoded_operators_preserve_rows_and_own_independent_metrics() -> Result
     assert_eq!(first.options().provider.as_deref(), Some("worker"));
     assert_eq!(first.options().batch_size, Some(2));
     assert_eq!(first.output_col(), "answer");
+    assert_eq!(first.task_kind(), TaskKind::Chat);
+    assert!(first.media().is_none());
     assert_eq!(
         first.options_json(),
         r#"{"batch_size":2,"extra_body":{"a":{},"z":[{"a":2,"b":1}]},"provider":"worker"}"#,
@@ -220,6 +227,300 @@ async fn decoded_operators_preserve_rows_and_own_independent_metrics() -> Result
     assert_eq!(rows(&batches), expected);
     assert_eq!(submitted(&second), 2);
     assert_eq!(submitted(&first), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn object_store_resolver_checks_ranges_limits_and_etags() -> Result<()> {
+    let env = RuntimeEnv::default();
+    let store = Arc::new(InMemory::new());
+    let etag = store
+        .put(
+            &Path::from("asset"),
+            bytes::Bytes::from_static(b"abcdef").into(),
+        )
+        .await?
+        .e_tag;
+    assert!(etag.is_some());
+    env.register_object_store(&"memory://test".parse().unwrap(), store);
+    let resolver = ObjectStoreMediaResolver::new(Arc::clone(&env.object_store_registry));
+    let mut media = MediaRef {
+        uri: "memory://test/asset".into(),
+        byte_offset: None,
+        byte_len: None,
+        etag,
+        mime: Some("image/png".into()),
+    };
+    assert!(resolver.resolve(&media, None).await.is_err());
+    assert!(
+        resolver
+            .resolve(&media, Some(5))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("max_bytes")
+    );
+    let full = resolver.resolve(&media, Some(6)).await?;
+    assert_eq!(full.bytes, "abcdef");
+    assert_eq!(full.mime, media.mime);
+    assert_eq!(full.etag, media.etag);
+    media.byte_offset = Some(2);
+    assert_eq!(resolver.resolve(&media, Some(4)).await?.bytes, "cdef");
+    media.byte_len = Some(2);
+    assert_eq!(resolver.resolve(&media, Some(2)).await?.bytes, "cd");
+    media.byte_len = Some(9);
+    assert!(resolver.resolve(&media, Some(9)).await.is_err());
+    media.etag = Some("wrong".into());
+    media.byte_len = Some(0);
+    assert!(
+        resolver
+            .resolve(&media, Some(0))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("ETag")
+    );
+    media.etag = None;
+    media.byte_offset = Some(u64::MAX);
+    media.uri = "memory://unregistered/missing".into();
+    assert!(resolver.resolve(&media, None).await?.bytes.is_empty());
+
+    media.byte_len = None;
+    media.uri = "memory://unregistered/asset?sig=private-marker".into();
+    let error = resolver
+        .resolve(&media, Some(1))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !error.contains("://") && !error.contains("private-marker"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn vision_worker_decode_requires_a_media_resolver() -> Result<()> {
+    let ctx = task_context(&LlmProviderRegistry::default());
+    let plan = || MediaPlan::new(Arc::new(Column::new("text", 1)));
+    let decode_vision = |ctx| {
+        LlmExec::try_new_task_from_task_context(
+            input(&[Some("prompt")])?,
+            Arc::new(Column::new("text", 1)),
+            Some(plan()),
+            TaskKind::Vision,
+            "model".into(),
+            "{}",
+            "answer".into(),
+            ctx,
+        )
+    };
+    let error = decode_vision(&ctx).unwrap_err();
+    assert!(
+        matches!(error, DataFusionError::Plan(message) if message.contains("resolver"))
+    );
+    let env = RuntimeEnv::default();
+    let resolver = ObjectStoreMediaResolver::new(Arc::clone(&env.object_store_registry));
+    let ctx = TaskContext::default().with_session_config(
+        ctx.session_config()
+            .clone()
+            .with_extension(Arc::new(resolver)),
+    );
+    let exec = decode_vision(&ctx)?;
+    assert_eq!(exec.task_kind(), TaskKind::Vision);
+    assert!(exec.media().is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn embedding_envelope_is_checkpointable_and_round_trips_fixed_size_lists()
+-> Result<()> {
+    use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
+    use std::io::Cursor;
+
+    let ctx = task_context(&LlmProviderRegistry::default());
+    let exec = LlmExec::try_new_task_from_task_context(
+        input(&[Some("prompt")])?,
+        Arc::new(Column::new("text", 1)),
+        None,
+        TaskKind::Embed,
+        "model".into(),
+        r#"{"dimension":2,"on_error":"envelope"}"#,
+        "answer".into(),
+        &ctx,
+    )?;
+    assert_eq!(exec.task_kind(), TaskKind::Embed);
+    assert!(exec.media().is_none());
+    let schema = exec.schema();
+    validate_checkpoint_target(&exec, &schema)?;
+    assert!(exec.ai_output_columns()[0].is_error_envelope);
+    schema.field(2).try_extension_type::<AiErrorType>()?;
+    let batch = exec
+        .execute(0, ctx)?
+        .try_collect::<Vec<_>>()
+        .await?
+        .remove(0);
+    let envelope = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let values = envelope
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap();
+    assert_eq!(values.value_length(), 2);
+    assert!(!values.is_null(0));
+    assert!(envelope.columns()[1..].iter().all(|field| field.is_null(0)));
+    let mut writer = StreamWriter::try_new(Vec::new(), &schema)?;
+    writer.write(&batch)?;
+    let read_back = StreamReader::try_new(Cursor::new(writer.into_inner()?), None)?;
+    assert_eq!(
+        read_back.collect::<std::result::Result<Vec<_>, _>>()?,
+        [batch]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn vision_envelopes_keep_struct_references_and_failures_aligned() -> Result<()> {
+    #[derive(Debug, Default)]
+    struct Resolver(AtomicUsize);
+
+    #[async_trait]
+    impl MediaResolver for Resolver {
+        async fn resolve(
+            &self,
+            media: &MediaRef,
+            max_bytes: Option<u64>,
+        ) -> Result<ResolvedMedia> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(max_bytes, Some(8 << 20));
+            match media.uri.as_str() {
+                "memory://test/first" => {
+                    assert_eq!((media.byte_offset, media.byte_len), (Some(1), Some(3)));
+                    assert_eq!(media.etag.as_deref(), Some("opaque"));
+                    Ok(ResolvedMedia {
+                        bytes: bytes::Bytes::from_static(b"img"),
+                        mime: None,
+                        etag: media.etag.clone(),
+                    })
+                }
+                "memory://test/missing" => datafusion_common::exec_err!("object was not found"),
+                "memory://test/busy" => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out\nwhile reading https://storage.invalid/signed?sig=private-marker",
+                ).into()),
+                uri => panic!("unexpected media read for {uri}"),
+            }
+        }
+    }
+
+    let media_field = MediaRefType::field("media", false)?;
+    let DataType::Struct(fields) = media_field.data_type() else {
+        unreachable!()
+    };
+    let references = StructArray::try_new(
+        fields.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![
+                "memory://test/first",
+                "memory://test/missing",
+                "memory://test/busy",
+                "memory://test/unused",
+            ])),
+            Arc::new(UInt64Array::from(vec![Some(1), None, None, None])),
+            Arc::new(UInt64Array::from(vec![Some(3), None, None, None])),
+            Arc::new(StringArray::from(vec![Some("opaque"), None, None, None])),
+            Arc::new(StringArray::from(vec![Some("image/png"), None, None, None])),
+        ],
+        None,
+    )?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("text", DataType::Utf8, true),
+        media_field,
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                None,
+            ])),
+            Arc::new(references),
+        ],
+    )?;
+    let (registry, mut attempts) = script(1)?;
+    let resolver = Arc::new(Resolver::default());
+    let ctx = Arc::new(
+        TaskContext::default().with_session_config(
+            SessionConfig::new()
+                .with_extension(Arc::new(registry))
+                .with_extension(Arc::new(resolver.clone() as Arc<dyn MediaResolver>)),
+        ),
+    );
+    let input = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?;
+    let exec = LlmExec::try_new_task_from_task_context(
+        input,
+        Arc::new(Column::new("text", 0)),
+        Some(MediaPlan::new(Arc::new(Column::new("media", 1)))),
+        TaskKind::Vision,
+        "model".into(),
+        r#"{"provider":"script","batch_size":3,"on_error":"envelope"}"#,
+        "answer".into(),
+        &ctx,
+    )?;
+    let output = exec.execute(0, ctx)?.try_collect::<Vec<_>>();
+    let (output, ()) = tokio::join!(output, async {
+        let attempt = next_attempt(&mut attempts).await;
+        assert_eq!(attempt.prompts, ["a"]);
+        assert_eq!(
+            attempt.media[0].as_ref().unwrap().mime.as_deref(),
+            Some("image/png")
+        );
+        attempt.succeed();
+    });
+    let output = output?;
+    let envelope = output
+        .iter()
+        .find(|batch| batch.num_rows() == 3)
+        .unwrap()
+        .column(2)
+        .as_struct();
+    assert_eq!(
+        envelope
+            .column(0)
+            .as_string::<i32>()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some("answer:a"), None, None]
+    );
+    assert_eq!(
+        envelope
+            .column(1)
+            .as_string::<i32>()
+            .iter()
+            .collect::<Vec<_>>(),
+        [None, Some("PERMANENT_HTTP"), Some("TRANSIENT_HTTP")]
+    );
+    assert_eq!(
+        envelope.column(3).as_boolean().iter().collect::<Vec<_>>(),
+        [None, Some(false), Some(true)]
+    );
+    for message in envelope.column(2).as_string::<i32>().iter().flatten() {
+        assert!(message.starts_with("media: "));
+        assert!(
+            !message.contains(['\n', '\r'])
+                && !message.contains("://")
+                && !message.contains("private-marker")
+        );
+    }
+    assert_eq!(resolver.0.load(Ordering::Relaxed), 3);
+    assert_eq!(submitted(&exec), 1);
+    assert_eq!(metric(&exec, "failed_rows"), 2);
     Ok(())
 }
 
@@ -249,6 +550,7 @@ type Reply = std::result::Result<LlmResponse, LlmBackendError>;
 
 struct Attempt {
     prompts: Vec<String>,
+    media: Vec<Option<ResolvedMedia>>,
     cancel: CancellationToken,
     reply: oneshot::Sender<Reply>,
 }
@@ -280,6 +582,7 @@ impl LlmBackend for ScriptedBackend {
             self.0
                 .send(Attempt {
                     prompts: request.prompts,
+                    media: request.media,
                     cancel: cancel.clone(),
                     reply
                 })
@@ -537,6 +840,83 @@ async fn terminal_failures_raise_log_or_ignore_as_requested() -> Result<()> {
         assert_eq!(metric(&exec, "backend_attempts"), 1);
         assert_eq!(registry.available_permits("script"), Some(1));
         assert_no_attempt(&mut attempts);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn envelope_preserves_terminal_error_codes_and_retryability() -> Result<()> {
+    let errors = [
+        (
+            LlmBackendError::RateLimited {
+                retry_after: None,
+                message: "throttled".into(),
+            },
+            "RATE_LIMITED",
+            true,
+        ),
+        (
+            LlmBackendError::Transient {
+                status: Some(503),
+                message: "unavailable".into(),
+            },
+            "TRANSIENT_HTTP",
+            true,
+        ),
+        (
+            LlmBackendError::Permanent {
+                status: Some(403),
+                message: "forbidden".into(),
+            },
+            "PERMANENT_HTTP",
+            false,
+        ),
+        (
+            LlmBackendError::InvalidResponse {
+                status: Some(200),
+                message: "invalid response".into(),
+            },
+            "INVALID_RESPONSE",
+            false,
+        ),
+        (
+            LlmBackendError::SchemaMismatch {
+                message: "wrong dimension".into(),
+            },
+            "SCHEMA_MISMATCH",
+            false,
+        ),
+        (LlmBackendError::Cancelled, "CANCELLED", false),
+    ];
+    for (error, code, retryable) in errors {
+        let (registry, mut attempts) = script(1)?;
+        let ctx = task_context(&registry);
+        let exec = decode(
+            input(&[Some("a"), Some("b")])?,
+            r#"{"provider":"script","max_retries":0,"batch_size":2,"on_error":"envelope"}"#,
+            &ctx,
+        )?;
+        let message = error.to_string();
+        let collect = exec.execute(0, ctx)?.try_collect::<Vec<_>>();
+        let (batches, ()) = tokio::join!(collect, async {
+            next_attempt(&mut attempts)
+                .await
+                .reply
+                .send(Err(error))
+                .unwrap();
+        });
+        let batches = batches?;
+        assert_eq!(batches.len(), 1);
+        let envelope = batches[0].column(2).as_struct();
+        assert_eq!(envelope.len(), 2);
+        assert_eq!(envelope.column(0).null_count(), 2);
+        for row in 0..2 {
+            assert_eq!(envelope.column(1).as_string::<i32>().value(row), code);
+            assert_eq!(envelope.column(2).as_string::<i32>().value(row), message);
+            assert_eq!(envelope.column(3).as_boolean().value(row), retryable);
+        }
+        assert_eq!(metric(&exec, "failed_rows"), 2);
+        assert_eq!(metric(&exec, "backend_attempts"), 1);
     }
     Ok(())
 }
