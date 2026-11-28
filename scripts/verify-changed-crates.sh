@@ -57,6 +57,7 @@ for module in ai lake dist core; do
         ai)
             verify_crate ai-contract datafusion-ai --no-default-features
             verify_crate ai-runtime datafusion-ai
+            verify_crate ai-http datafusion-ai --features http
             ;;
         core)
             has_ai=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '

@@ -104,6 +104,7 @@ unicode_expressions = [
 ]
 # Enables SQL planning and execution for AI operators.
 ai = ["dep:datafusion-ai", "sql", "string_expressions"]
+ai-http = ["ai", "datafusion-ai/http"]
 llm = ["ai"]
 extended_tests = []
 

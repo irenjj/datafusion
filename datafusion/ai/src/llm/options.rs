@@ -120,7 +120,7 @@ fn invalid_options(error: &serde_json::Error) -> DataFusionError {
     DataFusionError::Plan(format!("invalid llm() options_json: {error}"))
 }
 
-fn is_sensitive_key(key: &str) -> bool {
+pub(super) fn is_sensitive_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
         "api_key" | "token" | "secret" | "password"
