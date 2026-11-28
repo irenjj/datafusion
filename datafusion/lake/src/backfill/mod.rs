@@ -11,6 +11,8 @@
 mod lance;
 mod paimon;
 mod plan;
+mod stage;
+mod wire;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -19,6 +21,7 @@ use futures::Stream;
 use lance_io::object_store::ObjectStoreParams;
 
 pub use plan::{BackfillPlan, BackfillReceipt, BackfillWorkUnit};
+pub use stage::bridge_backfill_stage;
 
 /// The existing table that the coordinator will backfill.
 ///
@@ -57,7 +60,8 @@ pub async fn prepare_backfill(
 
 /// Write only the new columns for one attempt. The stream must supply every row
 /// in physical offset order, including deleted offsets, with the planned Arrow
-/// schema on every batch. Wrap a single batch in [futures::stream::iter].
+/// schema on every batch. Use [`bridge_backfill_stage`] to adapt a logical stream
+/// of visible rows from a distributed stage. Wrap a single batch in [futures::stream::iter].
 ///
 /// # Errors
 /// Returns an error for invalid inputs, storage failures, or a previously published

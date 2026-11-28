@@ -3,7 +3,9 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use arrow::datatypes::{DataType, Fields, Schema};
 use datafusion_common::{Result, not_impl_err, plan_datafusion_err, plan_err};
@@ -11,6 +13,8 @@ use lance::table::format::DataFile;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
+
+pub(super) const PLAN_VERSION: u8 = 2;
 
 /// Snapshot and Arrow column schema shared by the coordinator and workers.
 ///
@@ -24,6 +28,8 @@ pub struct BackfillPlan {
     /// SHA-256 of the versioned payload with JSON object keys sorted recursively.
     pub plan_fingerprint: String,
     pub(super) payload: PlanPayload,
+    #[serde(skip)]
+    verified_payload_fingerprint: OnceLock<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +43,46 @@ pub(super) struct PlanPayload {
     pub(super) new_columns: Schema,
     pub(super) unit_count: usize,
     pub(super) row_count: u64,
+    #[serde(default)]
+    pub(super) fragments: Vec<FragmentLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FragmentLayout {
+    pub(super) unit: BackfillWorkUnit,
+    pub(super) deletion_file_rev: Option<u64>,
+    pub(super) deleted_ranges: Vec<Range<u32>>,
+}
+
+impl FragmentLayout {
+    fn validate(&self, dataset_version: u64) -> Result<()> {
+        let physical_rows = u32::try_from(self.unit.row_count).map_err(|_| {
+            plan_datafusion_err!(
+                "Lance fragment {} exceeds u32 rows",
+                self.unit.fragment_id
+            )
+        })?;
+        if self
+            .deletion_file_rev
+            .is_some_and(|revision| revision > dataset_version)
+            || (self.deletion_file_rev.is_none() && !self.deleted_ranges.is_empty())
+            || self
+                .deleted_ranges
+                .iter()
+                .any(|range| range.start >= range.end || range.end > physical_rows)
+            || !self
+                .deleted_ranges
+                .windows(2)
+                .all(|pair| pair[0].end < pair[1].start)
+        {
+            return plan_err!(
+                "Invalid deletion ranges or revision for Lance fragment {}",
+                self.unit.fragment_id
+            );
+        }
+        Ok(())
+    }
 }
 
 /// One physical Lance fragment to backfill.
@@ -78,8 +124,10 @@ pub struct BackfillReceipt {
 
 impl BackfillPlan {
     pub(super) fn new(payload: PlanPayload) -> Result<Self> {
+        payload.validate()?;
         let plan_fingerprint = fingerprint(&payload)?;
         Ok(Self {
+            verified_payload_fingerprint: OnceLock::from(plan_fingerprint.clone()),
             plan_fingerprint,
             payload,
         })
@@ -119,16 +167,42 @@ impl BackfillPlan {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
-        if self.payload.version != 1 {
-            return plan_err!(
-                "Unsupported backfill plan version {}",
-                self.payload.version
-            );
-        }
-        if self.plan_fingerprint != fingerprint(&self.payload)? {
+        let fingerprint = match self.verified_payload_fingerprint.get() {
+            Some(fingerprint) => fingerprint,
+            None => {
+                self.payload.validate()?;
+                let computed = fingerprint(&self.payload)?;
+                self.verified_payload_fingerprint.get_or_init(|| computed)
+            }
+        };
+        if &self.plan_fingerprint != fingerprint {
             return plan_err!("Backfill plan fingerprint does not match its payload");
         }
         Ok(())
+    }
+
+    pub(super) fn fragment(&self, fragment_id: u32) -> Result<&FragmentLayout> {
+        let index = self
+            .payload
+            .fragments
+            .binary_search_by_key(&fragment_id, |fragment| fragment.unit.fragment_id)
+            .map_err(|_| {
+                plan_datafusion_err!("Unknown backfill fragment {fragment_id}")
+            })?;
+        Ok(&self.payload.fragments[index])
+    }
+
+    pub(super) fn validate_unit(
+        &self,
+        unit: &BackfillWorkUnit,
+    ) -> Result<&FragmentLayout> {
+        let fragment = self.fragment(unit.fragment_id)?;
+        if fragment.unit != *unit {
+            return plan_err!(
+                "Lance backfill work unit does not match the pinned fragment"
+            );
+        }
+        Ok(fragment)
     }
 
     pub(super) fn validate_receipts<'a>(
@@ -139,14 +213,7 @@ impl BackfillPlan {
         let mut winners = HashMap::with_capacity(receipts.len());
         let mut row_count = 0;
         for receipt in receipts {
-            if receipt.plan_fingerprint != self.plan_fingerprint {
-                return plan_err!("Backfill receipt fingerprint does not match the plan");
-            }
-            if receipt.row_count != receipt.work_unit.row_count {
-                return plan_err!(
-                    "Backfill receipt row count does not match its work unit"
-                );
-            }
+            receipt.validate_identity(self)?;
             let fragment = receipt.work_unit.fragment_id;
             if winners.insert(fragment, receipt).is_some() {
                 return plan_err!(
@@ -169,6 +236,54 @@ impl BackfillPlan {
             );
         }
         Ok(winners)
+    }
+}
+
+impl PlanPayload {
+    fn validate(&self) -> Result<()> {
+        if self.version != PLAN_VERSION {
+            return plan_err!("Unsupported backfill plan version {}", self.version);
+        }
+        dataset_url(&self.dataset_uri)?;
+        if self.dataset_version == 0
+            || self.manifest_identity.len() != 64
+            || !self
+                .manifest_identity
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return plan_err!("Invalid backfill dataset version or manifest identity");
+        }
+        validate_fields(self.new_columns.fields())?;
+        if self.unit_count != self.fragments.len()
+            || !self
+                .fragments
+                .windows(2)
+                .all(|pair| pair[0].unit.fragment_id < pair[1].unit.fragment_id)
+        {
+            return plan_err!("Backfill plan requires one ordered layout per fragment");
+        }
+        let mut physical_rows = 0;
+        for fragment in &self.fragments {
+            fragment.validate(self.dataset_version)?;
+            physical_rows = add_rows(physical_rows, fragment.unit.row_count)?;
+        }
+        if physical_rows != self.row_count {
+            return plan_err!("Backfill plan row count does not match its fragments");
+        }
+        Ok(())
+    }
+}
+
+impl BackfillReceipt {
+    pub(super) fn validate_identity(&self, plan: &BackfillPlan) -> Result<()> {
+        if self.plan_fingerprint != plan.plan_fingerprint {
+            return plan_err!("Backfill receipt fingerprint does not match the plan");
+        }
+        if self.row_count != self.work_unit.row_count {
+            return plan_err!("Backfill receipt row count does not match its work unit");
+        }
+        Ok(())
     }
 }
 
