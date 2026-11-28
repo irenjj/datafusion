@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 from ray_driver import (
-    RayExecutor, _download_worker, _inherited_payload, _invoke, _read_payload,
+    RayExecutor, WorkerCli, _download_worker, _inherited_payload, _invoke, _read_payload,
     _read_secrets_file, _s3_worker_location, drive, main,
 )
 
@@ -86,6 +86,54 @@ def run(worker, executor, **kwargs):
 
 
 class DriverTests(unittest.TestCase):
+    def test_empty_and_duplicate_pending_inventory(self):
+        executor = Mock()
+        self.assertEqual(drive(FakeWorker([]), executor), [])
+        with self.assertRaisesRegex(ValueError, "Duplicate pending split"):
+            drive(FakeWorker([4, 4]), executor)
+        executor.assert_not_called()
+
+    def test_replay_shortcut_finishes_before_ray_initialization(self):
+        argv = ["ray_driver.py", "--base-output-root", "base", "--output-root", "out",
+                "--row-key", "id", "--sql", "SELECT id FROM t", "--execution-mode", "actor"]
+        summary = {"output_rows": 8, "llm_requests": 0}
+        with (patch.object(sys, "argv", argv),
+              patch("ray_driver._invoke", return_value={"result": summary}) as invoke,
+              patch("ray_driver._actor_job") as actor_job,
+              redirect_stdout(StringIO()) as stdout):
+            main()
+        actor_job.assert_not_called()
+        self.assertEqual(invoke.call_args.args[1][0], "plan-replay-dlq")
+        self.assertEqual(json.loads(stdout.getvalue()), summary)
+
+    def test_replay_task_finalizes_prepared_retry_job_before_publishing(self):
+        argv = ["ray_driver.py", "--base-output-root", "base", "--output-root", "out",
+                "--row-key", "id", "--sql", "SELECT id FROM t", "--table", "t=source",
+                "--execution-mode", "task"]
+        calls = []
+        summary = {"new_data_rows": 1}
+
+        def invoke(_, args, **kwargs):
+            calls.append(args[0])
+            if args[0] == "plan-replay-dlq":
+                Path(args[args.index("--out") + 1]).write_text(json.dumps({
+                    "pending_splits": [{"split_id": 0, "attempt_id": 2}],
+                }))
+                return {"attempt_id": 7}
+            if args[0] == "commit-split":
+                self.assertEqual(kwargs["receipt"], {"artifact": {"split_id": 0, "attempt_id": 2}})
+            if args[0] == "finalize-replay-dlq":
+                self.assertEqual(args[-2:], ["--attempt-id", "7"])
+                return summary
+
+        executor = ScriptedExecutor([(0, [(0, 2)])])
+        with (patch.object(sys, "argv", argv), patch("ray_driver._invoke", side_effect=invoke),
+              patch("ray_driver.RayExecutor", return_value=executor),
+              redirect_stdout(StringIO()) as stdout):
+            main()
+        self.assertEqual(calls, ["plan-replay-dlq", "commit-split", "finalize-stage", "finalize-replay-dlq"])
+        self.assertEqual(json.loads(stdout.getvalue()), summary)
+
     def test_timeout_retries_and_discards_late_result(self):
         worker = FakeWorker([0, 1])
         executor = ScriptedExecutor([
@@ -136,6 +184,39 @@ class DriverTests(unittest.TestCase):
 
 
 class RayWorkerTests(unittest.TestCase):
+    def test_plan_forwards_all_table_types(self):
+        with (tempfile.TemporaryDirectory() as directory,
+              patch("ray_driver._invoke") as invoke):
+            job = Path(directory) / "job.json"
+            job.write_text("{}", encoding="utf-8")
+            worker = WorkerCli("dist-worker", "SELECT id FROM source", [], job, "output",
+                               stage_tables=["prior=input"], stage_dlq_tables=["bad=input"],
+                               lance_tables=["source=one.lance", "other=two.lance"])
+            self.assertEqual(worker.plan(), {})
+            self.assertEqual(invoke.call_args.args[1][7:], [
+                "--stage-table", "prior=input",
+                "--stage-dlq-table", "bad=input",
+                "--lance-table", "source=one.lance",
+                "--lance-table", "other=two.lance",
+            ])
+
+    def test_cli_validates_bindings_and_task_pool_before_ray(self):
+        args = ["ray_driver.py", "--sql=SELECT 1", "--job=unused", "--output-root=unused"]
+        cases = [
+            ([], "at least one"),
+            (["--lance-table=t=", "--execution-mode=task"], "name=path"),
+            (["--stage-table=t=prior", "--stage-dlq-table=t=prior"], "Duplicate"),
+            (["--lance-table=t=one", "--execution-mode=task", "--pool-size=2"], "only.*actor"),
+        ]
+        with patch("ray_driver._connect_ray") as connect:
+            for flags, message in cases:
+                with (self.subTest(flags=flags), redirect_stderr(StringIO()) as stderr,
+                      patch.object(sys, "argv", args + flags), self.assertRaises(SystemExit) as error):
+                    main()
+                self.assertEqual(error.exception.code, 2)
+                self.assertRegex(stderr.getvalue(), message)
+            connect.assert_not_called()
+
     def test_worker_location(self):
         for local in ("dist-worker", "/shared/dist-worker", Path("bin/dist-worker")):
             self.assertIsNone(_s3_worker_location(local))

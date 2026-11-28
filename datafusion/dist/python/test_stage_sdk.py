@@ -5,6 +5,7 @@
 from dataclasses import FrozenInstanceError
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from stage_sdk import StageResult, run_stage
+from stage_sdk import StageResult, replay_dlq, run_stage
 
 
 FINGERPRINT = "f" * 64
@@ -59,6 +60,30 @@ class S3Error(Exception):
 
 
 class StageResultTests(unittest.TestCase):
+    def test_empty_manifest_returns_empty_inventories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / MANIFEST
+            doc = manifest()
+            doc.update(splits=[], output_rows=0, dlq_rows=0, dlq_by_code={})
+            path.write_text(json.dumps(doc), encoding="utf-8")
+            result = StageResult.from_manifest(path)
+            self.assertEqual((result.output_rows, result.dlq_rows), (0, 0))
+            self.assertEqual((result.data_uris(), result.dlq_uris()), ([], []))
+
+    def test_duplicate_split_identity_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / MANIFEST
+            for field, message in (
+                ("split_id", "strictly increasing"),
+                ("split_fingerprint", "checkpoint fingerprint"),
+            ):
+                with self.subTest(field=field):
+                    doc = manifest()
+                    doc["splits"][1][field] = doc["splits"][0][field]
+                    path.write_text(json.dumps(doc), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, message):
+                        StageResult.from_manifest(path)
+
     def test_read_only_metrics_and_local_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -196,6 +221,90 @@ class RunStageTests(unittest.TestCase):
             })
             self.assertEqual(result.data_uris()[0], str(root / "stages" / FINGERPRINT / FIRST / "data.parquet"))
 
+    def test_passes_worker_and_scheduler_options_and_secrets_through_stdin(self):
+        secrets = {"OPENAI_API_KEY": "fixture-private-key"}
+        with (tempfile.TemporaryDirectory() as directory,
+              patch("stage_sdk.subprocess.run") as invoke):
+            def driver(args, *, input, **kwargs):
+                job = Path(args[args.index("--job") + 1])
+                self.assertEqual(list(job.parent.iterdir()), [])
+                self.assertEqual(json.loads(input), secrets)
+                self.assertNotIn(secrets["OPENAI_API_KEY"], " ".join(args))
+                self.assertTrue({
+                    "--execution-mode=actor", "--pool-size=2", "--max-global-inflight=1",
+                    "--max-splits-per-minute=15", "--secrets-stdin",
+                    "--stage-table=upstream=/prior",
+                    "--stage-dlq-table=bad=s3://results/prior",
+                    "--lance-table=clips=/shared/clips.lance",
+                }.issubset(args))
+                return subprocess.CompletedProcess([], 1, "", "denied fixture-private-key")
+
+            invoke.side_effect = driver
+            with self.assertRaisesRegex(RuntimeError, r"denied \[redacted\]"):
+                run_stage(
+                    sql="SELECT id FROM clips", output_root=directory, execution_mode="actor",
+                    pool_size=2, max_global_inflight=1, splits_per_minute=15,
+                    stage_tables={"upstream": Path("/prior")},
+                    stage_dlq_tables=["bad=s3://results/prior"],
+                    lance_tables=["clips=/shared/clips.lance"], secrets=secrets,
+                )
+            invoke.assert_called_once()
+
+    def test_secrets_file_requires_0600_and_redacts_values(self):
+        with (tempfile.TemporaryDirectory() as directory,
+              patch("stage_sdk.subprocess.run") as invoke):
+            path = Path(directory) / "secrets.json"
+            path.write_text(json.dumps({"OPENAI_API_KEY": "file-private-key"}), encoding="utf-8")
+            path.chmod(0o644)
+            options = dict(sql="SELECT id FROM t", tables=["t=input"], output_root=directory,
+                           secrets_file=path, execution_mode="task")
+            with self.assertRaisesRegex(ValueError, "0600"):
+                run_stage(**options)
+            invoke.assert_not_called()
+            path.chmod(0o600)
+            invoke.return_value = subprocess.CompletedProcess([], 1, "", "denied file-private-key")
+            with self.assertRaisesRegex(RuntimeError, r"denied \[redacted\]"):
+                run_stage(**options)
+            self.assertIn(f"--secrets-file={path}", invoke.call_args.args[0])
+            self.assertIn("--execution-mode=task", invoke.call_args.args[0])
+
+    def test_rejects_invalid_options_before_launching(self):
+        options = dict(sql="SELECT id FROM t", output_root="/output")
+        cases = [
+            ({}, "at least one"),
+            ({"tables": ["bad"]}, "name=path"),
+            ({"tables": ["t="]}, "name=path"),
+            ({"tables": ["t=one", "t=two"]}, "Duplicate"),
+            ({"tables": ["t=one"], "lance_tables": ["t=two"]}, "Duplicate"),
+        ]
+        for invalid, message in [
+            ({"execution_mode": "worker"}, "execution-mode"),
+            ({"execution_mode": "task", "pool_size": 2}, "only.*actor"),
+            ({"pool_size": 0}, "pool-size"),
+            ({"max_global_inflight": True}, "max-global-inflight"),
+            ({"splits_per_minute": 0}, "splits-per-minute"),
+            ({"concurrency": 0}, "concurrency"),
+            ({"timeout": float("nan")}, "timeout"),
+            ({"max_attempts": -1}, "max-attempts"),
+            ({"secrets": {}, "secrets_file": "/unused"}, "mutually exclusive"),
+            ({"secrets": {"KEY=invalid": "value"}}, "environment names"),
+            ({"secrets": {"KEY": 7}}, "string values"),
+        ]:
+            cases.append(({"tables": ["t=input"], **invalid}, message))
+        with patch("stage_sdk.subprocess.run") as invoke:
+            for invalid, message in cases:
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, message):
+                    run_stage(**options, **invalid)
+            invoke.assert_not_called()
+
+    def test_import_does_not_require_ray_or_driver(self):
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent)}
+        subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import sys; sys.modules['ray'] = sys.modules['ray_driver'] = None; import stage_sdk"],
+            env=env, check=True, capture_output=True,
+        )
+
     def test_driver_failure_preserves_diagnostics_and_redacts_credentials(self):
         with (tempfile.TemporaryDirectory() as directory,
               patch("stage_sdk.subprocess.run") as invoke,
@@ -204,6 +313,124 @@ class RunStageTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Access denied") as error:
                 run_stage(sql="SELECT id FROM t", tables=["t=input.parquet"], output_root=directory)
             self.assertNotIn("credential-value", str(error.exception))
+
+
+class ReplayDlqTests(unittest.TestCase):
+    def test_replay_returns_standard_stage_result_and_uses_secrets_stdin(self):
+        with (tempfile.TemporaryDirectory() as directory,
+              patch("stage_sdk.subprocess.run") as invoke):
+            root = Path(directory)
+            invoke.return_value = subprocess.CompletedProcess([], 0, json.dumps({
+                **manifest(), "prev_data_rows": 2, "new_data_rows": 1, "remaining_dlq_rows": 1,
+            }), "")
+            result = replay_dlq(
+                base_output_root=root / "base", output_root=root / "out",
+                sql="SELECT id FROM items", tables={"items": root / "input.parquet"},
+                row_key="id", execution_mode="task", ray_address="auto",
+                batch_size=16, pool_size=2, secrets={"PROVIDER_KEY": "sentinel-secret"},
+            )
+            (args,) = invoke.call_args.args
+            self.assertEqual(Path(args[2]).name, "ray_driver.py")
+            self.assertIn(f"--base-output-root={root / 'base'}", args)
+            self.assertIn("--execution-mode=task", args)
+            self.assertIn("--batch-size=16", args)
+            self.assertIn("--pool-size=2", args)
+            self.assertIn("--secrets-stdin", args)
+            self.assertNotIn("sentinel-secret", " ".join(args))
+            self.assertEqual(json.loads(invoke.call_args.kwargs["input"]), {
+                "PROVIDER_KEY": "sentinel-secret",
+            })
+            self.assertEqual(result.data_uris()[0], str(root / "out" / FIRST / "data.parquet"))
+            self.assertEqual((result.output_rows, result.dlq_rows), (3, 1))
+
+    def test_replay_redacts_explicit_secrets_on_failure(self):
+        with (tempfile.TemporaryDirectory() as directory,
+              patch("stage_sdk.subprocess.run") as invoke):
+            invoke.return_value = subprocess.CompletedProcess([], 1, "", "error sentinel-secret")
+            with self.assertRaisesRegex(RuntimeError, r"error \[redacted\]") as error:
+                replay_dlq(
+                    base_output_root=Path(directory) / "base", output_root=directory,
+                    sql="SELECT id FROM t", row_key="id", execution_mode="local",
+                    secrets={"KEY": "sentinel-secret"},
+                )
+            self.assertNotIn("sentinel-secret", str(error.exception))
+
+
+@unittest.skipUnless(os.environ.get("DIST_WORKER_REPLAY_E2E"),
+                     "requires an AI-enabled dist-worker, PyArrow and local Ray")
+class ReplayEndToEndTests(unittest.TestCase):
+    def test_replays_with_local_worker_ray_actor_and_ray_task(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import ray
+
+        binary = Path(os.environ["DIST_WORKER_REPLAY_E2E"]).resolve()
+        driver = Path(__file__).with_name("ray_driver.py").resolve()
+        env = {
+            name: value for name, value in os.environ.items()
+            if not name.startswith(("AWS_", "MINIO_", "OPENAI_", "DF_DIST_LLM_"))
+            and name != "RAY_ADDRESS"
+        }
+        env["PATH"] = os.pathsep.join((str(Path(sys.executable).parent), env["PATH"]))
+        env["DF_DIST_LLM_BACKEND"] = "mock"
+        with tempfile.TemporaryDirectory(prefix="dist-dlq-e2e-") as directory:
+            root = Path(directory)
+            image = root / "image.ppm"
+            image.write_bytes(b"P6\n1 1\n255\n\xff\0\0")
+            valid, invalid = image.as_uri(), (root / "absent.ppm").as_uri()
+            source = root / "source.parquet"
+            base, local = root / "base", root / "local"
+            pq.write_table(pa.table({
+                "id": ["already-ok", "recovered", "still-failed"],
+                "old_uri": [valid, invalid, invalid],
+                "new_uri": [valid, valid, invalid],
+            }), source)
+            sql = """SELECT id, vlm(id, {uri}, '{model}', '{{"on_error":"envelope"}}') AS label FROM t"""
+            initial = subprocess.run(
+                [binary, "run-local", "--sql", sql.format(uri="old_uri", model="base"),
+                 "--table", f"t={source}", "--output-root", str(base), "--row-key", "id"],
+                env=env, capture_output=True, text=True, timeout=30, check=False,
+            )
+            self.assertEqual(initial.returncode, 0, initial.stderr)
+            retry_sql = sql.format(uri="new_uri", model="retry")
+
+            def check_result(result, out):
+                self.assertEqual(result, StageResult.load(out))
+                self.assertEqual((result.output_rows, result.dlq_rows, result.llm_requests), (2, 1, 1))
+                self.assertEqual(result.llm_usage_by_provider["default"]["requests"], 1)
+                rows = [row for path in result.data_uris() for row in pq.read_table(path).to_pylist()]
+                self.assertEqual(sorted(rows, key=lambda row: row["id"]), [
+                    {"id": "already-ok", "label": "mock[base]: already-ok"},
+                    {"id": "recovered", "label": "mock[retry]: recovered"},
+                ])
+                self.assertEqual(pq.read_table(result.dlq_uris()[0])["row_key"].to_pylist(), ["still-failed"])
+
+            with patch.dict(os.environ, env, clear=True):
+                check_result(replay_dlq(
+                    base_output_root=base, output_root=local, sql=retry_sql,
+                    row_key="id", tables={"t": source}, worker=binary, batch_size=1,
+                ), local)
+                ray_context = ray.init(address="local", num_cpus=2, include_dashboard=False,
+                                       object_store_memory=80 * 1024**2)
+                self.addCleanup(ray.shutdown)
+                for mode in ("actor", "task"):
+                    with self.subTest(mode=mode):
+                        out = root / mode
+                        secret = "fixture-only-secret"
+                        result = subprocess.run(
+                            [binary, "replay-dlq", "--base-output-root", str(base),
+                             "--output-root", str(out), "--sql", retry_sql, "--row-key", "id",
+                             "--table", f"t={source}", "--batch-size", "1", "--concurrency", "2",
+                             "--execution-mode", mode, "--ray-driver", str(driver),
+                             "--ray-address", ray_context.address_info["gcs_address"], "--secrets-stdin"],
+                            input=json.dumps({"OPENAI_API_KEY": secret}), capture_output=True,
+                            text=True, timeout=120, check=False,
+                        )
+                        self.assertNotIn(secret, result.stdout + result.stderr)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        summary = json.loads(result.stdout)
+                        self.assertEqual(summary["remaining_dlq_rows"], 1)
+                        check_result(StageResult._from_document(summary, out), out)
 
 
 if __name__ == "__main__":

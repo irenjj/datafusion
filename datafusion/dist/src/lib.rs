@@ -8,8 +8,11 @@
 mod ai;
 mod codec;
 mod fingerprint;
+#[cfg(feature = "lake")]
+mod lake;
 mod manifest_table;
 mod plan;
+mod replay;
 mod runner;
 mod scheduler;
 mod sink;
@@ -20,6 +23,8 @@ pub use codec::{
     DistExtensionRegistry, DistPhysicalCodec, ExtensionOperatorPolicy,
     NamedPhysicalExtensionCodec,
 };
+#[cfg(feature = "lake")]
+pub use lake::backfill_lance;
 pub use manifest_table::StageOutputReader;
 pub use plan::{
     DistCodecs, FileExtensionCodec, FileExtensionCodecRegistry, PreparedStage,
@@ -30,6 +35,7 @@ pub use plan::{
     decode_stage_template_with_extensions, split_plan_for_distribution,
     split_plan_for_distribution_with_codecs, split_plan_for_distribution_with_extensions,
 };
+pub use replay::{DlqReplay, ReplaySummary};
 pub use runner::LocalWorker;
 pub use scheduler::{
     CommitOutcome, LeaseConfig, LeaseError, LeaseToken, LeasedSplitQueue, ManualClock,

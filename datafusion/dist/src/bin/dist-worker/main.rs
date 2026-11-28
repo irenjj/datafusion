@@ -7,19 +7,17 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::arrow::json::writer::{LineDelimited, WriterBuilder};
 use datafusion::common::{Result, exec_datafusion_err, plan_datafusion_err, plan_err};
-use datafusion_dist::{
-    AttemptArtifact, LeaseConfig, SinkOptions, SplitMetrics, SystemClock,
-};
+use datafusion_dist::{AttemptArtifact, LeaseConfig, SinkOptions, SplitMetrics};
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 mod job;
 mod local;
+mod replay;
 mod serve;
 
 use job::{PlanningOptions, StageJob};
@@ -30,8 +28,18 @@ dist-worker run-split --job JOB --split-id N --attempt-id N [--output-root PATH]
 dist-worker commit-split --job JOB [--artifact FILE|-] [--output-root PATH]
 dist-worker finalize-stage --job JOB [--output-root PATH]
 dist-worker query-stage --output-root PATH --sql SQL
+dist-worker replay-dlq --base-output-root BASE --output-root PATH --sql SQL --row-key COLUMN [--table name=path | --stage-table name=PATH] [--execution-mode local|actor|task] [--batch-size N] [--pool-size N] [--ray-address ADDRESS] [--secrets-stdin]
 dist-worker serve
 dist-worker run-local --sql SQL --table name=path --output-root PATH [--row-key COLUMN] [--timeout-secs N] [--max-attempts N]";
+
+fn usage() -> String {
+    let usage = USAGE.to_owned();
+    #[cfg(feature = "lake")]
+    let usage = usage
+        + "\nplan and run-local also accept repeatable --lance-table name=PATH_OR_URI"
+        + "\ndist-worker backfill-lance --dataset PATH_OR_URI --stage-output-root ROOT";
+    usage
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,7 +52,7 @@ fn main() -> ExitCode {
     let mut argv = std::env::args().skip(1);
     let command = argv.next();
     if matches!(command.as_deref(), None | Some("--help" | "-h")) {
-        println!("{USAGE}");
+        println!("{}", usage());
         return ExitCode::SUCCESS;
     }
     let args = Arguments::parse(argv);
@@ -135,6 +143,19 @@ async fn run(command: &str, args: Result<Arguments>) -> Result<()> {
             writer.into_inner().flush()?;
             Ok(())
         }
+        #[cfg(feature = "lake")]
+        "backfill-lance" => {
+            let dataset = args.required("--dataset")?;
+            let root = args.required("--stage-output-root")?;
+            args.finish()?;
+            let version = job::backfill_lance(&dataset, &root).await?;
+            write_json(
+                io::stdout().lock(),
+                &serde_json::json!({"dataset_version": version}),
+            )
+        }
+        #[cfg(not(feature = "lake"))]
+        "backfill-lance" => plan_err!("backfill-lance requires the lake feature"),
         "run-local" => {
             let options = args.planning()?;
             if options.output_root.is_none() {
@@ -151,28 +172,34 @@ async fn run(command: &str, args: Result<Arguments>) -> Result<()> {
             args.finish()?;
             config.validate()?;
             let job = StageJob::plan(options).await?;
-            let manifest = local::run(
-                &job,
-                config,
-                Arc::new(SystemClock::default()),
-                async |stage, queue, split, token| {
-                    tokio::time::timeout(
-                        config.lease_ttl,
-                        stage.execute_lease(queue, split, token),
-                    )
-                    .await
-                    .map_err(|_| {
-                        exec_datafusion_err!(
-                            "Split {} execution timed out",
-                            split.split_id
-                        )
-                    })?
-                },
-            )
-            .await?;
+            let manifest = local::run_with_timeout(&job, config).await?;
             write_json(io::stdout().lock(), &manifest)
         }
-        _ => plan_err!("Unknown command '{command}'.\n{USAGE}"),
+        "replay-dlq" => replay::cli(args).await,
+        "plan-replay-dlq" => {
+            let file = args.required("--out")?;
+            let options = replay::ReplayOptions::from_args(&mut args)?;
+            args.finish()?;
+            let planned = match options.prepare().await? {
+                replay::Preparation::Complete(result) => {
+                    replay::PlannedReplay::Complete { result }
+                }
+                replay::Preparation::Pending(pending) => {
+                    write_json(File::create(file)?, &pending.job)?;
+                    replay::PlannedReplay::Pending {
+                        attempt_id: pending.attempt_id,
+                    }
+                }
+            };
+            write_json(io::stdout().lock(), &planned)
+        }
+        "finalize-replay-dlq" => {
+            let attempt_id = args.number("--attempt-id", None)?;
+            let options = replay::ReplayOptions::from_args(&mut args)?;
+            args.finish()?;
+            write_json(io::stdout().lock(), &options.finalize(attempt_id).await?)
+        }
+        _ => plan_err!("Unknown command '{command}'.\n{}", usage()),
     }
 }
 
@@ -205,6 +232,10 @@ impl Arguments {
             if !key.starts_with("--") {
                 return plan_err!("Expected a flag beginning with --");
             }
+            if key == "--secrets-stdin" {
+                parsed.0.entry(key).or_default().push(String::new());
+                continue;
+            }
             let value = args
                 .next()
                 .ok_or_else(|| plan_datafusion_err!("{key} needs a value"))?;
@@ -234,6 +265,10 @@ impl Arguments {
             .ok_or_else(|| plan_datafusion_err!("{key} is required"))
     }
 
+    fn switch(&mut self, key: &str) -> Result<bool> {
+        Ok(self.flag(key)?.is_some())
+    }
+
     fn number<T: FromStr>(&mut self, key: &str, default: Option<T>) -> Result<T> {
         match self.flag(key)? {
             Some(value) => value
@@ -248,9 +283,18 @@ impl Arguments {
         let tables = self.0.remove("--table").unwrap_or_default();
         let stage_tables = self.0.remove("--stage-table").unwrap_or_default();
         let stage_dlq_tables = self.0.remove("--stage-dlq-table").unwrap_or_default();
-        if tables.is_empty() && stage_tables.is_empty() && stage_dlq_tables.is_empty() {
+        let lance_tables = self.0.remove("--lance-table").unwrap_or_default();
+        #[cfg(not(feature = "lake"))]
+        if !lance_tables.is_empty() {
+            return plan_err!("--lance-table requires the lake feature");
+        }
+        if tables.is_empty()
+            && stage_tables.is_empty()
+            && stage_dlq_tables.is_empty()
+            && lance_tables.is_empty()
+        {
             return plan_err!(
-                "--table is required (or use --stage-table or --stage-dlq-table)"
+                "--table is required (or use --stage-table, --stage-dlq-table, or --lance-table)"
             );
         }
         Ok(PlanningOptions {
@@ -258,6 +302,8 @@ impl Arguments {
             tables,
             stage_tables,
             stage_dlq_tables,
+            #[cfg(feature = "lake")]
+            lance_tables,
             sink: SinkOptions {
                 row_key: self.flag("--row-key")?,
             },

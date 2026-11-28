@@ -163,24 +163,59 @@ assert StageResult.load("/shared/out").data_uris() == result.data_uris()
 print(result.output_rows, result.dlq_uris())
 ```
 
+Pass `execution_mode`, `pool_size`, `max_global_inflight`, and `splits_per_minute` to control dispatch through the SDK. The driver defaults to actor mode, and `pool_size` applies to actors. Pass table bindings through `tables`, `stage_tables`, `stage_dlq_tables`, or `lance_tables`. Each accepts a name-to-path mapping or an iterable of `name=path` strings. Table names must be unique across the bindings. Pass a worker environment dictionary in `secrets` for stdin transport or a regular mode-0600 file in `secrets_file`.
+
+Build `dist-worker` with `--features lake` to plan Lance scans. Add `ai-http,s3` for HTTP inference and S3 object stores. Use repeatable `--lance-table name=PATH_OR_URI` bindings with `plan` or `run-local`. Workers open the recorded snapshot and fragment when executing each split. Scans emit Blob references. Vision inference resolves those references through `LakeMediaResolver` when it needs the payload.
+
+```bash
+dist-worker run-local --lance-table clips=/shared/clips.lance \
+  --sql 'SELECT id AS row_key, score * 2 AS score_v2 FROM clips' \
+  --row-key row_key --output-root /shared/clip-scores
+
+dist-worker backfill-lance --dataset /shared/clips.lance \
+  --stage-output-root /shared/clip-scores
+```
+
+Backfill requires the current source snapshot, a complete winning split for each fragment, and zero DLQ rows. Select new columns and, for filters or operators that may reorder rows, an unchanged source column as `--row-key`. Keys must be unique and non-null within each fragment. Backfill reads the key from the pinned Lance snapshot to recover the physical row order and excludes the key from the new columns. Unfiltered scans with order-preserving projections can use physical row order directly. Ranged fragments and deletion vectors cannot supply the complete physical rows required by this command. Backfill verifies the winning files' checksums and commits the new schema and column files together. Paimon backfill requires atomic schema-and-snapshot publication and fails during preparation. S3 backfills require conditional create support for Lance column files. Configure the object store's copy-if-absent mode, for example `AWS_COPY_IF_NOT_EXISTS=multipart`.
+
 Worker receipts carry `input_tokens`, `output_tokens`, `llm_requests` and `llm_retries` under `metrics`. Token counts use the usage reported by the provider for successful responses. A response without usage contributes zero tokens. Requests count backend attempts, including retries. The manifest keeps the counters under each winning split's `metrics` and sums them at the top level. Older receipts and checkpoints default missing usage counters to zero.
 
 `llm_usage_by_provider` records `input_tokens`, `output_tokens` and `requests` by resolved provider name in split metrics and in the stage manifest. The stage map merges winning splits. Older checkpoints without the map still contribute their aggregate counters. In a stage resumed from those checkpoints, provider totals cover the splits that recorded provider attribution. Provider names use ASCII letters, digits, underscores, periods or hyphens.
 
 `df.ai_error` columns require an explicit non-null output row key. A row with any failed envelope is routed to the DLQ, with one entry per failed column and stable ordering by row key and column name. A successful row retains the Arrow value type. The Python suite uses an injected executor and requires neither Ray nor a network connection.
 
+Replay into a dedicated output root with the original Parquet source and a query that returns the same data schema as the base stage. Use `--stage-table input=PATH` for a manifest-backed source. The worker snapshots only the distinct failed keys before planning the SQL. A base without failures skips source access and SQL planning.
+
+```bash
+dist-worker replay-dlq --base-output-root /shared/base --output-root /shared/replayed \
+  --table input=/shared/input --row-key id \
+  --sql "SELECT id, llm(prompt, 'retry-model', '{\"on_error\":\"envelope\"}') AS label FROM input"
+
+dist-worker query-stage --output-root /shared/replayed --sql 'SELECT COUNT(*) FROM data'
+```
+
+For Ray, pass `--execution-mode actor` or `--execution-mode task` and optionally `--ray-address`. Actor mode accepts `--pool-size`. Install Ray in the driver's Python environment and supply `--ray-driver PATH` or `DF_DIST_RAY_DRIVER` if the driver scripts are installed separately. `--secrets-stdin` reads the same environment JSON as the Ray driver. The Python SDK exposes `replay_dlq(...)`, which accepts `execution_mode`, `ray_address`, and a `secrets` mapping and returns a `StageResult`.
+
+The replay summary includes `prev_data_rows`, `new_data_rows`, and `remaining_dlq_rows` as unique-key counts. The manifest's `dlq_rows` still counts failed cells. For a key with multiple failed cells, the checkpoint must include the split's original row count so the worker can verify key uniqueness. The output keeps upstream successful Parquet files byte for byte and reports inference usage from the replay's winning splits. The worker checks the winner checksums, schema, row counts and key sets before publishing `STAGE_MANIFEST.json`. Both `query-stage` and `StageResult.load()` read the published root directly. Replay assigns new split fingerprints and drops Lake backfill provenance. Use a stage finalized directly from the Lake scan for `backfill-lance`.
+
+The coordinator holds the key set in memory and buffers one winning Parquet object at a time for integrity checks and copying. `--batch-size` bounds the number of selected source rows written to each retry input file. Temporary snapshots and retry receipts stay under `_replay/`. Concurrent invocations can execute separate attempts. The first valid manifest wins, and repeating the same request after publication returns that winner's counts. Restarting a failed invocation can repeat inference for the base's failed keys.
+
+The daemon also accepts `{"command":"replay_dlq","options":{...}}` for local execution. The options are `base_output_root`, `output_root`, `sql`, `row_key`, and optionally `table`, `stage_table`, or `batch_size`.
+
 ```bash
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --bin dist-worker
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai -E 'test(manifest_table::) + test(query_stage_and_plan_next_stage)'
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --test worker serve
+cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai -E 'test(replay)'
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai --test worker multimodal_parquet_outputs
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai-http --test worker openai_ca_cert
+cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features lake --test worker lake_
 cargo tree --locked -p datafusion-dist --features ai
 cargo tree --locked -p datafusion-dist --features ai-http
 python3 -m unittest discover -s datafusion/dist/python -v
 ```
 
-With Ray installed locally and the pinned `parquet-testing` fixtures available, set `DIST_WORKER_E2E` to the built `dist-worker` executable and rerun the Python suite to exercise the actor pool and read back its committed Parquet output.
+With Ray installed locally and the pinned `parquet-testing` fixtures available, set `DIST_WORKER_E2E` to the built `dist-worker` executable and rerun the Python suite to exercise the actor pool and read back its committed Parquet output. Set `DIST_WORKER_REPLAY_E2E` to a worker built with `ai` and install PyArrow to exercise both Ray replay modes with the mock inference backend.
 
 ## Distributed scheduler replay
 

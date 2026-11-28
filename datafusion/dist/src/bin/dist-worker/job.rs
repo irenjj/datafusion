@@ -9,12 +9,15 @@ use std::path::absolute;
 use std::sync::Arc;
 
 use datafusion::common::{Result, plan_datafusion_err, plan_err};
-#[cfg(feature = "ai")]
+use datafusion::datasource::physical_plan::ParquetSource;
+use datafusion::datasource::source::DataSourceExec;
+#[cfg(any(feature = "ai", feature = "lake"))]
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SQLOptions;
 use datafusion::execution::object_store::ObjectStoreUrl;
-#[cfg(feature = "ai")]
+#[cfg(any(feature = "ai", feature = "lake"))]
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 #[cfg(feature = "ai")]
 use datafusion_ai::ObjectStoreMediaResolver;
@@ -28,6 +31,14 @@ use datafusion_dist::{
 };
 #[cfg(feature = "ai")]
 use datafusion_dist::{DistExtensionRegistry, LlmExecCodec};
+#[cfg(all(feature = "lake", feature = "ai"))]
+use datafusion_lake::LakeMediaResolver;
+#[cfg(feature = "lake")]
+use datafusion_lake::{LakeTableOptions, LanceReadOnlyTable, dist::LakeRuntimeConfig};
+#[cfg(feature = "lake")]
+use lance::dataset::builder::DatasetBuilder;
+#[cfg(feature = "lake")]
+use lance_io::object_store::ObjectStoreParams;
 #[cfg(feature = "s3")]
 use object_store::aws::AmazonS3Builder;
 use object_store::{ObjectStore, local::LocalFileSystem, path::Path as StorePath};
@@ -42,6 +53,8 @@ pub(super) struct PlanningOptions {
     pub(super) tables: Vec<String>,
     pub(super) stage_tables: Vec<String>,
     pub(super) stage_dlq_tables: Vec<String>,
+    #[cfg(feature = "lake")]
+    pub(super) lance_tables: Vec<String>,
     pub(super) sink: SinkOptions,
     pub(super) output_root: Option<String>,
 }
@@ -52,6 +65,8 @@ pub(super) struct StageJob {
     schema: String,
     stage: StagePlan,
     input_stores: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    lake: bool,
     options: SinkOptions,
     output_root: Option<String>,
     pub(super) splits: Vec<Split>,
@@ -76,13 +91,27 @@ impl From<&Split> for PendingSplit {
 
 impl StageJob {
     pub(super) async fn plan(options: PlanningOptions) -> Result<Self> {
+        Self::plan_with_stores(options, BTreeSet::new(), None).await
+    }
+
+    pub(super) async fn plan_with_stores(
+        options: PlanningOptions,
+        mut input_stores: BTreeSet<String>,
+        replay_input: Option<&Location>,
+    ) -> Result<Self> {
         let output_root = options
             .output_root
             .as_deref()
             .map(Location::parse)
             .transpose()?;
-        let ctx = session()?;
-        let mut input_stores = BTreeSet::new();
+        #[cfg(feature = "lake")]
+        let lake = !options.lance_tables.is_empty();
+        #[cfg(not(feature = "lake"))]
+        let lake = false;
+        let ctx = session(lake)?;
+        for origin in &input_stores {
+            Location::parse(origin)?.register(&ctx)?;
+        }
         for table in &options.tables {
             let (name, path) = table_binding(table, "--table")?;
             let source = Location::parse(path)?;
@@ -108,11 +137,26 @@ impl StageJob {
                 ctx.register_table(name, provider)?;
             }
         }
+        #[cfg(feature = "lake")]
+        for table in &options.lance_tables {
+            let (name, path) = table_binding(table, "--lance-table")?;
+            let source = Location::parse(path)?;
+            source.register_input(&ctx, &mut input_stores)?;
+            let table = LanceReadOnlyTable::open_with_builder(
+                source.lance_builder(ctx.runtime_env().as_ref())?,
+                &LakeTableOptions::default(),
+            )
+            .await?;
+            ctx.register_table(name, Arc::new(table))?;
+        }
         let plan = ctx
             .sql_with_options(&options.sql, read_only_sql())
             .await?
             .create_physical_plan()
             .await?;
+        if let Some(input) = replay_input {
+            input.validate_replay_scan(plan.as_ref())?;
+        }
         options.sink.validate_plan(plan.as_ref())?;
         let (stage, mut splits) =
             split_plan_for_distribution_with_codecs(plan, 0, &codecs()?)?;
@@ -134,6 +178,7 @@ impl StageJob {
             schema: SCHEMA.into(),
             stage,
             input_stores,
+            lake,
             options: options.sink,
             output_root: output_root.map(|root| root.0.into()),
             splits,
@@ -144,6 +189,10 @@ impl StageJob {
     pub(super) fn validate(&self) -> Result<()> {
         if self.schema != SCHEMA {
             return plan_err!("Unsupported stage job schema");
+        }
+        #[cfg(not(feature = "lake"))]
+        if self.lake {
+            return plan_err!("This stage job requires the lake feature");
         }
         Ok(())
     }
@@ -164,7 +213,7 @@ impl StageJob {
     }
 
     pub(super) fn worker(&self) -> Result<LocalWorker> {
-        let ctx = session()?;
+        let ctx = session(self.lake)?;
         for origin in &self.input_stores {
             let location = Location::parse(origin)?;
             if location.origin() != origin
@@ -221,10 +270,13 @@ impl StageJob {
     }
 }
 
-fn table_binding<'a>(table: &'a str, flag: &str) -> Result<(&'a str, &'a str)> {
+pub(super) fn table_binding<'a>(
+    table: &'a str,
+    flag: &str,
+) -> Result<(&'a str, &'a str)> {
     table
         .split_once('=')
-        .filter(|(name, _)| !name.is_empty())
+        .filter(|(name, path)| !name.trim().is_empty() && !path.trim().is_empty())
         .ok_or_else(|| plan_datafusion_err!("{flag} expects name=path"))
 }
 
@@ -241,6 +293,24 @@ pub(super) async fn query_stage(
     ctx.sql_with_options(sql, read_only_sql()).await
 }
 
+#[cfg(feature = "lake")]
+pub(super) async fn backfill_lance(dataset: &str, root: &str) -> Result<u64> {
+    let ctx = SessionContext::new();
+    let dataset = Location::parse(dataset)?;
+    let root = Location::parse(root)?;
+    let mut stores = BTreeSet::new();
+    root.register_input(&ctx, &mut stores)?;
+    dataset.register_input(&ctx, &mut stores)?;
+    datafusion_dist::backfill_lance(
+        &ctx,
+        ObjectStoreUrl::parse(root.origin())?,
+        &root.store_path()?,
+        dataset.0.as_str(),
+        &dataset.lance_params(ctx.runtime_env().as_ref())?,
+    )
+    .await
+}
+
 fn read_only_sql() -> SQLOptions {
     SQLOptions::new()
         .with_allow_ddl(false)
@@ -249,10 +319,10 @@ fn read_only_sql() -> SQLOptions {
 }
 
 #[derive(Clone)]
-struct Location(Url);
+pub(super) struct Location(Url);
 
 impl Location {
-    fn parse(value: &str) -> Result<Self> {
+    pub(super) fn parse(value: &str) -> Result<Self> {
         if value.is_empty() {
             return plan_err!("An object store path cannot be empty");
         }
@@ -293,7 +363,7 @@ impl Location {
         &self.0[..Position::BeforePath]
     }
 
-    fn input_path(&self) -> Result<String> {
+    pub(super) fn input_path(&self) -> Result<String> {
         if self.0.scheme() == "file" {
             let path = self
                 .0
@@ -307,7 +377,7 @@ impl Location {
         }
     }
 
-    fn store_path(&self) -> Result<StorePath> {
+    pub(super) fn store_path(&self) -> Result<StorePath> {
         Ok(StorePath::from_url_path(self.0.path())?)
     }
 
@@ -316,7 +386,7 @@ impl Location {
         Ok(())
     }
 
-    fn register_input(
+    pub(super) fn register_input(
         &self,
         ctx: &SessionContext,
         input_stores: &mut BTreeSet<String>,
@@ -327,13 +397,81 @@ impl Location {
         Ok(())
     }
 
-    async fn open_stage(&self, ctx: &SessionContext) -> Result<StageOutputReader> {
-        StageOutputReader::open(
-            ctx,
-            ObjectStoreUrl::parse(self.origin())?,
-            &self.store_path()?,
-        )
-        .await
+    pub(super) fn store_url(&self) -> Result<ObjectStoreUrl> {
+        ObjectStoreUrl::parse(self.origin())
+    }
+
+    pub(super) async fn open_stage(
+        &self,
+        ctx: &SessionContext,
+    ) -> Result<StageOutputReader> {
+        StageOutputReader::open(ctx, self.store_url()?, &self.store_path()?).await
+    }
+
+    pub(super) fn resolve_local(self) -> Result<Self> {
+        if self.0.scheme() != "file" {
+            return Ok(self);
+        }
+        let path = self.0.to_file_path().expect("validated file URL");
+        for parent in path.ancestors() {
+            match std::fs::symlink_metadata(parent) {
+                Ok(_) => {
+                    let resolved = parent
+                        .canonicalize()?
+                        .join(path.strip_prefix(parent).unwrap());
+                    let url = Url::from_file_path(resolved)
+                        .map_err(|()| plan_datafusion_err!("Invalid local file path"))?;
+                    return Ok(Self(url));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        plan_err!("Cannot resolve local file path")
+    }
+
+    pub(super) fn overlaps(&self, other: &Self) -> Result<bool> {
+        let lhs = self.store_path()?;
+        let rhs = other.store_path()?;
+        Ok(self.origin() == other.origin()
+            && (lhs.prefix_matches(&rhs) || rhs.prefix_matches(&lhs)))
+    }
+
+    pub(super) fn child_directory(&self, path: &StorePath) -> Result<Self> {
+        let root = self.store_path()?;
+        let parts = path.prefix_match(&root).ok_or_else(|| {
+            plan_datafusion_err!("Replay workspace is outside its output root")
+        })?;
+        let mut url = self.0.clone();
+        url.path_segments_mut()
+            .expect("validated hierarchical URL")
+            .pop_if_empty()
+            .extend(parts.map(|part| part.as_ref().to_owned()))
+            .push("");
+        Ok(Self(url))
+    }
+
+    fn validate_replay_scan(&self, mut plan: &dyn ExecutionPlan) -> Result<()> {
+        while let &[child] = plan.children().as_slice() {
+            plan = child.as_ref();
+        }
+        let Some((scan, _)) = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(DataSourceExec::downcast_to_file_source::<ParquetSource>)
+        else {
+            return plan_err!("Replay SQL must scan the filtered source table");
+        };
+        let prefix = self.store_path()?;
+        if scan.object_store_url != self.store_url()?
+            || scan
+                .file_groups
+                .iter()
+                .flat_map(|group| group.files())
+                .any(|file| !file.object_meta.location.prefix_matches(&prefix))
+        {
+            return plan_err!("Replay SQL must scan only the filtered source table");
+        }
+        Ok(())
     }
 
     #[cfg(feature = "s3")]
@@ -355,42 +493,95 @@ impl Location {
     fn sink(&self, stage: &StagePlan, options: &SinkOptions) -> Result<ParquetSplitSink> {
         ParquetSplitSink::try_new(self.store()?, &self.store_path()?, stage, options)
     }
+
+    #[cfg(feature = "lake")]
+    fn lance_builder(&self, runtime: &RuntimeEnv) -> Result<DatasetBuilder> {
+        Ok(DatasetBuilder::from_uri(self.0.as_str())
+            .with_store_params(self.lance_params(runtime)?))
+    }
+
+    #[cfg(feature = "lake")]
+    fn lance_params(&self, runtime: &RuntimeEnv) -> Result<ObjectStoreParams> {
+        if self.0.scheme() == "file" {
+            return Ok(ObjectStoreParams::default());
+        }
+        // The pinned Lance builder uses Path::from on an injected store's URL.
+        // Refuse paths where that would resolve to a different S3 key.
+        if StorePath::from(self.0.path()) != self.store_path()? {
+            return plan_err!(
+                "This Lance version cannot open an escaped S3 dataset path"
+            );
+        }
+        #[expect(deprecated)]
+        Ok(ObjectStoreParams {
+            object_store: Some((
+                runtime.object_store_registry.get_store(&self.0)?,
+                self.0.clone(),
+            )),
+            ..Default::default()
+        })
+    }
 }
 
-fn session() -> Result<SessionContext> {
+fn session(lake: bool) -> Result<SessionContext> {
     #[cfg(not(feature = "ai-http"))]
     if std::env::var_os(PROVIDERS_ENV).is_some() {
         return plan_err!("{PROVIDERS_ENV} requires the ai-http feature");
     }
     let mut config = SessionConfig::new().with_target_partitions(1);
     config.options_mut().optimizer.repartition_file_scans = false;
-    #[cfg(feature = "ai")]
+    #[cfg(any(feature = "ai", feature = "lake"))]
     {
         let runtime = Arc::new(RuntimeEnv::default());
-        let config = config.with_extension(Arc::new(ObjectStoreMediaResolver::new(
-            Arc::clone(&runtime.object_store_registry),
-        )));
-        Ok(SessionContext::new_with_state(
-            SessionStateBuilder::new_with_default_features()
-                .with_config(config)
-                .with_llm_provider_registry(llm_registry()?)
-                .with_runtime_env(runtime)
-                .build(),
-        ))
+        #[cfg(feature = "lake")]
+        if lake {
+            LakeRuntimeConfig::default()
+                .with_lance_builder({
+                    let runtime = Arc::clone(&runtime);
+                    move |uri| Location::parse(uri)?.lance_builder(&runtime)
+                })
+                .register(&mut config);
+        }
+        #[cfg(feature = "ai")]
+        {
+            #[cfg(feature = "lake")]
+            if lake {
+                let resolver: Arc<dyn datafusion_ai::MediaResolver> = Arc::new(
+                    LakeMediaResolver::new(Arc::clone(&runtime.object_store_registry)),
+                );
+                config = config.with_extension(Arc::new(resolver));
+            }
+            if !lake {
+                config = config.with_extension(Arc::new(ObjectStoreMediaResolver::new(
+                    Arc::clone(&runtime.object_store_registry),
+                )));
+            }
+        }
+        let builder = SessionStateBuilder::new_with_default_features()
+            .with_config(config)
+            .with_runtime_env(runtime);
+        #[cfg(feature = "ai")]
+        let builder = builder.with_llm_provider_registry(llm_registry()?);
+        Ok(SessionContext::new_with_state(builder.build()))
     }
-    #[cfg(not(feature = "ai"))]
-    Ok(SessionContext::new_with_config(config))
+    #[cfg(not(any(feature = "ai", feature = "lake")))]
+    {
+        let _ = lake;
+        Ok(SessionContext::new_with_config(config))
+    }
 }
 
 fn codecs() -> Result<DistCodecs> {
+    let codecs = DistCodecs::default();
     #[cfg(feature = "ai")]
-    {
+    let codecs = {
         let mut registry = DistExtensionRegistry::default();
         registry.register(Arc::new(LlmExecCodec::new()))?;
-        Ok(DistCodecs::default().with_physical_codecs(registry))
-    }
-    #[cfg(not(feature = "ai"))]
-    Ok(DistCodecs::default())
+        codecs.with_physical_codecs(registry)
+    };
+    #[cfg(feature = "lake")]
+    let codecs = codecs.with_lake()?;
+    Ok(codecs)
 }
 
 #[cfg(feature = "ai")]
@@ -527,6 +718,81 @@ mod s3_tests {
 
     use super::*;
 
+    #[cfg(feature = "lake")]
+    #[tokio::test]
+    async fn lance_reuses_registered_s3_store_for_scan_and_backfill() -> Result<()> {
+        use datafusion::arrow::array::{Int32Array, RecordBatch};
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        use lance_table_runtime::InsertBuilder;
+        use object_store::ObjectStoreExt;
+        use object_store::memory::InMemory;
+
+        let ctx = session(true)?;
+        let location = Location::parse("s3://lance-fixture/source.lance")?;
+        let store = Arc::new(InMemory::new());
+        ctx.register_object_store(&location.0, store.clone());
+        let params = location.lance_params(ctx.runtime_env().as_ref())?;
+        let rows = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from(vec![7, 3])) as _,
+        )])?;
+        let fixture = tempfile::tempdir()?;
+        let local = fixture.path().join("source.lance");
+        InsertBuilder::new(local.to_str().unwrap())
+            .execute(vec![rows])
+            .await
+            .map_err(|error| {
+                datafusion::common::DataFusionError::External(Box::new(error))
+            })?;
+        let mut directories = vec![local];
+        while let Some(dir) = directories.pop() {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_dir() {
+                    directories.push(path);
+                } else {
+                    let relative = path.strip_prefix(fixture.path()).unwrap();
+                    let key = StorePath::parse(relative.to_str().unwrap())?;
+                    store.put(&key, std::fs::read(&path)?.into()).await?;
+                }
+            }
+        }
+        let table = LanceReadOnlyTable::open_with_builder(
+            location.lance_builder(ctx.runtime_env().as_ref())?,
+            &LakeTableOptions::default(),
+        )
+        .await?;
+        ctx.register_table("source", Arc::new(table))?;
+        let plan = ctx
+            .sql("SELECT id * 2 AS score FROM source")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let (stage, splits) =
+            split_plan_for_distribution_with_codecs(plan, 0, &codecs()?)?;
+        let worker = LocalWorker::with_context(ctx.clone()).with_codecs(codecs()?);
+        let root = StorePath::from("output");
+        let sink =
+            ParquetSplitSink::try_new(store, &root, &stage, &SinkOptions::default())?;
+        for split in &splits {
+            let output = worker.execute_split(&stage, split).await?;
+            let attempt = sink.write_attempt(split, &output.batches).await?;
+            sink.commit_split(split, attempt).await?;
+        }
+        assert_eq!(sink.finalize_stage(&splits).await?.output_rows, 2);
+        let version = datafusion_dist::backfill_lance(
+            &ctx,
+            ObjectStoreUrl::parse(location.origin())?,
+            &root,
+            location.0.as_str(),
+            &params,
+        )
+        .await?;
+        assert_eq!(version, 2);
+        Ok(())
+    }
+
     #[test]
     fn s3_builder_preserves_environment() -> Result<()> {
         if std::env::var_os("DF_DIST_TEST_S3_CONFIG").is_none() {
@@ -583,7 +849,7 @@ mod tests {
     #[tokio::test]
     async fn media_resolver_sees_stores_registered_after_session_creation() -> Result<()>
     {
-        let ctx = session()?;
+        let ctx = session(false)?;
         let resolver = ctx
             .state()
             .config()
