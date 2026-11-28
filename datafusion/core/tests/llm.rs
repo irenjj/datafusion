@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+#[path = "llm/async_exec.rs"]
+mod async_exec;
 #[path = "llm/contract.rs"]
 mod contract;
 #[path = "llm/fuzz.rs"]

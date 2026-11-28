@@ -22,6 +22,8 @@ use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 #[cfg(feature = "sql")]
 use arrow_schema::DataType;
 use arrow_schema::FieldRef;
+#[cfg(feature = "ai")]
+use datafusion_ai::llm::LlmProviderRegistry;
 use datafusion_catalog::MemoryCatalogProviderList;
 use datafusion_catalog::information_schema::{
     INFORMATION_SCHEMA, InformationSchemaProvider,
@@ -181,6 +183,8 @@ struct SessionStateInner {
     file_formats: HashMap<String, Arc<dyn FileFormatFactory>>,
     /// Session configuration
     config: SessionConfig,
+    #[cfg(feature = "ai")]
+    llm_provider_registry: LlmProviderRegistry,
     /// Table options
     table_options: TableOptions,
     /// TableProviderFactories for different file formats.
@@ -954,6 +958,12 @@ impl SessionState {
         &mut Arc::make_mut(&mut self.inner).config
     }
 
+    /// Returns the session's [`LlmProviderRegistry`], shared with its task contexts.
+    #[cfg(feature = "ai")]
+    pub fn llm_provider_registry(&self) -> &LlmProviderRegistry {
+        &self.inner.llm_provider_registry
+    }
+
     /// Return the logical optimizers
     pub fn optimizers(&self) -> &[Arc<dyn OptimizerRule + Send + Sync>] {
         &self.inner.optimizer.rules
@@ -1156,6 +1166,10 @@ impl SessionState {
 pub struct SessionStateBuilder {
     session_id: Option<String>,
     analyzer: Option<Analyzer>,
+    #[cfg(feature = "ai")]
+    llm_provider_registry: Option<LlmProviderRegistry>,
+    #[cfg(feature = "ai")]
+    inherited_llm_provider_registry: Option<LlmProviderRegistry>,
     expr_planners: Option<Vec<Arc<dyn ExprPlanner>>>,
     #[cfg(feature = "sql")]
     relation_planners: Option<Vec<Arc<dyn RelationPlanner>>>,
@@ -1200,6 +1214,10 @@ impl SessionStateBuilder {
         Self {
             session_id: None,
             analyzer: None,
+            #[cfg(feature = "ai")]
+            llm_provider_registry: None,
+            #[cfg(feature = "ai")]
+            inherited_llm_provider_registry: None,
             expr_planners: None,
             #[cfg(feature = "sql")]
             relation_planners: None,
@@ -1262,6 +1280,10 @@ impl SessionStateBuilder {
         Self {
             session_id: None,
             analyzer: Some(existing.analyzer),
+            #[cfg(feature = "ai")]
+            llm_provider_registry: None,
+            #[cfg(feature = "ai")]
+            inherited_llm_provider_registry: Some(existing.llm_provider_registry),
             expr_planners: Some(existing.expr_planners),
             #[cfg(feature = "sql")]
             relation_planners: Some(existing.relation_planners),
@@ -1569,6 +1591,14 @@ impl SessionStateBuilder {
         self
     }
 
+    /// Uses this [`LlmProviderRegistry`] for SQL LLM calls, overriding the
+    /// registry supplied by the session config or inherited from a prior state.
+    #[cfg(feature = "ai")]
+    pub fn with_llm_provider_registry(mut self, registry: LlmProviderRegistry) -> Self {
+        self.llm_provider_registry = Some(registry);
+        self
+    }
+
     /// Set the [`TableOptions`]
     pub fn with_table_options(mut self, table_options: TableOptions) -> Self {
         self.table_options = Some(table_options);
@@ -1701,6 +1731,10 @@ impl SessionStateBuilder {
         let Self {
             session_id,
             analyzer,
+            #[cfg(feature = "ai")]
+            llm_provider_registry,
+            #[cfg(feature = "ai")]
+            inherited_llm_provider_registry,
             expr_planners,
             #[cfg(feature = "sql")]
             relation_planners,
@@ -1735,20 +1769,35 @@ impl SessionStateBuilder {
         let config = config.unwrap_or_default();
         let runtime_env = runtime_env.unwrap_or_else(|| Arc::new(RuntimeEnv::default()));
 
+        #[cfg(feature = "ai")]
+        let (config, llm_provider_registry) = {
+            let mut config = config;
+            let registry = llm_provider_registry
+                .or_else(|| {
+                    config
+                        .get_extension::<LlmProviderRegistry>()
+                        .map(Arc::unwrap_or_clone)
+                })
+                .or(inherited_llm_provider_registry)
+                .unwrap_or_default();
+            config.set_extension(Arc::new(registry.clone()));
+            (config, registry)
+        };
+
         let content = Arc::new(SessionStateInner {
             session_id: session_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
-            #[cfg(feature = "llm")]
+            #[cfg(feature = "ai")]
             analyzer: analyzer.unwrap_or_else(crate::llm::analyzer),
-            #[cfg(not(feature = "llm"))]
+            #[cfg(not(feature = "ai"))]
             analyzer: analyzer.unwrap_or_default(),
             expr_planners: expr_planners.unwrap_or_default(),
             #[cfg(feature = "sql")]
             relation_planners: relation_planners.unwrap_or_default(),
             #[cfg(feature = "sql")]
             type_planner,
-            #[cfg(feature = "llm")]
-            optimizer: optimizer.unwrap_or_else(crate::llm::optimizer),
-            #[cfg(not(feature = "llm"))]
+            #[cfg(feature = "ai")]
+            optimizer: crate::llm::optimizer(optimizer, &llm_provider_registry),
+            #[cfg(not(feature = "ai"))]
             optimizer: optimizer.unwrap_or_default(),
             physical_optimizers: physical_optimizers.unwrap_or_default(),
             query_planner: query_planner
@@ -1779,6 +1828,8 @@ impl SessionStateBuilder {
                 TableOptions::default_from_session_config(config.options())
             }),
             config,
+            #[cfg(feature = "ai")]
+            llm_provider_registry,
             table_factories: table_factories.unwrap_or_default(),
             catalog_factories: catalog_factories.unwrap_or_default(),
             runtime_env,
@@ -2590,7 +2641,6 @@ mod tests {
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::Expr;
     use datafusion_expr::HigherOrderUDF;
-    use datafusion_optimizer::Optimizer;
     use datafusion_optimizer::optimizer::OptimizerRule;
     use datafusion_physical_plan::display::DisplayableExecutionPlan;
     use datafusion_session::Session;
@@ -2760,14 +2810,12 @@ mod tests {
         assert_eq!(state.optimizers().len(), 1);
 
         // test adding rules to default recommendations
+        let default_rule_count = SessionStateBuilder::new().build().optimizers().len();
         let state = SessionStateBuilder::new()
             .with_optimizer_rule(Arc::new(DummyRule {}))
             .build();
 
-        assert_eq!(
-            state.optimizers().len(),
-            Optimizer::default().rules.len() + 1
-        );
+        assert_eq!(state.optimizers().len(), default_rule_count + 1);
     }
 
     #[test]

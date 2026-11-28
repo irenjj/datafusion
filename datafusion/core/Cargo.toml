@@ -102,8 +102,9 @@ unicode_expressions = [
     "datafusion-sql?/unicode_expressions",
     "datafusion-functions/unicode_expressions",
 ]
-# Enables the native projection-only llm operator with mock inference.
-llm = ["dep:serde", "dep:serde_json", "sql", "string_expressions"]
+# Enables SQL planning and execution for AI operators.
+ai = ["dep:datafusion-ai", "sql", "string_expressions"]
+llm = ["ai"]
 extended_tests = []
 
 [dependencies]
@@ -112,6 +113,7 @@ arrow-schema = { workspace = true, features = ["canonical_extension_types"] }
 async-trait = { workspace = true }
 bzip2 = { workspace = true, optional = true }
 chrono = { workspace = true }
+datafusion-ai = { workspace = true, optional = true, features = ["runtime"] }
 datafusion-catalog = { workspace = true }
 datafusion-catalog-listing = { workspace = true }
 datafusion-common = { workspace = true, features = ["object_store"] }
@@ -148,7 +150,6 @@ object_store = { workspace = true }
 parking_lot = { workspace = true }
 parquet = { workspace = true, optional = true, default-features = true }
 serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
-serde_json = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
@@ -179,7 +180,7 @@ rstest = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = "0.40.3"
 test-utils = { path = "../../test-utils" }
-tokio = { workspace = true, features = ["rt-multi-thread", "parking_lot", "fs"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "parking_lot", "fs", "test-util"] }
 unicode-width = "0.2"
 
 [package.metadata.cargo-machete]
@@ -191,7 +192,7 @@ nix = { version = "0.31.3", features = ["fs"] }
 [[test]]
 name = "llm"
 path = "tests/llm.rs"
-required-features = ["llm"]
+required-features = ["ai"]
 
 [[test]]
 name = "extended_tests"

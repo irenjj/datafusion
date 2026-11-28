@@ -76,9 +76,13 @@ pub(super) fn exec_nodes(plan: &dyn ExecutionPlan) -> Vec<&dyn ExecutionPlan> {
 }
 
 pub(super) fn submitted(plan: &dyn ExecutionPlan) -> usize {
+    metric(plan, "submitted_prompts")
+}
+
+pub(super) fn metric(plan: &dyn ExecutionPlan, name: &str) -> usize {
     exec_nodes(plan)
         .into_iter()
-        .filter_map(|exec| exec.metrics().unwrap().sum_by_name("submitted_prompts"))
+        .filter_map(|exec| exec.metrics().unwrap().sum_by_name(name))
         .map(|value| value.as_usize())
         .sum()
 }

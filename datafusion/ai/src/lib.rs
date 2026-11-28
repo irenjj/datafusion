@@ -10,6 +10,8 @@ use datafusion_common::{Result, plan_err};
 use serde::{Deserialize, Serialize};
 
 mod checkpoint;
+#[cfg(feature = "runtime")]
+pub mod llm;
 mod media;
 
 pub use checkpoint::{

@@ -2075,10 +2075,9 @@ impl DefaultPhysicalPlanner {
                         .await?;
                 }
 
-                #[cfg(feature = "llm")]
+                #[cfg(feature = "ai")]
                 if maybe_plan.is_none() {
                     maybe_plan = crate::llm::plan_llm(
-                        self,
                         node.as_ref(),
                         &logical_input,
                         &children,

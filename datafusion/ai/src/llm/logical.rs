@@ -8,20 +8,21 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use super::options::canonical_options;
-use crate::arrow::datatypes::{DataType, Field, FieldRef};
-use crate::common::config::ConfigOptions;
-use crate::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use crate::common::{
+use super::{LlmOptions, LlmProviderRegistry};
+use arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion_common::{
     Column, DFSchema, DFSchemaRef, Result, ScalarValue, internal_err, plan_err,
 };
-use crate::logical_expr::expr::ScalarFunction;
-use crate::logical_expr::expr_rewriter::NamePreserver;
-use crate::logical_expr::{
+use datafusion_expr::expr::ScalarFunction;
+use datafusion_expr::expr_rewriter::NamePreserver;
+use datafusion_expr::{
     ColumnarValue, Expr, Extension, LogicalPlan, Projection, ReturnFieldArgs,
-    ScalarFunctionArgs, ScalarUDFImpl, Signature, UserDefinedLogicalNodeCore, Volatility,
+    ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
+    UserDefinedLogicalNodeCore, Volatility,
 };
-use crate::optimizer::{AnalyzerRule, ApplyOrder, OptimizerConfig, OptimizerRule};
+use datafusion_optimizer::{AnalyzerRule, ApplyOrder, OptimizerConfig, OptimizerRule};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct LlmMarkerUdf {
@@ -31,7 +32,15 @@ pub(super) struct LlmMarkerUdf {
 impl Default for LlmMarkerUdf {
     fn default() -> Self {
         Self {
-            signature: Signature::exact(vec![DataType::Utf8; 3], Volatility::Volatile),
+            signature: Signature::one_of(
+                [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View]
+                    .into_iter()
+                    .map(|prompt| {
+                        TypeSignature::Exact(vec![prompt, DataType::Utf8, DataType::Utf8])
+                    })
+                    .collect(),
+                Volatility::Volatile,
+            ),
         }
     }
 }
@@ -82,13 +91,14 @@ pub(super) fn llm_field(name: &str) -> FieldRef {
     Arc::new(Field::new(name, DataType::Utf8, true))
 }
 
+/// Logical extension that appends an LLM inference result to each input row.
 #[derive(Debug, Eq, PartialEq, Hash)]
-pub(super) struct LlmNode {
-    pub(super) input: LogicalPlan,
-    pub(super) prompt_expr: Expr,
-    pub(super) model: String,
-    pub(super) options_json: String,
-    pub(super) output_col: String,
+pub struct LlmNode {
+    input: LogicalPlan,
+    prompt_expr: Expr,
+    model: String,
+    options_json: String,
+    output_col: String,
     schema: DFSchemaRef,
 }
 
@@ -113,6 +123,31 @@ impl PartialOrd for LlmNode {
 }
 
 impl LlmNode {
+    /// Returns the input plan.
+    pub fn input(&self) -> &LogicalPlan {
+        &self.input
+    }
+
+    /// Returns the expression that produces the prompt for each row.
+    pub fn prompt_expr(&self) -> &Expr {
+        &self.prompt_expr
+    }
+
+    /// Returns the model identifier.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Returns the validated, canonical JSON options.
+    pub fn options_json(&self) -> &str {
+        &self.options_json
+    }
+
+    /// Returns the name of the appended result column.
+    pub fn output_col(&self) -> &str {
+        &self.output_col
+    }
+
     fn try_new(
         input: LogicalPlan,
         prompt_expr: Expr,
@@ -277,9 +312,19 @@ impl AnalyzerRule for ValidateLlm {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct LlmProjectRule {
     next_column: AtomicU64,
+    registry: LlmProviderRegistry,
+}
+
+impl LlmProjectRule {
+    pub(super) fn new(registry: LlmProviderRegistry) -> Self {
+        Self {
+            next_column: AtomicU64::new(0),
+            registry,
+        }
+    }
 }
 
 impl OptimizerRule for LlmProjectRule {
@@ -323,12 +368,11 @@ impl OptimizerRule for LlmProjectRule {
                     return plan_err!("llm() requires prompt, model, and options_json");
                 };
                 let model = literal_string(&model, "model")?.to_owned();
-                let options =
-                    canonical_options(literal_string(&options, "options_json")?)?;
-                // Within one SELECT, identical non-volatile prompts share inference
-                // for the same model and canonical options. If Step 2 needs
-                // independent sampling, add an explicit option to disable reuse.
-                let reusable = !prompt.is_volatile();
+                let (typed_options, options) =
+                    LlmOptions::parse(literal_string(&options, "options_json")?)?;
+                self.registry.resolve(typed_options.provider.as_deref())?;
+                let reusable =
+                    typed_options.deduplicate.unwrap_or(true) && !prompt.is_volatile();
                 if reusable
                     && let Some((_, _, _, output)) = extracted.iter().find(
                         |(prior_prompt, prior_model, prior_options, _)| {

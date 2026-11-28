@@ -284,7 +284,7 @@ async fn nested_calls_are_extracted_inside_out() -> Result<()> {
 #[tokio::test]
 async fn canonical_options_deduplicate_calls_and_rule_is_idempotent() -> Result<()> {
     let ctx = context()?;
-    let sql = "SELECT llm(text, 'm1', '{\"b\":1,\"a\":2}'), llm(text, 'm1', '{\"a\":2,\"b\":1}') FROM t LIMIT 1";
+    let sql = "SELECT llm(text, 'm1', '{\"extra_body\":{\"b\":1,\"a\":2}}'), llm(text, 'm1', '{\"extra_body\":{\"a\":2,\"b\":1}}') FROM t LIMIT 1";
     let (logical, physical) = explain(&ctx, sql, "Common subexpression").await?;
     assert_eq!(logical.matches("LlmProject:").count(), 1);
     assert_eq!(physical.matches("LlmExec:").count(), 1);
@@ -398,6 +398,10 @@ async fn invalid_configuration_fails_in_planning() -> Result<()> {
         ),
         (
             "SELECT llm(text, 'm1', '{\"config\":{\"secret\":\"example\"},\"config\":{}}') FROM t",
+            "sensitive credential key",
+        ),
+        (
+            r#"SELECT llm(text, 'm1', '{"extra_body":{"nested":[{"PassWord":"example"}]},"extra_body":{}}') FROM t"#,
             "sensitive credential key",
         ),
     ] {
