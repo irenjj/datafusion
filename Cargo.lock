@@ -2481,6 +2481,7 @@ name = "datafusion-dist"
 version = "57.0.0-dev"
 dependencies = [
  "datafusion",
+ "datafusion-ai",
  "datafusion-proto",
  "futures",
  "hex",

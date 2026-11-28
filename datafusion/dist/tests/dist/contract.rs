@@ -459,11 +459,11 @@ struct WireExtensions {
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct LegacySplitEnvelope {
+pub(super) struct LegacySplitEnvelope {
     #[prost(message, optional, tag = "1")]
-    file: Option<protobuf::PartitionedFile>,
+    pub(super) file: Option<protobuf::PartitionedFile>,
     #[prost(string, optional, tag = "2")]
-    e_tag: Option<String>,
+    pub(super) e_tag: Option<String>,
 }
 
 #[tokio::test]
@@ -992,7 +992,7 @@ async fn rejects_invalid_split_descriptors_and_nonempty_templates() -> Result<()
     nonempty.plan_fingerprint = plan_hash(&nonempty)?;
     assert_plan_error(
         &worker.prepare_stage(&nonempty).unwrap_err(),
-        "must have an empty Parquet scan",
+        "must have an empty file scan",
     );
     Ok(())
 }
@@ -1237,7 +1237,7 @@ async fn reused_prepared_stage_isolates_scan_filter_and_mock_ai_metrics() -> Res
     assert_matches_single_node(&stage, &schema, &baseline, &outputs)
 }
 
-fn plan_hash(stage: &StagePlan) -> Result<String> {
+pub(super) fn plan_hash(stage: &StagePlan) -> Result<String> {
     let schema =
         protobuf::Schema::try_from(stage.output_schema.as_ref())?.encode_to_vec();
     let mut hash = Sha256::new();
@@ -1258,7 +1258,7 @@ fn split_hash(stage: &StagePlan, file: &[u8]) -> String {
     hex::encode(hash.finalize())
 }
 
-fn set_file_bytes(stage: &StagePlan, split: &mut Split, file: Vec<u8>) {
+pub(super) fn set_file_bytes(stage: &StagePlan, split: &mut Split, file: Vec<u8>) {
     split.fingerprint = split_hash(stage, &file);
     split.file_proto = file;
 }

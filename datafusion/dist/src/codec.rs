@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema;
 use datafusion::common::{Result, plan_datafusion_err, plan_err};
+use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::ParquetSource;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
@@ -72,6 +74,21 @@ pub trait NamedPhysicalExtensionCodec: Debug + Send + Sync {
         converter: &dyn PhysicalProtoConverterExtension,
         root_codec: &dyn PhysicalExtensionCodec,
     ) -> Result<Arc<dyn ExecutionPlan>>;
+
+    /// Bind one split to an empty non-Parquet [`DataSourceExec`] template.
+    ///
+    /// Return `Some` only when this codec claims `node`. The returned
+    /// [`ExecutionPlan`] must retain the template's output schema and have
+    /// exactly one output partition. The coordinator also calls this method
+    /// during admission, so binding must only construct a plan.
+    /// Multiple codecs claiming the same binding cause a planning error.
+    fn bind_split(
+        &self,
+        _node: &Arc<dyn ExecutionPlan>,
+        _file: PartitionedFile,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
 }
 
 /// Registered [`NamedPhysicalExtensionCodec`]s, ordered by wire name.
@@ -113,6 +130,30 @@ impl DistExtensionRegistry {
         Ok(policy)
     }
 
+    pub(crate) fn bind_split(
+        &self,
+        node: &Arc<dyn ExecutionPlan>,
+        file: PartitionedFile,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let mut bound = None;
+        let files = std::iter::repeat_n(file, self.codecs.len());
+        for ((name, codec), file) in self.codecs.iter().zip(files) {
+            let candidate = codec.bind_split(node, file).map_err(|error| {
+                plan_datafusion_err!("Cannot bind physical extension '{name}': {error}")
+            })?;
+            if let Some(candidate) = candidate {
+                if bound.is_some() {
+                    return plan_err!(
+                        "Ambiguous physical extension split binding for {}",
+                        node.name()
+                    );
+                }
+                bound = Some(candidate);
+            }
+        }
+        Ok(bound)
+    }
+
     /// Check speculation policy at every node, propagating ambiguous claims.
     ///
     /// Split admission is checked separately by
@@ -140,6 +181,33 @@ impl DistPhysicalCodec {
     /// Create a codec using the supplied [`DistExtensionRegistry`].
     pub fn new(registry: DistExtensionRegistry) -> Self {
         Self { registry }
+    }
+
+    fn encode_extension(
+        &self,
+        node: &Arc<dyn ExecutionPlan>,
+        converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<Option<VersionedExtensionNode>> {
+        let mut encoded = None;
+        for (name, codec) in self.registry.codecs.iter() {
+            let candidate = codec.try_encode(node, converter, self).map_err(|error| {
+                plan_datafusion_err!("Cannot encode physical extension '{name}': {error}")
+            })?;
+            if let Some((schema_version, payload)) = candidate {
+                if encoded.is_some() {
+                    return plan_err!(
+                        "Ambiguous physical extension encoding for {}",
+                        node.name()
+                    );
+                }
+                encoded = Some(VersionedExtensionNode {
+                    extension_name: name.clone(),
+                    schema_version,
+                    payload,
+                });
+            }
+        }
+        Ok(encoded)
     }
 }
 
@@ -194,29 +262,7 @@ impl PhysicalExtensionCodec for DistPhysicalCodec {
         buf: &mut Vec<u8>,
         converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
-        let mut encoded = None;
-        for (name, codec) in self.registry.codecs.iter() {
-            let candidate =
-                codec.try_encode(&node, converter, self).map_err(|error| {
-                    plan_datafusion_err!(
-                        "Cannot encode physical extension '{name}': {error}"
-                    )
-                })?;
-            if let Some((schema_version, payload)) = candidate {
-                if encoded.is_some() {
-                    return plan_err!(
-                        "Ambiguous physical extension encoding for {}",
-                        node.name()
-                    );
-                }
-                encoded = Some(VersionedExtensionNode {
-                    extension_name: name.clone(),
-                    schema_version,
-                    payload,
-                });
-            }
-        }
-        let encoded = encoded.ok_or_else(|| {
+        let encoded = self.encode_extension(&node, converter)?.ok_or_else(|| {
             plan_datafusion_err!("Unsupported physical extension {}", node.name())
         })?;
         encoded.encode_raw(buf);
@@ -234,9 +280,9 @@ pub(crate) fn is_builtin(plan: &dyn ExecutionPlan) -> bool {
 }
 
 // DataFusion's session registry can bypass the extension codec for named nodes.
-pub(crate) struct MapPlanProtoConverter;
+pub(crate) struct MapPlanProtoConverter<'a>(pub(crate) &'a DistPhysicalCodec);
 
-impl PhysicalProtoConverterExtension for MapPlanProtoConverter {
+impl PhysicalProtoConverterExtension for MapPlanProtoConverter<'_> {
     fn proto_to_execution_plan(
         &self,
         proto: &PhysicalPlanNode,
@@ -255,9 +301,9 @@ impl PhysicalProtoConverterExtension for MapPlanProtoConverter {
                         "Map-only stage extensions must use the versioned codec"
                     );
                 }
-                if extension.inputs.len() != 1 {
+                if extension.inputs.len() > 1 {
                     return plan_err!(
-                        "Map-only stage extensions require exactly one input"
+                        "Map-only stage extensions require exactly one input for unary operators or zero inputs for scan leaves"
                     );
                 }
                 self.default_proto_to_execution_plan(proto, ctx)
@@ -271,6 +317,13 @@ impl PhysicalProtoConverterExtension for MapPlanProtoConverter {
         plan: &Arc<dyn ExecutionPlan>,
         codec: &dyn PhysicalExtensionCodec,
     ) -> Result<PhysicalPlanNode> {
+        if plan.downcast_delegate().is_none()
+            && let Some(source) = plan.downcast_ref::<DataSourceExec>()
+            && source.downcast_to_file_source::<ParquetSource>().is_none()
+            && let Some(node) = self.0.encode_extension(plan, self)?
+        {
+            return Ok(extension_proto(node.encode_to_vec(), vec![]));
+        }
         if is_builtin(plan.as_ref()) {
             let proto = PhysicalPlanNode::try_from_physical_plan_with_converter(
                 Arc::clone(plan),
@@ -293,15 +346,10 @@ impl PhysicalProtoConverterExtension for MapPlanProtoConverter {
         };
         let mut node = Vec::new();
         codec.try_encode(Arc::clone(plan), &mut node, self)?;
-        Ok(PhysicalPlanNode {
-            physical_plan_type: Some(PhysicalPlanType::Extension(
-                PhysicalExtensionNode {
-                    node,
-                    inputs: vec![self.execution_plan_to_proto(child, codec)?],
-                    plan_name: None,
-                },
-            )),
-        })
+        Ok(extension_proto(
+            node,
+            vec![self.execution_plan_to_proto(child, codec)?],
+        ))
     }
 
     fn proto_to_physical_expr(
@@ -319,5 +367,15 @@ impl PhysicalProtoConverterExtension for MapPlanProtoConverter {
         codec: &dyn PhysicalExtensionCodec,
     ) -> Result<PhysicalExprNode> {
         serialize_physical_expr_with_converter(expr, codec, self)
+    }
+}
+
+fn extension_proto(node: Vec<u8>, inputs: Vec<PhysicalPlanNode>) -> PhysicalPlanNode {
+    PhysicalPlanNode {
+        physical_plan_type: Some(PhysicalPlanType::Extension(PhysicalExtensionNode {
+            node,
+            inputs,
+            plan_name: None,
+        })),
     }
 }
