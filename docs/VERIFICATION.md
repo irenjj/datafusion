@@ -21,7 +21,7 @@ tests() { cargo nextest run --locked --cargo-profile ci -p "$@"; }
 | dist-checkpoint | TODO `lint datafusion-dist` and `tests datafusion-dist`. The lake tables are read-only. Checkpoint and DLQ routing belong to `datafusion-dist`.                                                                              | TODO restart, duplicate replay and interruption tests at the checkpoint commit boundary.                                                                                                                                |
 | lake-retrieval  | TODO `lint datafusion-lake` and `tests datafusion-lake`. Add exact-oracle, ties and empty-input cases.                                                                                                                       | TODO differential retrieval fuzz with fixed seeds and stored failing cases.                                                                                                                                             |
 | dist-plan       | `lint datafusion-dist` and `tests datafusion-dist` (target `dist`). Covers map-only admission, versioned operator and file codecs, split fingerprints and metric isolation.                                                  | `DIST_FUZZ_CASES=36 DIST_FUZZ_SEED=2026 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --test dist fuzz`. Use `DIST_FUZZ_REPLAY=dataset_seed,case_seed` for one failing case.                         |
-| dist-runtime    | TODO `lint datafusion-dist` and `tests datafusion-dist`. Add worker loss, late completion and retry fencing cases.                                                                                                           | TODO replay worker-loss and retry fixtures on Ray.                                                                                                                                                                      |
+| dist-runtime    | `lint datafusion-dist` and `tests datafusion-dist`. Covers deterministic worker recovery, attempt fencing and 256 seeded lease sequences.                                                                                    | [Replay high-sample proptest and both TLC configurations](#distributed-scheduler-replay).                                                                                                                               |
 | assembly        | Once core exposes `ai`, `lint datafusion --features ai` and `tests datafusion --features ai --lib --test core_integration`. TODO add feature wiring and end-to-end cases in core. Existing Rust CI covers the default build. | TODO AI-enabled SQL fixtures in `sqllogictests` and end-to-end composed execution.                                                                                                                                      |
 | repo-infra      | `scripts/test-evidence.sh` and the workflow fmt gate. Run `./ci/scripts/doc_prettier_check.sh` for Markdown changes.                                                                                                         | Replay the three PR jobs with the toolchain or runner image being updated.                                                                                                                                              |
 
@@ -40,6 +40,29 @@ Lance applies predicates in the fragment scanner. Paimon pushes predicates into 
 Top-level blobs project as `df.media_ref` v1. MIME takes the first declared value from field metadata, `fields.<column>.<key>`, or table metadata, with key order `df.media.mime`, `mime`, `content-type`. Any applicable blank declaration fails at open. Nested blob projections and Lance blob overlays are rejected at open. Lance preserves the storage block size configured by its builder. Its metadata tail prefetch can overlap inline payload bytes.
 
 The media resolver uses a caller's object store registry, with optional scoped Paimon FileIO bindings. It validates the URI for every reference. An explicit zero-length range without an ETag returns empty bytes without storage IO. With an ETag, the resolver checks object metadata without reading payload bytes. Paimon FileIO bindings expose object length and reject a supplied ETag because their API does not expose ETags.
+
+## Distributed scheduler replay
+
+```bash
+PROPTEST_CASES=256 DIST_LEASE_PROPTEST_SEED=3099 \
+  cargo nextest run --locked --cargo-profile ci -p datafusion-dist --test dist scheduler_props
+PROPTEST_CASES=4096 DIST_LEASE_PROPTEST_SEED=3099 \
+  cargo nextest run --locked --cargo-profile ci -p datafusion-dist --test dist scheduler_props
+```
+
+The default seed is `0xc1b` (3099). If both seed variables are set, proptest's
+`PROPTEST_RNG_SEED` overrides `DIST_LEASE_PROPTEST_SEED`.
+
+With the [official TLC JAR in `/home/renjj/df-ci-data/tools`](../datafusion/dist/specs/README.md#replay-with-tlc),
+run both exhaustive model configurations with deadlock checking enabled.
+
+```bash
+for config in LeasedSplitQueue LeasedSplitQueueHardCap; do
+  java -XX:+UseParallelGC -cp /home/renjj/df-ci-data/tools/tla2tools.jar tlc2.TLC \
+    -workers auto -noGenerateSpecTE -metadir "/tmp/tlc-states-$config" \
+    -config "datafusion/dist/specs/$config.cfg" datafusion/dist/specs/LeasedSplitQueue.tla
+done
+```
 
 ## Evidence
 

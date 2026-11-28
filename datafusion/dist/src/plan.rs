@@ -101,7 +101,7 @@ pub struct PreparedStage {
     plan_fingerprint: String,
     output_schema: SchemaRef,
     pub(crate) task_ctx: Arc<TaskContext>,
-    codecs: DistCodecs,
+    pub(crate) codecs: DistCodecs,
 }
 
 /// Counters collected from one split attempt.

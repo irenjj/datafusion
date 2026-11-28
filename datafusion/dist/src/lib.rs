@@ -8,6 +8,7 @@ mod codec;
 mod fingerprint;
 mod plan;
 mod runner;
+mod scheduler;
 
 pub use codec::{
     DistExtensionRegistry, DistPhysicalCodec, ExtensionOperatorPolicy,
@@ -23,3 +24,7 @@ pub use plan::{
     split_plan_for_distribution_with_codecs, split_plan_for_distribution_with_extensions,
 };
 pub use runner::LocalWorker;
+pub use scheduler::{
+    CommitOutcome, LeaseConfig, LeaseError, LeaseToken, LeasedSplitQueue, ManualClock,
+    MonotonicClock, MonotonicTime, SplitState, SplitTransition, SystemClock,
+};
