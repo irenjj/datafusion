@@ -14,22 +14,33 @@ publish = false
 [lints]
 workspace = true
 
+[[bin]]
+name = "dist-worker"
+path = "src/bin/dist-worker/main.rs"
+
 [features]
-ai = ["dep:datafusion-ai", "datafusion-ai/runtime"]
+ai = ["dep:arrow-schema", "dep:datafusion-ai", "datafusion-ai/runtime", "datafusion/ai"]
+ai-http = ["ai", "datafusion-ai/http", "datafusion/ai-http"]
 parquet_encryption = ["datafusion/parquet_encryption"]
+s3 = ["object_store/aws"]
 
 [dependencies]
-datafusion = { workspace = true, features = ["parquet"] }
+arrow-schema = { workspace = true, optional = true }
+datafusion = { workspace = true, features = ["parquet", "serde", "sql"] }
 datafusion-ai = { workspace = true, optional = true, features = ["runtime"] }
 datafusion-proto = { workspace = true, features = ["parquet"] }
 futures = { workspace = true }
 hex = { workspace = true }
+object_store = { workspace = true }
 prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+url = { workspace = true }
 
 [dev-dependencies]
 proptest = { version = "1.12", default-features = false, features = ["std"] }
 rand = { workspace = true }
 tempfile = { workspace = true }
 test-utils = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -2482,18 +2482,23 @@ dependencies = [
 name = "datafusion-dist"
 version = "57.0.0-dev"
 dependencies = [
+ "arrow-schema",
  "datafusion",
  "datafusion-ai",
  "datafusion-proto",
  "futures",
  "hex",
+ "object_store",
  "proptest",
  "prost",
  "rand 0.9.4",
+ "serde",
+ "serde_json",
  "sha2 0.11.1",
  "tempfile",
  "test-utils",
  "tokio",
+ "url",
 ]
 
 [[package]]

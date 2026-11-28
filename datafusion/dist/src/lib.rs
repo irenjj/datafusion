@@ -11,6 +11,7 @@ mod fingerprint;
 mod plan;
 mod runner;
 mod scheduler;
+mod sink;
 
 #[cfg(feature = "ai")]
 pub use ai::LlmExecCodec;
@@ -32,3 +33,4 @@ pub use scheduler::{
     CommitOutcome, LeaseConfig, LeaseError, LeaseToken, LeasedSplitQueue, ManualClock,
     MonotonicClock, MonotonicTime, SplitState, SplitTransition, SystemClock,
 };
+pub use sink::{AttemptArtifact, ParquetSplitSink, SinkOptions, StageManifest};

@@ -99,7 +99,7 @@ async fn llm_splits_match_local_results_and_isolate_retry_metrics() -> Result<()
     assert_plan_error(
         &decode_stage_template_with_codecs(&stage, &SessionContext::new(), &codecs)
             .unwrap_err(),
-        "requires a LlmProviderRegistry extension",
+        "Unknown llm provider 'offline'",
     );
 
     let worker = session(&registry()?);
