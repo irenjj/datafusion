@@ -173,7 +173,10 @@ loom = "0.7"
 memchr = "2.8.1"
 num-traits = { version = "0.2" }
 object_store = { version = "0.14.2", default-features = false }
-paimon = { git = "https://github.com/irenjj/paimon-rust.git", rev = "b2a0bdae93db74a98a5afe11e614fb491f7a8857", default-features = false, features = ["storage-memory", "storage-fs"] }
+paimon = { git = "https://github.com/irenjj/paimon-rust.git", rev = "b2a0bdae93db74a98a5afe11e614fb491f7a8857", default-features = false, features = [
+    "storage-memory",
+    "storage-fs",
+] }
 parking_lot = "0.13"
 parquet = { version = "60.2.0", default-features = false, features = [
     "arrow",
