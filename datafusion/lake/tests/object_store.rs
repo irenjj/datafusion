@@ -2,22 +2,16 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
-use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use arrow::array::{Int32Array, RecordBatch};
-use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
+use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema};
-use async_trait::async_trait;
 use datafusion_ai::MediaRefType;
 use datafusion_catalog::{Session, TableProvider};
-use datafusion_datasource::file_scan_config::FileScanConfig;
-use datafusion_datasource::source::DataSourceExec;
-use datafusion_execution::{TaskContext, config::SessionConfig};
 use datafusion_lake::backfill::{
     BackfillPlan, BackfillReceipt, BackfillTarget, BackfillWorkUnit, finalize_backfill,
     prepare_backfill, write_backfill_unit,
@@ -29,33 +23,23 @@ use datafusion_lake::{
     LakeObjectStores, LakeSplitExt, LakeSplitPayload, LakeTableOptions,
     LanceReadOnlyTable,
 };
-use datafusion_physical_plan::{ExecutionPlan, collect};
-use futures::stream::BoxStream;
-use futures::{TryStreamExt, future::try_join_all, stream};
-use lance::{BlobArrayBuilder, BlobFieldOptions, blob_field_with_options};
+use datafusion_physical_plan::collect;
+use futures::{future::try_join_all, stream};
 use lance_file::version::LanceFileVersion;
-use lance_io::object_store::{
-    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_DOWNLOAD_RETRY_COUNT,
-    ObjectStore as LanceObjectStore, ObjectStoreParams, ObjectStoreProvider,
-    ObjectStoreRegistry,
-};
-use lance_table_runtime::Table;
-use lance_table_runtime::write::{InsertBuilder, WriteParams};
 use lance_testing::datafusion::TestSession;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{
-    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult,
-};
-use sha2::{Digest, Sha256};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use tokio::sync::Barrier;
 use url::Url;
 
-const URI: &str = "s3://test-bucket/lake/nested%20prefix/source.lance";
-const PREFIX: &str = "s3://test-bucket/lake/nested%20prefix/";
-const IDS: [i32; 7] = [42, 7, 81, 15, 9, 61, 30];
+#[path = "support/s3.rs"]
+mod s3;
+
+use s3::{
+    IDS, ManifestProbe, ObservedStore, PREFIX, URI, bound_stores, file_config, ids,
+    is_blob, next_manifest, object_states, sort_by_id, worker_context, write_fixture,
+};
 
 #[test]
 fn resolves_most_specific_scope() {
@@ -416,44 +400,6 @@ async fn open(stores: &LakeObjectStores) -> LanceReadOnlyTable {
         .unwrap()
 }
 
-fn bound_stores(store: Arc<dyn ObjectStore>) -> LakeObjectStores {
-    let mut stores = LakeObjectStores::default();
-    stores.register(PREFIX, store).unwrap();
-    stores
-}
-
-fn worker_context(runtime: LakeRuntimeConfig) -> Arc<TaskContext> {
-    let mut config = SessionConfig::new();
-    runtime.register(&mut config);
-    Arc::new(TaskContext::new(
-        None,
-        "s3-worker".into(),
-        config,
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-    ))
-}
-
-fn file_config(plan: &dyn ExecutionPlan) -> &FileScanConfig {
-    plan.downcast_ref::<DataSourceExec>()
-        .unwrap()
-        .data_source()
-        .downcast_ref()
-        .unwrap()
-}
-
-fn ids(batch: &RecordBatch) -> &Int32Array {
-    batch["id"].as_any().downcast_ref().unwrap()
-}
-
-fn sort_by_id(batch: &RecordBatch) -> RecordBatch {
-    let order = sort_to_indices(ids(batch), None, None).unwrap();
-    take_record_batch(batch, &order).unwrap()
-}
-
 fn derived_columns(ids: &[i32], offset: i32) -> RecordBatch {
     let values = Int32Array::from_iter_values(ids.iter().map(|id| id * 10 + offset));
     RecordBatch::try_new(
@@ -465,231 +411,4 @@ fn derived_columns(ids: &[i32], offset: i32) -> RecordBatch {
         vec![Arc::new(values)],
     )
     .unwrap()
-}
-
-fn next_manifest(table: &Table) -> Path {
-    let base = Path::from_url_path(Url::parse(URI).unwrap().path()).unwrap();
-    table
-        .manifest_location()
-        .naming_scheme
-        .manifest_path(&base, table.version_id() + 1)
-}
-
-fn is_blob(path: &Path) -> bool {
-    path.extension() == Some("blob")
-}
-
-async fn object_states(
-    inner: &InMemory,
-    prefix: &Path,
-) -> BTreeMap<Path, (u64, [u8; 32])> {
-    let mut states = BTreeMap::new();
-    let mut objects = inner.list(Some(prefix));
-    while let Some(meta) = objects.try_next().await.unwrap() {
-        let bytes = inner
-            .get(&meta.location)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        states.insert(meta.location, (meta.size, Sha256::digest(bytes).into()));
-    }
-    states
-}
-
-#[derive(Debug)]
-struct FixtureProvider(Arc<InMemory>);
-
-#[async_trait]
-impl ObjectStoreProvider for FixtureProvider {
-    async fn new_store(
-        &self,
-        url: Url,
-        _: &ObjectStoreParams,
-    ) -> lance::Result<LanceObjectStore> {
-        LanceObjectStore::try_new(
-            self.0.clone(),
-            url,
-            None,
-            None,
-            false,
-            true,
-            DEFAULT_CLOUD_IO_PARALLELISM,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        )
-    }
-}
-
-async fn write_fixture(store: Arc<InMemory>) -> Table {
-    let registry = Arc::new(ObjectStoreRegistry::default());
-    registry.insert("s3", Arc::new(FixtureProvider(store)));
-    let session = lance::session::Session::new(0, 0, registry);
-    let mut blobs = BlobArrayBuilder::new(IDS.len());
-    for id in IDS {
-        blobs
-            .push_bytes(vec![u8::try_from(id).unwrap(); 128])
-            .unwrap();
-    }
-    let blob = blob_field_with_options(
-        "payload",
-        true,
-        BlobFieldOptions::default()
-            .with_inline_size_threshold(1)
-            .with_dedicated_size_threshold(NonZeroUsize::new(8).unwrap()),
-    );
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            blob,
-        ])),
-        vec![
-            Arc::new(Int32Array::from_iter_values(IDS)),
-            blobs.finish().unwrap(),
-        ],
-    )
-    .unwrap();
-    InsertBuilder::new(URI)
-        .with_params(&WriteParams {
-            max_rows_per_file: 3,
-            data_storage_version: Some(LanceFileVersion::V2_2),
-            session: Some(Arc::new(session.as_ref().clone())),
-            ..Default::default()
-        })
-        .execute(vec![batch])
-        .await
-        .unwrap()
-}
-
-#[derive(Debug, Default)]
-struct ManifestProbe {
-    path: Path,
-    barrier: Option<Barrier>,
-    reject: bool,
-    writes: Mutex<Vec<(PutMode, bool)>>,
-}
-
-#[derive(Debug, Default)]
-struct ObservedStore {
-    inner: Arc<InMemory>,
-    read_ops: AtomicUsize,
-    fetched: Mutex<HashMap<Path, u64>>,
-    manifest: Option<ManifestProbe>,
-    reject_conditional_copy: bool,
-}
-
-impl ObservedStore {
-    fn assert_no_blob_reads(&self) {
-        let mut fetched = self.fetched.lock().unwrap();
-        assert!(fetched.values().any(|bytes| *bytes > 0));
-        let blob_bytes: u64 = fetched
-            .iter()
-            .filter(|(path, _)| is_blob(path))
-            .map(|(_, bytes)| bytes)
-            .sum();
-        assert_eq!(blob_bytes, 0);
-        fetched.clear();
-    }
-}
-
-impl fmt::Display for ObservedStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("observed test S3 store")
-    }
-}
-
-#[async_trait]
-impl ObjectStore for ObservedStore {
-    async fn get_opts(
-        &self,
-        path: &Path,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        self.read_ops.fetch_add(1, Ordering::Relaxed);
-        let head = options.head;
-        let result = self.inner.get_opts(path, options).await?;
-        if !head {
-            *self
-                .fetched
-                .lock()
-                .unwrap()
-                .entry(path.clone())
-                .or_default() += result.range.end - result.range.start;
-        }
-        Ok(result)
-    }
-
-    async fn put_opts(
-        &self,
-        path: &Path,
-        payload: PutPayload,
-        options: PutOptions,
-    ) -> object_store::Result<PutResult> {
-        let Some(probe) = self.manifest.as_ref().filter(|probe| probe.path == *path)
-        else {
-            return self.inner.put_opts(path, payload, options).await;
-        };
-        let mode = options.mode.clone();
-        if let Some(barrier) = &probe.barrier {
-            barrier.wait().await;
-        }
-        let result = if probe.reject && mode == PutMode::Create {
-            Err(unsupported("conditional put"))
-        } else {
-            self.inner.put_opts(path, payload, options).await
-        };
-        probe.writes.lock().unwrap().push((mode, result.is_ok()));
-        result
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        path: &Path,
-        options: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(path, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        paths: BoxStream<'static, object_store::Result<Path>>,
-    ) -> BoxStream<'static, object_store::Result<Path>> {
-        self.inner.delete_stream(paths)
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&Path>,
-    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.read_ops.fetch_add(1, Ordering::Relaxed);
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> object_store::Result<ListResult> {
-        self.read_ops.fetch_add(1, Ordering::Relaxed);
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> object_store::Result<()> {
-        if self.reject_conditional_copy && options.mode == CopyMode::Create {
-            return Err(unsupported("conditional copy"));
-        }
-        self.inner.copy_opts(from, to, options).await
-    }
-}
-
-fn unsupported(operation: &str) -> object_store::Error {
-    object_store::Error::NotImplemented {
-        operation: operation.into(),
-        implementer: "observed test S3 store".into(),
-    }
 }
