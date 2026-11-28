@@ -374,6 +374,30 @@ impl SplitFileEnvelope {
     }
 }
 
+#[cfg(feature = "lake")]
+pub(crate) fn decode_lake_split(
+    file_proto: &[u8],
+) -> Result<datafusion_lake::LakeSplitExt> {
+    use datafusion_lake::{LAKE_SPLIT_EXT_NAME, LAKE_SPLIT_EXT_VERSION, LakeSplitExt};
+
+    let envelope = SplitFileEnvelope::decode(file_proto)
+        .map_err(|error| plan_datafusion_err!("Invalid split protobuf: {error}"))?;
+    let mut entries = envelope
+        .extensions
+        .iter()
+        .filter(|entry| entry.extension_name == LAKE_SPLIT_EXT_NAME);
+    let entry = entries
+        .next()
+        .ok_or_else(|| plan_datafusion_err!("Missing lake split extension"))?;
+    if entry.version != LAKE_SPLIT_EXT_VERSION || entries.next().is_some() {
+        return plan_err!("Duplicate or unsupported lake split extension");
+    }
+    let file = datafusion_lake::dist::decode_split(&entry.payload)?;
+    file.extension::<LakeSplitExt>()
+        .cloned()
+        .ok_or_else(|| plan_datafusion_err!("Missing decoded lake split extension"))
+}
+
 /// Extract the planned files/ranges and serialize a template with no file groups.
 pub fn split_plan_for_distribution(
     plan: Arc<dyn ExecutionPlan>,

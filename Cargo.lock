@@ -2486,9 +2486,14 @@ dependencies = [
  "arrow-schema",
  "datafusion",
  "datafusion-ai",
+ "datafusion-lake",
  "datafusion-proto",
  "futures",
  "hex",
+ "lance",
+ "lance-core",
+ "lance-io",
+ "lance-table-runtime",
  "object_store",
  "proptest",
  "prost",
@@ -2500,6 +2505,7 @@ dependencies = [
  "test-utils",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]

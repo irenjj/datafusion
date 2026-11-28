@@ -161,6 +161,8 @@ mod tests {
             tables: vec![format!("t={}", input.display())],
             stage_tables: vec![],
             stage_dlq_tables: vec![],
+            #[cfg(feature = "lake")]
+            lance_tables: vec![],
             sink: SinkOptions::default(),
             output_root: Some(output.to_str().unwrap().into()),
         })

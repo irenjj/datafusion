@@ -8,6 +8,8 @@
 mod ai;
 mod codec;
 mod fingerprint;
+#[cfg(feature = "lake")]
+mod lake;
 mod manifest_table;
 mod plan;
 mod runner;
@@ -20,6 +22,8 @@ pub use codec::{
     DistExtensionRegistry, DistPhysicalCodec, ExtensionOperatorPolicy,
     NamedPhysicalExtensionCodec,
 };
+#[cfg(feature = "lake")]
+pub use lake::backfill_lance;
 pub use manifest_table::StageOutputReader;
 pub use plan::{
     DistCodecs, FileExtensionCodec, FileExtensionCodecRegistry, PreparedStage,

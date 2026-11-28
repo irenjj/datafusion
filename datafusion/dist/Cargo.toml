@@ -21,6 +21,7 @@ path = "src/bin/dist-worker/main.rs"
 [features]
 ai = ["dep:arrow-schema", "dep:datafusion-ai", "datafusion-ai/runtime", "datafusion/ai"]
 ai-http = ["ai", "datafusion-ai/http", "datafusion/ai-http"]
+lake = ["dep:datafusion-lake", "dep:lance", "dep:lance-core", "dep:lance-io", "dep:lance-table-runtime", "dep:uuid"]
 parquet_encryption = ["datafusion/parquet_encryption"]
 s3 = ["object_store/aws"]
 
@@ -28,9 +29,14 @@ s3 = ["object_store/aws"]
 arrow-schema = { workspace = true, optional = true }
 datafusion = { workspace = true, features = ["parquet", "serde", "sql"] }
 datafusion-ai = { workspace = true, optional = true, features = ["runtime"] }
+datafusion-lake = { workspace = true, optional = true }
 datafusion-proto = { workspace = true, features = ["parquet"] }
 futures = { workspace = true }
 hex = { workspace = true }
+lance = { workspace = true, optional = true }
+lance-core = { git = "https://github.com/irenjj/lance.git", rev = "d7774c85fd5416ea5e10f1b5fe861bda7a603672", default-features = false, optional = true }
+lance-io = { git = "https://github.com/irenjj/lance.git", rev = "d7774c85fd5416ea5e10f1b5fe861bda7a603672", default-features = false, optional = true }
+lance-table-runtime = { git = "https://github.com/irenjj/lance.git", rev = "d7774c85fd5416ea5e10f1b5fe861bda7a603672", default-features = false, optional = true }
 object_store = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
@@ -38,6 +44,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "time"] }
 url = { workspace = true }
+uuid = { workspace = true, optional = true, features = ["v4"] }
 
 [dev-dependencies]
 proptest = { version = "1.12", default-features = false, features = ["std"] }

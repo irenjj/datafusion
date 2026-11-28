@@ -18,12 +18,6 @@ import tempfile
 from types import MappingProxyType
 from urllib.parse import quote, unquote, urlsplit
 
-if __package__:
-    from . import ray_driver
-else:
-    import ray_driver
-
-
 _MANIFEST = "STAGE_MANIFEST.json"
 _SCHEMA = "df-stage-manifest-v1"
 _FINGERPRINT = re.compile(r"[a-f0-9]{64}")
@@ -147,18 +141,46 @@ class StageResult:
         )
 
 
-def run_stage(*, sql, tables, output_root, row_key=None, worker="dist-worker",
-              ray_address=None, concurrency=4, timeout=60.0, max_attempts=3) -> StageResult:
+def run_stage(*, sql, output_root, tables=None, row_key=None, worker="dist-worker",
+              ray_address=None, concurrency=4, timeout=60.0, max_attempts=3,
+              execution_mode=None, pool_size=None, max_global_inflight=None,
+              splits_per_minute=None, secrets=None, secrets_file=None,
+              stage_tables=None, stage_dlq_tables=None, lance_tables=None) -> StageResult:
     """Plan, run and finalize a stage through the Ray driver CLI.
 
-    ``tables`` is a mapping of names to Parquet locations or an iterable of
-    ``name=path`` strings. ``timeout`` is the per-attempt timeout in seconds.
+    Table bindings are mappings of names to locations or iterables of
+    ``name=path`` strings. Supply at least one binding across the four table types.
+    The default execution mode is actor. ``pool_size`` applies only to actors.
+    ``timeout`` is the per-attempt timeout in seconds. Supply worker environment
+    variables through ``secrets`` (JSON sent on stdin) or a regular
+    ``secrets_file`` with mode 0600.
     """
-    if isinstance(tables, Mapping):
-        tables = [f"{name}={os.fspath(path)}" for name, path in tables.items()]
-    elif isinstance(tables, str):
-        raise TypeError("tables must be a mapping or an iterable of name=path strings")
+    if __package__:
+        from . import ray_driver
+    else:
+        import ray_driver
+
     ray_driver._validate_ray_address(ray_address)
+    ray_driver._validate_dispatch(timeout, concurrency, max_attempts)
+    ray_driver._validate_scheduler("actor" if execution_mode is None else execution_mode,
+                                   pool_size, max_global_inflight, splits_per_minute)
+    bindings = list(ray_driver._table_bindings(
+        tables, stage_tables, stage_dlq_tables, lance_tables,
+    ))
+    if secrets is not None and secrets_file is not None:
+        raise ValueError("secrets and secrets_file are mutually exclusive")
+    secret_flags = []
+    secret_input = None
+    redactions = ray_driver._inherited_payload()
+    if secrets is not None:
+        payload = ray_driver._validate_payload(secrets)
+        redactions.update(payload)
+        secret_flags.append("--secrets-stdin")
+        secret_input = json.dumps(payload)
+    elif secrets_file is not None:
+        redactions.update(ray_driver._read_secrets_file(secrets_file))
+        secret_flags.append(f"--secrets-file={os.fspath(secrets_file)}")
+
     root = _location(output_root)
     if isinstance(root, Path):
         root = root.resolve()
@@ -170,17 +192,18 @@ def run_stage(*, sql, tables, output_root, row_key=None, worker="dist-worker",
             "--job", str(Path(directory) / "stage-job.json"),
             f"--concurrency={concurrency}", f"--timeout={timeout}", f"--max-attempts={max_attempts}",
         ]
-        command.extend(f"--table={table}" for table in tables)
-        if row_key is not None:
-            command.append(f"--row-key={row_key}")
-        if ray_address is not None:
-            command.append(f"--ray-address={ray_address}")
-        result = subprocess.run(command, capture_output=True, text=True, errors="replace", check=False)
+        command.extend(f"{flag}={binding}" for flag, binding in bindings)
+        command.extend(f"{flag}={value}" for flag, value in (
+            ("--row-key", row_key), ("--ray-address", ray_address),
+            ("--execution-mode", execution_mode), ("--pool-size", pool_size),
+            ("--max-global-inflight", max_global_inflight),
+            ("--max-splits-per-minute", splits_per_minute),
+        ) if value is not None)
+        command.extend(secret_flags)
+        result = subprocess.run(command, input=secret_input, capture_output=True,
+                                text=True, errors="replace", check=False)
         if result.returncode:
-            detail = result.stderr
-            for value in sorted(set(ray_driver._inherited_payload().values()), key=len, reverse=True):
-                if value:
-                    detail = detail.replace(value, "[redacted]")
+            detail = ray_driver._redact(result.stderr, redactions)
             raise RuntimeError(f"Ray stage driver exited {result.returncode}: {detail.strip()}")
         manifest = _decode_manifest(result.stdout)
     stage_root = root.joinpath("stages", _plan_fingerprint(manifest))
