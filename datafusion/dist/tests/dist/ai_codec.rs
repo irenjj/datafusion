@@ -8,20 +8,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::common::{DFSchema, Result};
+use datafusion::common::{DFSchema, Result, plan_datafusion_err, plan_err};
+use datafusion::execution::TaskContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::{
     ExecutionPlan, collect, empty::EmptyExec, filter::FilterExec,
 };
 use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
-use datafusion_ai::llm::{LlmExec, LlmProviderRegistry, MockLlmBackend};
+use datafusion_ai::ObjectStoreMediaResolver;
+use datafusion_ai::llm::{
+    LlmExec, LlmProviderRegistry, MediaPlan, MockLlmBackend, TaskKind,
+};
 use datafusion_dist::{
     CommitOutcome, DistCodecs, DistExtensionRegistry, DistPhysicalCodec, LeaseConfig,
     LeasedSplitQueue, LlmExecCodec, ManualClock, NamedPhysicalExtensionCodec,
     bind_split_to_template, decode_stage_template_with_codecs,
     split_plan_for_distribution_with_codecs,
 };
-use datafusion_proto::physical_plan::DefaultPhysicalProtoConverter;
+use datafusion_proto::physical_plan::{
+    DefaultPhysicalProtoConverter, to_proto::serialize_physical_expr_with_converter,
+};
 use datafusion_proto::protobuf::PhysicalExprNode;
 use prost::Message;
 use tempfile::tempdir;
@@ -156,25 +163,34 @@ async fn llm_splits_match_local_results_and_isolate_retry_metrics() -> Result<()
     assert_matches_single_node(&stage, llm.schema().as_ref(), &baseline, &outputs)
 }
 
-fn llm_test_plan(registry: &LlmProviderRegistry, options_json: &str) -> Result<LlmExec> {
-    let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::new(
-        vec![Field::new("prompt", DataType::Utf8, false)],
-    ))));
-    LlmExec::try_new_with_registry(
+fn llm_test_plan(
+    ctx: &TaskContext,
+    kind: TaskKind,
+    options_json: &str,
+) -> Result<LlmExec> {
+    let input: Arc<dyn ExecutionPlan> =
+        Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![
+            Field::new("prompt", DataType::Utf8, false),
+            Field::new("uri", DataType::Utf8, false),
+        ]))));
+    let media = (kind == TaskKind::Vision)
+        .then(|| MediaPlan::new(Arc::new(Column::new("uri", 1))));
+    LlmExec::try_new_task_from_task_context(
         input,
         Arc::new(Column::new("prompt", 0)),
+        media,
+        kind,
         "test-model".into(),
         options_json,
         "answer".into(),
-        registry,
+        ctx,
     )
 }
 
 #[test]
 fn llm_codec_requires_one_input_and_its_supported_version() -> Result<()> {
-    let registry = registry()?;
-    let ctx = session(&registry);
-    let llm = llm_test_plan(&registry, "{}")?;
+    let ctx = session(&registry()?).task_ctx();
+    let llm = llm_test_plan(&ctx, TaskKind::Chat, "{}")?;
     let input = Arc::clone(llm.input());
     let plan: Arc<dyn ExecutionPlan> = Arc::new(llm);
     let codec = LlmExecCodec::new();
@@ -184,27 +200,26 @@ fn llm_codec_requires_one_input_and_its_supported_version() -> Result<()> {
     assert!(codec.try_encode(&input, &converter, &root)?.is_none());
     let (version, payload) = codec.try_encode(&plan, &converter, &root)?.unwrap();
     assert_eq!(codec.extension_name(), "df.llm.exec");
-    assert_eq!(version, 1);
-    let task = ctx.task_ctx();
+    assert_eq!(version, 2);
     for inputs in [vec![], vec![Arc::clone(&input), Arc::clone(&input)]] {
         assert_plan_error(
             &codec
-                .try_decode(version, &payload, &inputs, &task, &converter, &root)
+                .try_decode(version, &payload, &inputs, &ctx, &converter, &root)
                 .unwrap_err(),
             "LlmExec requires exactly one input",
         );
     }
     assert_plan_error(
         &codec
-            .try_decode(2, &payload, &[input], &task, &converter, &root)
+            .try_decode(3, &payload, &[input], &ctx, &converter, &root)
             .unwrap_err(),
-        "Unsupported LlmExec schema version 2",
+        "Unsupported LlmExec schema version 3",
     );
     Ok(())
 }
 
 #[derive(Message)]
-struct WirePayload {
+struct V1Payload {
     #[prost(message, optional, tag = "1")]
     prompt: Option<PhysicalExprNode>,
     #[prost(string, tag = "2")]
@@ -215,33 +230,177 @@ struct WirePayload {
     output_col: String,
 }
 
+#[derive(Message)]
+struct TaskFields {
+    #[prost(uint32, tag = "5")]
+    kind: u32,
+    #[prost(message, optional, tag = "6")]
+    media: Option<PhysicalExprNode>,
+}
+
+fn decode_as_v1(version: u32, payload: &[u8]) -> Result<V1Payload> {
+    if version != 1 {
+        return plan_err!("Unsupported LlmExec schema version {version}");
+    }
+    V1Payload::decode(payload)
+        .map_err(|error| plan_datafusion_err!("Invalid LlmExec protobuf: {error}"))
+}
+
+#[test]
+fn llm_codec_round_trips_all_v2_task_kinds() -> Result<()> {
+    let registry = registry()?;
+    let worker_without_media = session(&registry).task_ctx();
+    let worker = TaskContext::default().with_session_config(
+        SessionConfig::new()
+            .with_extension(Arc::new(registry))
+            .with_extension(Arc::new(ObjectStoreMediaResolver::new(
+                RuntimeEnv::default().object_store_registry,
+            ))),
+    );
+    let codec = LlmExecCodec::new();
+    let converter = DefaultPhysicalProtoConverter {};
+    let root = DistPhysicalCodec::default();
+    for (kind, wire_kind, options) in [
+        (TaskKind::Chat, 0, r#"{"provider":"offline"}"#),
+        (
+            TaskKind::Embed,
+            1,
+            r#"{"dimension":4,"on_error":"envelope"}"#,
+        ),
+        (
+            TaskKind::Vision,
+            2,
+            r#"{"on_error":"envelope","max_media_bytes":16}"#,
+        ),
+    ] {
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(llm_test_plan(&worker, kind, options)?);
+        let original = plan.downcast_ref::<LlmExec>().unwrap();
+        let inputs = [Arc::clone(original.input())];
+        let (version, payload) = codec.try_encode(&plan, &converter, &root)?.unwrap();
+        assert_eq!(version, 2);
+        let fields = TaskFields::decode(payload.as_slice()).unwrap();
+        assert_eq!(fields.kind, wire_kind);
+        assert_eq!(fields.media.is_some(), kind == TaskKind::Vision);
+
+        let decoded =
+            codec.try_decode(version, &payload, &inputs, &worker, &converter, &root)?;
+        let decoded = decoded.downcast_ref::<LlmExec>().unwrap();
+        assert_eq!(decoded.task_kind(), kind);
+        assert_eq!(decoded.model(), original.model());
+        assert_eq!(decoded.output_col(), original.output_col());
+        assert_eq!(decoded.options_json(), original.options_json());
+        assert_eq!(decoded.schema(), original.schema());
+        assert!(decoded.prompt().as_ref().eq(original.prompt().as_ref()));
+        assert_eq!(
+            decoded.media().map(|plan| plan.expr().as_ref()),
+            original.media().map(|plan| plan.expr().as_ref())
+        );
+        assert_plan_error(
+            &decode_as_v1(version, &payload).unwrap_err(),
+            "Unsupported LlmExec schema version 2",
+        );
+        if kind == TaskKind::Vision {
+            assert_plan_error(
+                &codec
+                    .try_decode(
+                        version,
+                        &payload,
+                        &inputs,
+                        &worker_without_media,
+                        &converter,
+                        &root,
+                    )
+                    .unwrap_err(),
+                "media resolver",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn llm_codec_accepts_legacy_chat_and_rejects_invalid_task_fields() -> Result<()> {
+    let ctx = session(&registry()?).task_ctx();
+    let llm = llm_test_plan(&ctx, TaskKind::Chat, "{}")?;
+    let inputs = [Arc::clone(llm.input())];
+    let codec = LlmExecCodec::new();
+    let converter = DefaultPhysicalProtoConverter {};
+    let root = DistPhysicalCodec::default();
+    let legacy = V1Payload {
+        prompt: Some(serialize_physical_expr_with_converter(
+            llm.prompt(),
+            &root,
+            &converter,
+        )?),
+        model: llm.model().into(),
+        options_json: llm.options_json().into(),
+        output_col: llm.output_col().into(),
+    };
+    let media = legacy.prompt.clone().unwrap();
+    let legacy = legacy.encode_to_vec();
+    let decoded = codec.try_decode(1, &legacy, &inputs, &ctx, &converter, &root)?;
+    let decoded = decoded.downcast_ref::<LlmExec>().unwrap();
+    assert_eq!(decoded.task_kind(), TaskKind::Chat);
+    assert!(decoded.media().is_none());
+    assert_eq!(decoded.model(), llm.model());
+    assert_eq!(decoded.output_col(), llm.output_col());
+    assert_eq!(decoded.options_json(), llm.options_json());
+    assert!(decoded.prompt().as_ref().eq(llm.prompt().as_ref()));
+
+    for (version, kind, has_media, message) in [
+        (1, 1, false, "schema version 1 only supports Chat"),
+        (1, 0, true, "schema version 1 only supports Chat"),
+        (2, 0, true, "Only vision inference accepts media"),
+        (2, 1, true, "Only vision inference accepts media"),
+        (2, 2, false, "Vision requires a media expression"),
+        (2, 3, false, "Unsupported LlmExec task kind 3"),
+    ] {
+        let mut payload = legacy.clone();
+        TaskFields {
+            kind,
+            media: has_media.then(|| media.clone()),
+        }
+        .encode(&mut payload)
+        .unwrap();
+        assert_plan_error(
+            &codec
+                .try_decode(version, &payload, &inputs, &ctx, &converter, &root)
+                .unwrap_err(),
+            message,
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn llm_codec_rejects_noncanonical_options_json() -> Result<()> {
-    let registry = registry()?;
-    let ctx = session(&registry);
+    let ctx = session(&registry()?).task_ctx();
     let canonical = r#"{"batch_size":2,"provider":"offline"}"#;
-    let llm = llm_test_plan(&registry, canonical)?;
+    let llm = llm_test_plan(&ctx, TaskKind::Chat, canonical)?;
     let inputs = [Arc::clone(llm.input())];
     let plan: Arc<dyn ExecutionPlan> = Arc::new(llm);
     let codec = LlmExecCodec::new();
     let converter = DefaultPhysicalProtoConverter {};
     let root = DistPhysicalCodec::default();
     let (version, payload) = codec.try_encode(&plan, &converter, &root)?.unwrap();
-    let mut wire = WirePayload::decode(payload.as_slice()).unwrap();
+    let mut wire = V1Payload::decode(payload.as_slice()).unwrap();
     assert_eq!(wire.options_json, canonical);
     wire.options_json = r#"{"provider":"offline","batch_size":2}"#.into();
-    assert_plan_error(
-        &codec
-            .try_decode(
-                version,
-                &wire.encode_to_vec(),
-                &inputs,
-                &ctx.task_ctx(),
-                &converter,
-                &root,
-            )
-            .unwrap_err(),
-        "requires canonical options JSON",
-    );
+    for version in [1, version] {
+        assert_plan_error(
+            &codec
+                .try_decode(
+                    version,
+                    &wire.encode_to_vec(),
+                    &inputs,
+                    &ctx,
+                    &converter,
+                    &root,
+                )
+                .unwrap_err(),
+            "requires canonical options JSON",
+        );
+    }
     Ok(())
 }

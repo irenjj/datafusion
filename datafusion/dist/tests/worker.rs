@@ -16,6 +16,10 @@ use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
+#[cfg(feature = "ai")]
+#[path = "worker/ai.rs"]
+mod ai;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn worker() -> Command {
@@ -342,6 +346,7 @@ fn openai_backend_selection_requires_ai_http_feature() -> Result<()> {
         .env("DF_DIST_LLM_BACKEND", "openai")
         .env("OPENAI_BASE_URL", "http://127.0.0.1:1/v1")
         .env("OPENAI_API_KEY", "runtime-only-fixture")
+        .env_remove("OPENAI_CA_CERT_FILE")
         .output()?;
     if cfg!(feature = "ai-http") {
         successful(output);

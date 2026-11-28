@@ -65,7 +65,9 @@ Each route retrieves up to `k` indexed candidates. Fusion uses one-based ranks a
 
 ## Distributed Parquet worker
 
-Use an output root dedicated to a job. On restart reuse its SQL, input inventory and `--row-key` (`--df.split_row_key`). The worker supports filesystem paths by default. Enable `--features s3` for `s3://bucket/key` URLs. End an S3 input prefix with `/` to read multiple files. Paths must be accessible to every worker, for example on a shared filesystem. Use the runtime `AWS_*` environment for S3. Enable `--features ai` for the mock backend. Enable `--features ai-http` to select `DF_DIST_LLM_BACKEND=openai`. `DF_DIST_LLM_PROVIDER` selects the provider name, and `OPENAI_BASE_URL` and `OPENAI_API_KEY` configure the HTTP backend at runtime.
+Use an output root dedicated to a job. On restart reuse its SQL, input inventory and `--row-key` (`--df.split_row_key`). The worker supports filesystem paths by default. Enable `--features s3` for `s3://bucket/key` URLs. End an S3 input prefix with `/` to read multiple files. Paths must be accessible to every worker, for example on a shared filesystem. Use the runtime `AWS_*` environment for S3. Enable `--features ai` for the mock backend. Enable `--features ai-http` to select `DF_DIST_LLM_BACKEND=openai`. `DF_DIST_LLM_PROVIDER` selects the provider name, and `OPENAI_BASE_URL`, `OPENAI_API_KEY` and optional `OPENAI_CA_CERT_FILE` configure the HTTP backend at runtime. Set `OPENAI_CA_CERT_FILE` to a PEM file on the planner and workers when the endpoint uses a custom CA.
+
+The `df.llm.exec` v2 codec carries the Chat, Embed or Vision task kind and the Vision media expression. Workers resolve media URIs and `df.media_ref` ranges through their session's object store registry. v2 workers can decode v1 Chat jobs. Deploy v2 workers before submitting v2 plans.
 
 ```bash
 dist-worker run-local --sql 'SELECT id FROM input' --table input=/shared/input --output-root /shared/out
@@ -86,6 +88,8 @@ python3 datafusion/dist/python/ray_driver.py --worker dist-worker --ray-address 
 
 ```bash
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --bin dist-worker
+cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai --test worker multimodal_parquet_outputs
+cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai-http --test worker openai_ca_cert
 cargo tree --locked -p datafusion-dist --features ai
 cargo tree --locked -p datafusion-dist --features ai-http
 python3 -m unittest discover -s datafusion/dist/python -v

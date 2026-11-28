@@ -25,13 +25,11 @@ use datafusion::physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions,
     repartition::RepartitionExec,
 };
-use datafusion_proto::bytes::{
-    physical_plan_from_bytes_with_proto_converter,
-    physical_plan_to_bytes_with_proto_converter,
-};
+use datafusion_proto::bytes::physical_plan_from_bytes_with_proto_converter;
 use datafusion_proto::physical_plan::{
     DefaultPhysicalProtoConverter, PhysicalPlanDecodeContext,
-    from_proto::parse_physical_sort_exprs, to_proto::serialize_physical_sort_exprs,
+    PhysicalProtoConverterExtension, from_proto::parse_physical_sort_exprs,
+    to_proto::serialize_physical_sort_exprs,
 };
 use datafusion_proto::protobuf;
 use prost::Message;
@@ -40,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::codec::{
     DistExtensionRegistry, DistPhysicalCodec, MapPlanProtoConverter, is_builtin,
 };
-use crate::fingerprint::{plan_fingerprint, split_fingerprint};
+use crate::fingerprint::{encode_plan, plan_fingerprint, split_fingerprint};
 
 /// Operator and file extension codecs shared by a coordinator and its workers.
 #[derive(Clone, Debug, Default)]
@@ -393,13 +391,10 @@ pub fn split_plan_for_distribution_with_codecs(
     if template.schema() != output_schema {
         return plan_err!("Map-only stage {stage_id} changed its output schema");
     }
-    let plan_bytes = physical_plan_to_bytes_with_proto_converter(
-        template,
-        &codec,
-        &MapPlanProtoConverter(&codec),
-    )
-    .map_err(as_plan_error)?
-    .to_vec();
+    let plan_proto = MapPlanProtoConverter(&codec)
+        .execution_plan_to_proto(&template, &codec)
+        .map_err(as_plan_error)?;
+    let plan_bytes = encode_plan(plan_proto);
     let plan_fingerprint = plan_fingerprint(&plan_bytes, output_schema.as_ref())?;
     let splits = files
         .into_iter()

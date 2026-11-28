@@ -10,7 +10,11 @@ use datafusion::common::{Result, plan_datafusion_err, plan_err};
 #[cfg(feature = "ai")]
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SQLOptions;
+#[cfg(feature = "ai")]
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+#[cfg(feature = "ai")]
+use datafusion_ai::ObjectStoreMediaResolver;
 #[cfg(feature = "ai")]
 use datafusion_ai::llm::{LlmBackend, LlmProviderRegistry, MockLlmBackend};
 #[cfg(feature = "ai-http")]
@@ -274,12 +278,19 @@ fn session() -> Result<SessionContext> {
     let mut config = SessionConfig::new().with_target_partitions(1);
     config.options_mut().optimizer.repartition_file_scans = false;
     #[cfg(feature = "ai")]
-    return Ok(SessionContext::new_with_state(
-        SessionStateBuilder::new_with_default_features()
-            .with_config(config)
-            .with_llm_provider_registry(llm_registry()?)
-            .build(),
-    ));
+    {
+        let runtime = Arc::new(RuntimeEnv::default());
+        let config = config.with_extension(Arc::new(ObjectStoreMediaResolver::new(
+            Arc::clone(&runtime.object_store_registry),
+        )));
+        Ok(SessionContext::new_with_state(
+            SessionStateBuilder::new_with_default_features()
+                .with_config(config)
+                .with_llm_provider_registry(llm_registry()?)
+                .with_runtime_env(runtime)
+                .build(),
+        ))
+    }
     #[cfg(not(feature = "ai"))]
     Ok(SessionContext::new_with_config(config))
 }
@@ -315,7 +326,9 @@ fn llm_registry() -> Result<LlmProviderRegistry> {
                 .unwrap_or_else(|| "https://api.openai.com/v1".into()),
             api_key: env("OPENAI_API_KEY")?,
             api_key_env: None,
-            ca_cert_pem: None,
+            ca_cert_pem: std::env::var_os("OPENAI_CA_CERT_FILE")
+                .map(std::fs::read)
+                .transpose()?,
         })?),
         #[cfg(not(feature = "ai-http"))]
         Some("openai") => {
@@ -325,4 +338,39 @@ fn llm_registry() -> Result<LlmProviderRegistry> {
     };
     registry.register(provider, backend)?;
     Ok(registry)
+}
+
+#[cfg(all(test, feature = "ai"))]
+mod tests {
+    use datafusion_ai::{MediaRef, MediaResolver};
+    use object_store::{ObjectStoreExt, memory::InMemory};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn media_resolver_sees_stores_registered_after_session_creation() -> Result<()>
+    {
+        let ctx = session()?;
+        let resolver = ctx
+            .state()
+            .config()
+            .get_extension::<ObjectStoreMediaResolver>()
+            .unwrap();
+        for uri in ["file:///asset", "s3://late-media/asset"] {
+            let store = Arc::new(InMemory::new());
+            store
+                .put(&StorePath::from("asset"), "abcdef".into())
+                .await?;
+            ctx.register_object_store(&Url::parse(uri).unwrap(), store);
+            let media = MediaRef {
+                uri: uri.into(),
+                byte_offset: Some(2),
+                byte_len: Some(3),
+                etag: None,
+                mime: None,
+            };
+            assert_eq!(resolver.resolve(&media, Some(3)).await?.bytes, "cde");
+        }
+        Ok(())
+    }
 }
