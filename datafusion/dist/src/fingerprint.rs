@@ -25,6 +25,7 @@ pub(crate) fn plan_fingerprint(plan: &[u8], schema: &Schema) -> Result<String> {
 
 // Plan fingerprints include the wire bytes. Preserve protobuf field tags while
 // ordering the schema metadata maps in Parquet scans and projections.
+// Named extensions must canonicalize their own payloads before reaching here.
 pub(crate) fn encode_plan(plan: protobuf::PhysicalPlanNode) -> Vec<u8> {
     let mut node = Vec::new();
     let tag = match plan.physical_plan_type {
@@ -113,7 +114,7 @@ struct OrderedField {
     metadata: BTreeMap<String, String>,
 }
 
-fn encode_schema(schema: protobuf::Schema) -> Vec<u8> {
+pub(crate) fn encode_schema(schema: protobuf::Schema) -> Vec<u8> {
     OrderedSchema {
         columns: schema.columns.into_iter().map(encode_field).collect(),
         metadata: schema.metadata.into_iter().collect(),

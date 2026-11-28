@@ -212,13 +212,13 @@ impl DistPhysicalCodec {
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct VersionedExtensionNode {
+pub(crate) struct VersionedExtensionNode {
     #[prost(string, tag = "1")]
-    extension_name: String,
+    pub(crate) extension_name: String,
     #[prost(uint32, tag = "2")]
-    schema_version: u32,
+    pub(crate) schema_version: u32,
     #[prost(bytes = "vec", tag = "3")]
-    payload: Vec<u8>,
+    pub(crate) payload: Vec<u8>,
 }
 
 impl PhysicalExtensionCodec for DistPhysicalCodec {

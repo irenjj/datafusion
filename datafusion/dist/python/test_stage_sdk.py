@@ -5,6 +5,7 @@
 from dataclasses import FrozenInstanceError
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -59,6 +60,30 @@ class S3Error(Exception):
 
 
 class StageResultTests(unittest.TestCase):
+    def test_empty_manifest_returns_empty_inventories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / MANIFEST
+            doc = manifest()
+            doc.update(splits=[], output_rows=0, dlq_rows=0, dlq_by_code={})
+            path.write_text(json.dumps(doc), encoding="utf-8")
+            result = StageResult.from_manifest(path)
+            self.assertEqual((result.output_rows, result.dlq_rows), (0, 0))
+            self.assertEqual((result.data_uris(), result.dlq_uris()), ([], []))
+
+    def test_duplicate_split_identity_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / MANIFEST
+            for field, message in (
+                ("split_id", "strictly increasing"),
+                ("split_fingerprint", "checkpoint fingerprint"),
+            ):
+                with self.subTest(field=field):
+                    doc = manifest()
+                    doc["splits"][1][field] = doc["splits"][0][field]
+                    path.write_text(json.dumps(doc), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, message):
+                        StageResult.from_manifest(path)
+
     def test_read_only_metrics_and_local_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -195,6 +220,90 @@ class RunStageTests(unittest.TestCase):
                 "--timeout=5", "--max-attempts=2",
             })
             self.assertEqual(result.data_uris()[0], str(root / "stages" / FINGERPRINT / FIRST / "data.parquet"))
+
+    def test_passes_worker_and_scheduler_options_and_secrets_through_stdin(self):
+        secrets = {"OPENAI_API_KEY": "fixture-private-key"}
+        with (tempfile.TemporaryDirectory() as directory,
+              patch("stage_sdk.subprocess.run") as invoke):
+            def driver(args, *, input, **kwargs):
+                job = Path(args[args.index("--job") + 1])
+                self.assertEqual(list(job.parent.iterdir()), [])
+                self.assertEqual(json.loads(input), secrets)
+                self.assertNotIn(secrets["OPENAI_API_KEY"], " ".join(args))
+                self.assertTrue({
+                    "--execution-mode=actor", "--pool-size=2", "--max-global-inflight=1",
+                    "--max-splits-per-minute=15", "--secrets-stdin",
+                    "--stage-table=upstream=/prior",
+                    "--stage-dlq-table=bad=s3://results/prior",
+                    "--lance-table=clips=/shared/clips.lance",
+                }.issubset(args))
+                return subprocess.CompletedProcess([], 1, "", "denied fixture-private-key")
+
+            invoke.side_effect = driver
+            with self.assertRaisesRegex(RuntimeError, r"denied \[redacted\]"):
+                run_stage(
+                    sql="SELECT id FROM clips", output_root=directory, execution_mode="actor",
+                    pool_size=2, max_global_inflight=1, splits_per_minute=15,
+                    stage_tables={"upstream": Path("/prior")},
+                    stage_dlq_tables=["bad=s3://results/prior"],
+                    lance_tables=["clips=/shared/clips.lance"], secrets=secrets,
+                )
+            invoke.assert_called_once()
+
+    def test_secrets_file_requires_0600_and_redacts_values(self):
+        with (tempfile.TemporaryDirectory() as directory,
+              patch("stage_sdk.subprocess.run") as invoke):
+            path = Path(directory) / "secrets.json"
+            path.write_text(json.dumps({"OPENAI_API_KEY": "file-private-key"}), encoding="utf-8")
+            path.chmod(0o644)
+            options = dict(sql="SELECT id FROM t", tables=["t=input"], output_root=directory,
+                           secrets_file=path, execution_mode="task")
+            with self.assertRaisesRegex(ValueError, "0600"):
+                run_stage(**options)
+            invoke.assert_not_called()
+            path.chmod(0o600)
+            invoke.return_value = subprocess.CompletedProcess([], 1, "", "denied file-private-key")
+            with self.assertRaisesRegex(RuntimeError, r"denied \[redacted\]"):
+                run_stage(**options)
+            self.assertIn(f"--secrets-file={path}", invoke.call_args.args[0])
+            self.assertIn("--execution-mode=task", invoke.call_args.args[0])
+
+    def test_rejects_invalid_options_before_launching(self):
+        options = dict(sql="SELECT id FROM t", output_root="/output")
+        cases = [
+            ({}, "at least one"),
+            ({"tables": ["bad"]}, "name=path"),
+            ({"tables": ["t="]}, "name=path"),
+            ({"tables": ["t=one", "t=two"]}, "Duplicate"),
+            ({"tables": ["t=one"], "lance_tables": ["t=two"]}, "Duplicate"),
+        ]
+        for invalid, message in [
+            ({"execution_mode": "worker"}, "execution-mode"),
+            ({"execution_mode": "task", "pool_size": 2}, "only.*actor"),
+            ({"pool_size": 0}, "pool-size"),
+            ({"max_global_inflight": True}, "max-global-inflight"),
+            ({"splits_per_minute": 0}, "splits-per-minute"),
+            ({"concurrency": 0}, "concurrency"),
+            ({"timeout": float("nan")}, "timeout"),
+            ({"max_attempts": -1}, "max-attempts"),
+            ({"secrets": {}, "secrets_file": "/unused"}, "mutually exclusive"),
+            ({"secrets": {"KEY=invalid": "value"}}, "environment names"),
+            ({"secrets": {"KEY": 7}}, "string values"),
+        ]:
+            cases.append(({"tables": ["t=input"], **invalid}, message))
+        with patch("stage_sdk.subprocess.run") as invoke:
+            for invalid, message in cases:
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, message):
+                    run_stage(**options, **invalid)
+            invoke.assert_not_called()
+
+    def test_import_does_not_require_ray_or_driver(self):
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent)}
+        subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import sys; sys.modules['ray'] = sys.modules['ray_driver'] = None; import stage_sdk"],
+            env=env, check=True, capture_output=True,
+        )
 
     def test_driver_failure_preserves_diagnostics_and_redacts_credentials(self):
         with (tempfile.TemporaryDirectory() as directory,

@@ -20,6 +20,10 @@ use tempfile::tempdir;
 #[path = "worker/ai.rs"]
 mod ai;
 
+#[cfg(feature = "lake")]
+#[path = "worker/lake.rs"]
+mod lake;
+
 #[path = "worker/serve.rs"]
 mod serve;
 
@@ -53,6 +57,37 @@ fn input_files(path: &Path) -> Result<()> {
         )?;
         writer.write(&batch)?;
         writer.close()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "lake"))]
+#[test]
+fn lake_commands_require_the_lake_feature() -> Result<()> {
+    for args in [
+        vec![
+            "plan",
+            "--out",
+            "unused",
+            "--sql",
+            "SELECT * FROM t",
+            "--lance-table",
+            "t=/unused",
+        ],
+        vec![
+            "backfill-lance",
+            "--dataset",
+            "/unused",
+            "--stage-output-root",
+            "/unused",
+        ],
+    ] {
+        let output = worker().args(args).output()?;
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("requires the lake feature"),
+            "{output:?}"
+        );
     }
     Ok(())
 }

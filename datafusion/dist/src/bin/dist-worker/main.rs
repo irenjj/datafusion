@@ -33,6 +33,15 @@ dist-worker query-stage --output-root PATH --sql SQL
 dist-worker serve
 dist-worker run-local --sql SQL --table name=path --output-root PATH [--row-key COLUMN] [--timeout-secs N] [--max-attempts N]";
 
+fn usage() -> String {
+    let usage = USAGE.to_owned();
+    #[cfg(feature = "lake")]
+    let usage = usage
+        + "\nplan and run-local also accept repeatable --lance-table name=PATH_OR_URI"
+        + "\ndist-worker backfill-lance --dataset PATH_OR_URI --stage-output-root ROOT";
+    usage
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AttemptReceipt {
@@ -44,7 +53,7 @@ fn main() -> ExitCode {
     let mut argv = std::env::args().skip(1);
     let command = argv.next();
     if matches!(command.as_deref(), None | Some("--help" | "-h")) {
-        println!("{USAGE}");
+        println!("{}", usage());
         return ExitCode::SUCCESS;
     }
     let args = Arguments::parse(argv);
@@ -135,6 +144,19 @@ async fn run(command: &str, args: Result<Arguments>) -> Result<()> {
             writer.into_inner().flush()?;
             Ok(())
         }
+        #[cfg(feature = "lake")]
+        "backfill-lance" => {
+            let dataset = args.required("--dataset")?;
+            let root = args.required("--stage-output-root")?;
+            args.finish()?;
+            let version = job::backfill_lance(&dataset, &root).await?;
+            write_json(
+                io::stdout().lock(),
+                &serde_json::json!({"dataset_version": version}),
+            )
+        }
+        #[cfg(not(feature = "lake"))]
+        "backfill-lance" => plan_err!("backfill-lance requires the lake feature"),
         "run-local" => {
             let options = args.planning()?;
             if options.output_root.is_none() {
@@ -172,7 +194,7 @@ async fn run(command: &str, args: Result<Arguments>) -> Result<()> {
             .await?;
             write_json(io::stdout().lock(), &manifest)
         }
-        _ => plan_err!("Unknown command '{command}'.\n{USAGE}"),
+        _ => plan_err!("Unknown command '{command}'.\n{}", usage()),
     }
 }
 
@@ -248,9 +270,18 @@ impl Arguments {
         let tables = self.0.remove("--table").unwrap_or_default();
         let stage_tables = self.0.remove("--stage-table").unwrap_or_default();
         let stage_dlq_tables = self.0.remove("--stage-dlq-table").unwrap_or_default();
-        if tables.is_empty() && stage_tables.is_empty() && stage_dlq_tables.is_empty() {
+        let lance_tables = self.0.remove("--lance-table").unwrap_or_default();
+        #[cfg(not(feature = "lake"))]
+        if !lance_tables.is_empty() {
+            return plan_err!("--lance-table requires the lake feature");
+        }
+        if tables.is_empty()
+            && stage_tables.is_empty()
+            && stage_dlq_tables.is_empty()
+            && lance_tables.is_empty()
+        {
             return plan_err!(
-                "--table is required (or use --stage-table or --stage-dlq-table)"
+                "--table is required (or use --stage-table, --stage-dlq-table, or --lance-table)"
             );
         }
         Ok(PlanningOptions {
@@ -258,6 +289,8 @@ impl Arguments {
             tables,
             stage_tables,
             stage_dlq_tables,
+            #[cfg(feature = "lake")]
+            lance_tables,
             sink: SinkOptions {
                 row_key: self.flag("--row-key")?,
             },

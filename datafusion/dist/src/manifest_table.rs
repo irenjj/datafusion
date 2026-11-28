@@ -78,19 +78,11 @@ impl StageOutputReader {
     ) -> Result<Self> {
         let state = ctx.state();
         let store = state.runtime_env().object_store(&store_url)?;
-        let (manifest_path, object) = find_manifest(store.as_ref(), output_root).await?;
-        let stage_root = manifest_path.parent().expect("manifest has a filename");
-        let local_root = match &object.payload {
-            GetResultPayload::File(_, path) => {
-                Some(local_stage_root(path, &manifest_path, output_root).await?)
-            }
-            GetResultPayload::Stream(_) => None,
-        };
-        let manifest: StageManifest = serde_json::from_slice(&object.bytes().await?)
-            .map_err(|error| {
-                exec_datafusion_err!("Invalid stage manifest at {manifest_path}: {error}")
-            })?;
-        validate_manifest(&manifest, &stage_root)?;
+        let PublishedStage {
+            manifest,
+            stage_root,
+            local_root,
+        } = load_manifest(store.as_ref(), output_root).await?;
 
         let (data, dlq): (Vec<_>, Vec<_>) = stream::iter(&manifest.splits)
             .map(|split| async {
@@ -163,6 +155,35 @@ impl StageOutputReader {
     }
 }
 
+pub(crate) struct PublishedStage {
+    pub(crate) manifest: StageManifest,
+    pub(crate) stage_root: Path,
+    pub(crate) local_root: Option<PathBuf>,
+}
+
+pub(crate) async fn load_manifest(
+    store: &dyn ObjectStore,
+    output_root: &Path,
+) -> Result<PublishedStage> {
+    let (manifest_path, object) = find_manifest(store, output_root).await?;
+    let stage_root = manifest_path.parent().expect("manifest has a filename");
+    let local_root = match &object.payload {
+        GetResultPayload::File(_, path) => {
+            Some(local_stage_root(path, &manifest_path, output_root).await?)
+        }
+        GetResultPayload::Stream(_) => None,
+    };
+    let manifest = serde_json::from_slice(&object.bytes().await?).map_err(|error| {
+        exec_datafusion_err!("Invalid stage manifest at {manifest_path}: {error}")
+    })?;
+    validate_manifest(&manifest, &stage_root)?;
+    Ok(PublishedStage {
+        manifest,
+        stage_root,
+        local_root,
+    })
+}
+
 async fn find_manifest(
     store: &dyn ObjectStore,
     output_root: &Path,
@@ -230,7 +251,7 @@ async fn local_stage_root(
         .to_path_buf())
 }
 
-async fn check_local_file(path: &FsPath) -> Result<()> {
+pub(crate) async fn check_local_file(path: &FsPath) -> Result<()> {
     let resolved = tokio::fs::canonicalize(path).await.map_err(|error| {
         exec_datafusion_err!("Cannot resolve stage file {}: {error}", path.display())
     })?;

@@ -76,7 +76,7 @@ pub struct AttemptArtifact {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct ArtifactFiles {
     pub(crate) data_rel_path: String,
-    data_sha256: String,
+    pub(crate) data_sha256: String,
     pub(crate) data_bytes: u64,
     pub(crate) output_rows: u64,
     pub(crate) dlq_rel_path: Option<String>,
@@ -92,10 +92,26 @@ pub(crate) struct SplitCheckpoint {
     pub(crate) split_fingerprint: String,
     pub(crate) split_id: u64,
     pub(crate) winning_attempt_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lake_source: Option<LakeSplitSource>,
     #[serde(flatten)]
     pub(crate) files: ArtifactFiles,
     #[serde(default)]
     metrics: SplitMetrics,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct LakeSplitSource {
+    pub(crate) file_proto: Vec<u8>,
+    pub(crate) order: BackfillOrder,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackfillOrder {
+    Position,
+    Key { source: String, output: String },
+    RequiresKey,
 }
 
 /// JSON inventory of winning Parquet files and totals for a completed stage.
@@ -160,6 +176,8 @@ pub struct ParquetSplitSink {
     plan_fingerprint: String,
     input_schema: SchemaRef,
     routing: Routing,
+    #[cfg(feature = "lake")]
+    lake_order: Option<BackfillOrder>,
 }
 
 impl ParquetSplitSink {
@@ -184,6 +202,8 @@ impl ParquetSplitSink {
             plan_fingerprint: stage.plan_fingerprint.clone(),
             input_schema: Arc::clone(&stage.output_schema),
             routing: Routing::try_new(Arc::clone(&stage.output_schema), options)?,
+            #[cfg(feature = "lake")]
+            lake_order: crate::lake::backfill_order(stage, options.row_key.as_deref()),
         })
     }
 
@@ -292,6 +312,7 @@ impl ParquetSplitSink {
             split_fingerprint: attempt.split_fingerprint,
             split_id: attempt.split_id,
             winning_attempt_id: attempt.attempt_id,
+            lake_source: None,
             files: attempt.files,
             metrics,
         };
@@ -374,6 +395,17 @@ impl ParquetSplitSink {
             let checkpoint = self.read_checkpoint(split).await?.ok_or_else(|| {
                 exec_datafusion_err!("Split {} is not committed", split.split_id)
             })?;
+            #[cfg(feature = "lake")]
+            let checkpoint = match &self.lake_order {
+                Some(order) => SplitCheckpoint {
+                    lake_source: Some(LakeSplitSource {
+                        file_proto: split.file_proto.clone(),
+                        order: order.clone(),
+                    }),
+                    ..checkpoint
+                },
+                None => checkpoint,
+            };
             add_rows(&mut manifest.output_rows, checkpoint.files.output_rows)?;
             add_rows(&mut manifest.dlq_rows, checkpoint.files.dlq_rows)?;
             for (code, rows) in &checkpoint.files.dlq_by_code {
