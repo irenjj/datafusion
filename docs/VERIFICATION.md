@@ -227,15 +227,27 @@ SELECT llm(
 
 Property declaration order determines the Arrow field order and is preserved when workers decode canonical options. Objects must have non-empty `properties`. Arrays use one `items` schema. Strings, booleans, signed 64-bit integers and finite numbers map to Arrow `Utf8`, `Boolean`, `Int64` and `Float64`. Missing optional properties and explicit nulls in nullable fields become Arrow nulls. Undeclared properties are rejected. The schema has a maximum depth of 16 and at most 1024 properties across all objects.
 
-The HTTP backend sets a strict `response_format` with every object closed and every property listed as required. Optional properties use a nullable type in the request. Setting `extra_body.response_format` together with `response_schema` is a planning error.
+With the default `schema_mode: "strict"`, the HTTP backend sends `response_format.type = "json_schema"` with closed objects and every property marked as required. Optional properties use a nullable type in the request.
 
-A malformed or mismatched response produces a non-retryable `SCHEMA_MISMATCH` for its row. With `on_error: "envelope"`, the successful value stays a typed struct and its error fields are null.
+For gateways with limited response format support, `json_object` sends `response_format.type = "json_object"` and adds compact, normalized JSON Schema instructions to the system message. `prompt_only` uses the same instructions as the entire schema request. Both modes append the instructions to any user system message after two newlines. They accept a single surrounding ` ```json ` fence before validating the completion. All three modes use the same typed validation, including exact JSON types. Non-default modes require `response_schema`, and `extra_body.response_format` conflicts with `response_schema` in every mode.
+
+Set `schema_retries` to an integer from 0 to 3 to resend a row whose completion fails validation. The default is 0. A positive value requires `response_schema`. Each resend counts toward `llm_requests`, `llm_retries` and the selected provider's request total. Reported token usage includes malformed completions and resends. A row that continues to fail validation after its retries produces a non-retryable `SCHEMA_MISMATCH`. With `on_error: "envelope"`, a successful row keeps its typed value and its error fields are null.
 
 ```bash
-cargo test --locked --profile ci -p datafusion-ai --lib response_schema
-cargo nextest run --locked --cargo-profile ci -p datafusion-ai --test runtime -E 'test(structured_) | test(worker_decode_preserves_schema_order)'
+cargo test --locked --profile ci -p datafusion-ai --lib schema
+cargo nextest run --locked --cargo-profile ci -p datafusion-ai --test runtime -E 'test(structured_) | test(schema_retr) | test(worker_decode_preserves_schema_order)'
 cargo nextest run --locked --cargo-profile ci -p datafusion-ai --features http --test http
 cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm structured_chat_sql
+cargo nextest run --locked --cargo-profile ci -p datafusion --features ai --test core_integration ai_assembly
+```
+
+## AI embedding dimensions
+
+For embedding providers that support a configurable output size, set `send_dimensions: true` in `embed()` options. The HTTP backend forwards `dimension` as `dimensions` to `/v1/embeddings`. With the default `false`, the body contains `model` and `input`. The operator validates the returned vector size in both cases. `send_dimensions` is accepted only for `embed()`.
+
+```bash
+cargo nextest run --locked --cargo-profile ci -p datafusion-ai --features http --test http embeddings_send_dimensions
+cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm parquet_sql_embeds_text
 ```
 
 ## AI vision with multiple images
@@ -252,6 +264,21 @@ Custom `LlmBackend` implementations receive one `LlmRequest::media` slot per pro
 cargo nextest run --locked --cargo-profile ci -p datafusion-ai --features http vision
 cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm vision
 cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm parquet_sql_isolates_multi_image_and_schema_errors
+```
+
+## AI vision image downsampling
+
+Set `image_max_edge` to an integer between 16 and 8192 in `vlm()` options to preprocess each image on the worker after resolution. The worker validates PNG chunks and bounds the declared pixel count by both `max_media_bytes` and 64 Mi pixels. Supported PNGs have 8-bit gray, gray-alpha, RGB, or RGBA samples. The decoded pixel bytes also count against `max_media_bytes`, and inflation is limited to the declared scanline length including filter bytes.
+
+Supported PNGs at or below the edge limit retain their original bytes. Larger PNGs use an integer area average with alpha-weighted color, round the scaled dimensions to the nearest pixel with a minimum of 1, and encode the resized default image as `image/png` with zlib level 6. The encoded image omits ancillary metadata.
+
+JPEG, WebP, GIF, and interlaced 8-bit PNG images that pass header validation follow `image_resize_fallback`. The default `passthrough` sends the original bytes and preserves any supplied MIME type. When MIME is absent the worker uses the detected type. Set `image_resize_fallback` to `error` to treat these images as non-retryable media errors. Invalid images, unsupported PNG sample types, and images that exceed the limits also follow `on_error` as non-retryable media errors. `image_resize_fallback` requires `image_max_edge`.
+
+```bash
+cargo test --locked --profile ci -p datafusion-ai --lib llm::image::tests
+cargo nextest run --locked --cargo-profile ci -p datafusion-ai --test runtime vision_resize_isolates_mixed_formats_and_honors_fallback
+cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm vision_validates_image_resize_options_at_planning
+cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm parquet_sql_vision_downsamples_images_and_retries_schema_rows
 ```
 
 ## Evidence

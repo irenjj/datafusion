@@ -25,6 +25,7 @@ runtime = [
     "dep:datafusion-physical-expr",
     "dep:datafusion-physical-plan",
     "dep:datafusion-session",
+    "dep:flate2",
     "dep:futures",
     "dep:log",
     "dep:object_store",
@@ -47,6 +48,7 @@ datafusion-optimizer = { workspace = true, optional = true }
 datafusion-physical-expr = { workspace = true, optional = true }
 datafusion-physical-plan = { workspace = true, optional = true }
 datafusion-session = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 httpdate = { workspace = true, optional = true }
 log = { workspace = true, optional = true }

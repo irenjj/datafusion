@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::options::is_sensitive_key;
+use super::schema::{openai_response_format, schema_system_message};
 use super::{
     CancellationToken, LlmBackend, LlmBackendError, LlmEmbeddingResponse, LlmRequest,
-    LlmResponse, LlmUsage, OnError, TaskKind,
+    LlmResponse, LlmUsage, OnError, SchemaMode, TaskKind,
 };
 use crate::sanitize::{sanitized_detail, single_line};
 
@@ -147,7 +148,10 @@ impl LlmBackend for OpenAiHttpBackend {
                 message: error.to_string(),
             }
         })? as usize;
-        let body = json!({"model": request.model, "input": request.prompts});
+        let mut body = json!({"model": request.model, "input": request.prompts});
+        if request.options.send_dimensions == Some(true) {
+            body["dimensions"] = json!(dimension);
+        }
         let response: EmbeddingResponse = self
             .transport
             .post_json(&["embeddings"], &body, &cancel)
@@ -179,6 +183,7 @@ fn build_body(
             "extra_body contains a sensitive credential key",
         ));
     }
+    let mut system = options.system_message.as_deref().map(Cow::Borrowed);
     if let Some(schema) = &options.response_schema {
         if body.contains_key("response_format") {
             return Err(permanent(
@@ -186,13 +191,25 @@ fn build_body(
                 "response_schema conflicts with extra_body.response_format",
             ));
         }
-        let format = super::schema::openai_response_format(schema)
-            .map_err(|error| permanent(None, &error.to_string()))?;
-        body.insert("response_format".into(), format);
+        match options.schema_mode {
+            SchemaMode::Strict => {
+                let format = openai_response_format(schema)
+                    .map_err(|error| permanent(None, &error.to_string()))?;
+                body.insert("response_format".into(), format);
+            }
+            SchemaMode::JsonObject | SchemaMode::PromptOnly => {
+                if options.schema_mode == SchemaMode::JsonObject {
+                    body.insert("response_format".into(), json!({"type": "json_object"}));
+                }
+                let message = schema_system_message(schema, system.as_deref())
+                    .map_err(|error| permanent(None, &error.to_string()))?;
+                system = Some(Cow::Owned(message));
+            }
+        }
     }
 
     let mut messages = Vec::new();
-    if let Some(system) = &options.system_message {
+    if let Some(system) = system {
         messages.push(json!({"role": "system", "content": system}));
     }
     let content = if let Some(images) = media {

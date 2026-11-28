@@ -20,7 +20,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Number, Value};
 
-use super::LlmBackendError;
+use super::{LlmBackendError, SchemaMode};
 
 const MAX_DEPTH: usize = 16;
 const MAX_PROPERTIES: usize = 1024;
@@ -324,11 +324,19 @@ impl ResponseSchema {
         &self,
         outputs: Vec<Option<String>>,
         output_rows: impl Iterator<Item = usize>,
+        mode: SchemaMode,
     ) -> Result<(ArrayRef, Vec<(usize, LlmBackendError)>)> {
         let mut values = Vec::with_capacity(outputs.len());
         let mut errors = Vec::new();
         for (row, output) in output_rows.zip(outputs) {
-            let value = match output.as_deref().map(|text| self.decode(text)) {
+            let decoded = output.as_deref().map(|text| {
+                self.decode(if mode == SchemaMode::Strict {
+                    text
+                } else {
+                    strip_json_fence(text)
+                })
+            });
+            let value = match decoded {
                 Some(Ok(value)) => Some(value),
                 result => {
                     let message = result
@@ -368,6 +376,21 @@ impl ResponseSchema {
                     "structured response is not valid JSON"
                 }
             })
+    }
+}
+
+fn strip_json_fence(text: &str) -> &str {
+    if let Some((opening, rest)) = text.trim().split_once('\n')
+        && opening.trim_end().eq_ignore_ascii_case("```json")
+        && let Some((body, closing)) = rest.rsplit_once('\n')
+        && closing.trim() == "```"
+        && !body
+            .lines()
+            .any(|line| line.trim_start().starts_with("```"))
+    {
+        body
+    } else {
+        text
     }
 }
 
@@ -571,22 +594,44 @@ fn validity(values: &[Option<&Value>]) -> Option<NullBuffer> {
 pub(super) fn openai_response_format(schema: &Value) -> Result<Value> {
     use serde_json::json;
 
-    let schema: SchemaInput =
-        SchemaInput::deserialize(schema).map_err(|error| schema_parse_error(&error))?;
-    schema.compile()?;
     Ok(json!({
         "type": "json_schema",
         "json_schema": {
             "name": "df_response",
             "strict": true,
-            "schema": schema.into_strict_json(false)
+            "schema": provider_schema(schema, true)?
         }
     }))
 }
 
 #[cfg(feature = "http")]
+pub(super) fn schema_system_message(
+    schema: &Value,
+    system_message: Option<&str>,
+) -> Result<String> {
+    let mut sorted = schema.clone();
+    sorted.sort_all_objects();
+    let mut schema = provider_schema(&sorted, false)?;
+    schema.sort_all_objects();
+    let instructions =
+        format!("Return a single JSON object matching this JSON Schema:\n{schema}");
+    Ok(match system_message {
+        Some(system) => format!("{system}\n\n{instructions}"),
+        None => instructions,
+    })
+}
+
+#[cfg(feature = "http")]
+fn provider_schema(schema: &Value, require_all: bool) -> Result<Value> {
+    let schema =
+        SchemaInput::deserialize(schema).map_err(|error| schema_parse_error(&error))?;
+    schema.compile()?;
+    Ok(schema.into_provider_json(false, require_all))
+}
+
+#[cfg(feature = "http")]
 impl SchemaInput {
-    fn into_strict_json(mut self, optional: bool) -> Value {
+    fn into_provider_json(mut self, optional: bool, require_all: bool) -> Value {
         let mut object = Map::new();
         if let Some(properties) = self.properties {
             let required: HashSet<_> = self
@@ -598,8 +643,11 @@ impl SchemaInput {
             let mut keys = Vec::with_capacity(properties.0.len());
             let mut children = Map::new();
             for (name, schema) in properties.0 {
-                let child = schema.into_strict_json(!required.contains(&name));
-                keys.push(Value::String(name.clone()));
+                let optional = !required.contains(&name);
+                let child = schema.into_provider_json(optional, require_all);
+                if require_all || !optional {
+                    keys.push(Value::String(name.clone()));
+                }
                 children.insert(name, child);
             }
             object.insert("properties".into(), Value::Object(children));
@@ -607,7 +655,7 @@ impl SchemaInput {
             object.insert("additionalProperties".into(), Value::Bool(false));
         }
         if let Some(items) = self.items {
-            object.insert("items".into(), items.into_strict_json(false));
+            object.insert("items".into(), items.into_provider_json(false, require_all));
         }
         if optional && !self.data_type.is_array() {
             self.data_type =
@@ -622,5 +670,55 @@ impl SchemaInput {
         }
         object.insert("type".into(), self.data_type);
         Value::Object(object)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_modes_accept_only_a_single_json_fence_in_fallbacks() -> Result<()> {
+        let schema = SchemaInput::from_options(
+            r#"{"response_schema":{"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]}}"#,
+        )?
+        .compile()?;
+        let json = r#"{"count":1}"#;
+        let fenced = format!(" \n```json\r\n{json}\r\n```\n");
+        assert_eq!(strip_json_fence(&fenced).trim(), json);
+        for text in [
+            format!("```\n{json}\n```"),
+            format!("```javascript\n{json}\n```"),
+            format!("```json\n```json\n{json}\n```\n```"),
+            format!("```json\n{json}\n```\n```json\n{json}\n```"),
+            format!("prefix\n```json\n{json}\n```"),
+            format!("```json\n{json}\n```\nsuffix"),
+        ] {
+            assert_eq!(strip_json_fence(&text), text);
+        }
+        for mode in [
+            SchemaMode::Strict,
+            SchemaMode::JsonObject,
+            SchemaMode::PromptOnly,
+        ] {
+            let (values, errors) = schema.decode_array(
+                vec![
+                    Some(json.into()),
+                    Some(fenced.clone()),
+                    Some("```json\n{\"count\":\"1\"}\n```".into()),
+                ],
+                0..3,
+                mode,
+            )?;
+            assert!(values.is_valid(0));
+            assert_eq!(values.is_null(1), mode == SchemaMode::Strict);
+            assert!(values.is_null(2));
+            assert_eq!(errors.len(), 1 + usize::from(mode == SchemaMode::Strict));
+            assert!(matches!(
+                errors.last(),
+                Some((2, LlmBackendError::SchemaMismatch { .. }))
+            ));
+        }
+        Ok(())
     }
 }

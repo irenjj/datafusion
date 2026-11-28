@@ -2139,6 +2139,7 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "datafusion-session",
+ "flate2",
  "futures",
  "httpdate",
  "log",

@@ -109,7 +109,9 @@ async fn structured_chat_sql_returns_typed_envelopes_over_http()
     ));
 
     let serve = async {
-        for _ in 0..2 {
+        let mut good = 0;
+        let mut bad = 0;
+        for _ in 0..3 {
             let (endpoint, body, socket) =
                 read_http_request(&listener, "structured-sql-test-key").await;
             assert_eq!(endpoint, "/v1/chat/completions");
@@ -118,17 +120,27 @@ async fn structured_chat_sql_returns_typed_envelopes_over_http()
             assert_eq!(format["strict"], true);
             assert_eq!(format["schema"]["additionalProperties"], false);
             let content = match body["messages"][0]["content"].as_str().unwrap() {
-                "good" => r#"{"token":"yes","score":7}"#,
-                "bad" => r#"{"token":"yes","score":"7"}"#,
+                "good" => {
+                    good += 1;
+                    r#"{"token":"yes","score":7}"#
+                }
+                "bad" => {
+                    bad += 1;
+                    r#"{"token":"yes","score":"7"}"#
+                }
                 text => panic!("unexpected prompt {text}"),
             };
-            let response = json!({"choices":[{"message":{"content":content}}]});
+            let response = json!({
+                "choices":[{"message":{"content":content}}],
+                "usage":{"prompt_tokens":2,"completion_tokens":3}
+            });
             write_http_response(socket, &response.to_string()).await;
         }
+        assert_eq!((good, bad), (1, 2));
     };
     let run = harness::run(
         &ctx,
-        r#"SELECT llm(text, 'm', '{"provider":"http","on_error":"envelope","response_schema":{"type":"object","properties":{"token":{"type":"string"},"score":{"type":"integer"}},"required":["token","score"]}}') AS answer
+        r#"SELECT llm(text, 'm', '{"provider":"http","on_error":"envelope","schema_retries":1,"response_schema":{"type":"object","properties":{"token":{"type":"string"},"score":{"type":"integer"}},"required":["token","score"]}}') AS answer
         FROM t ORDER BY id"#,
     );
     let (result, ()) =
@@ -136,6 +148,15 @@ async fn structured_chat_sql_returns_typed_envelopes_over_http()
             .await
             .unwrap();
     let (plan, batches) = result?;
+    for (metric, expected) in [
+        ("llm_requests", 3),
+        ("llm_retries", 1),
+        ("llm_requests::http", 3),
+        ("input_tokens::http", 6),
+        ("output_tokens::http", 9),
+    ] {
+        assert_eq!(harness::metric(plan.as_ref(), metric), expected, "{metric}");
+    }
     let schema = plan.schema();
     schema.field(0).try_extension_type::<AiErrorType>()?;
     let DataType::Struct(envelope_fields) = schema.field(0).data_type() else {
@@ -310,6 +331,7 @@ async fn parquet_sql_embeds_text_and_resolves_vision_media_over_http()
                 read_http_request(&listener, "loopback-parquet-test-key").await;
             let response = match endpoint.as_str() {
                 "/v1/embeddings" => {
+                    assert_eq!(body["dimensions"], 2);
                     let inputs = body["input"].as_array().unwrap();
                     let data = inputs.iter().enumerate().rev().map(|(index, input)| {
                         let value = input.as_str().unwrap().as_bytes()[0] - b'a';
@@ -336,7 +358,7 @@ async fn parquet_sql_embeds_text_and_resolves_vision_media_over_http()
         }
     };
     let query = async {
-        let (_, embed) = harness::run(&ctx, r#"SELECT embed(text, 'm', concat('{"provider":"http",', '"dimension":2}')) AS v FROM t ORDER BY id"#).await?;
+        let (_, embed) = harness::run(&ctx, r#"SELECT embed(text, 'm', concat('{"provider":"http",', '"dimension":2,"send_dimensions":true}')) AS v FROM t ORDER BY id"#).await?;
         let (_, vision) = harness::run(&ctx, r#"SELECT vlm(text, img_uri, 'm', '{"provider":"http"}') AS v FROM t ORDER BY id"#).await?;
         Ok::<_, datafusion::common::DataFusionError>((embed, vision))
     };

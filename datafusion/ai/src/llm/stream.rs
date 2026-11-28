@@ -13,7 +13,7 @@ use arrow::array::{
     LargeStringArray, StringArray, StringBuilder, StringViewArray, StructArray,
     UInt64Array, new_null_array,
 };
-use arrow::compute::take;
+use arrow::compute::{interleave, take};
 use arrow::datatypes::{DataType, SchemaRef, UInt64Type};
 use arrow::record_batch::RecordBatch;
 use futures::stream::{FuturesUnordered, Stream, StreamExt, once};
@@ -35,7 +35,7 @@ use super::backend::RegisteredProvider;
 use super::schema::ResponseSchema;
 use super::{
     CancellationToken, LlmBackendError, LlmEmbeddingResponse, LlmOptions, LlmRequest,
-    LlmResponse, LlmUsage, MediaPlan, OnError, TaskKind,
+    LlmResponse, LlmUsage, MediaPlan, OnError, SchemaMode, TaskKind,
 };
 use crate::media::is_transient_media_error;
 use crate::sanitize::sanitized_detail;
@@ -99,10 +99,10 @@ impl Dispatch {
 
     async fn generate(
         &self,
-        prompts: Vec<String>,
-        media: Vec<Option<Vec<ResolvedMedia>>>,
+        request: &LlmRequest,
         metrics: &LlmMetrics,
         cancel: &CancellationToken,
+        schema_retry: bool,
     ) -> std::result::Result<Outputs, LlmBackendError> {
         // Both limits count requests. One request reserves one slot from each
         // semaphore, in the same order, across all of its attempts and backoff.
@@ -120,12 +120,6 @@ impl Dispatch {
             ),
             None => None,
         };
-        let request = LlmRequest {
-            model: self.model.clone(),
-            prompts,
-            media,
-            options: Arc::clone(&self.options),
-        };
         let timeout = Duration::from_millis(self.options.timeout_ms.unwrap_or(30_000));
         let max_retries = self.options.max_retries.unwrap_or(3);
         let mut delay = Duration::from_millis(100);
@@ -133,7 +127,7 @@ impl Dispatch {
             if cancel.is_cancelled() {
                 return Err(LlmBackendError::Cancelled);
             }
-            if attempt == 0 {
+            if attempt == 0 && !schema_retry {
                 metrics.submitted.add(request.prompts.len());
             } else {
                 metrics.retries.add(1);
@@ -208,8 +202,7 @@ enum Outputs {
 
 struct DecodedOutputs {
     values: ArrayRef,
-    usage: Option<LlmUsage>,
-    schema_errors: Vec<(usize, LlmBackendError)>,
+    row_errors: Vec<(usize, LlmBackendError)>,
 }
 
 impl Outputs {
@@ -218,22 +211,19 @@ impl Outputs {
         value_type: &DataType,
         schema: Option<&ResponseSchema>,
         output_rows: impl Iterator<Item = usize>,
+        schema_mode: SchemaMode,
     ) -> Result<DecodedOutputs> {
         match self {
             Self::Completions(response) => {
-                let (values, schema_errors) = if let Some(schema) = schema {
-                    schema.decode_array(response.outputs, output_rows)?
+                let (values, row_errors) = if let Some(schema) = schema {
+                    schema.decode_array(response.outputs, output_rows, schema_mode)?
                 } else {
                     (
                         Arc::new(StringArray::from(response.outputs)) as ArrayRef,
                         Vec::new(),
                     )
                 };
-                Ok(DecodedOutputs {
-                    values,
-                    usage: response.usage,
-                    schema_errors,
-                })
+                Ok(DecodedOutputs { values, row_errors })
             }
             Self::Embeddings(response) => {
                 let DataType::FixedSizeList(item, dimension) = value_type else {
@@ -252,8 +242,7 @@ impl Outputs {
                 )?;
                 Ok(DecodedOutputs {
                     values: Arc::new(list),
-                    usage: response.usage,
-                    schema_errors: Vec::new(),
+                    row_errors: Vec::new(),
                 })
             }
         }
@@ -539,22 +528,40 @@ impl Driver {
                     media_errors.iter().map(|(row, error)| (*row, error)),
                 );
             }
+            let request = LlmRequest {
+                model: self.dispatch.model.clone(),
+                prompts,
+                media: resolved_media,
+                options: Arc::clone(&self.dispatch.options),
+            };
             let response = self
                 .dispatch
-                .generate(prompts, resolved_media, &self.metrics, &self.cancel)
+                .generate(&request, &self.metrics, &self.cancel, false)
                 .await;
-            tracking.pending = matches!(response, Err(LlmBackendError::Cancelled));
-            drop(tracking);
             match response {
                 Ok(response) => {
-                    self.append_response(&rows, response, indices, &media_errors)
+                    let indices =
+                        (!media_errors.is_empty()).then(|| UInt64Array::from(indices));
+                    let decoded = self
+                        .decode_response(
+                            response,
+                            &request,
+                            indices.as_ref(),
+                            rows.num_rows(),
+                        )
+                        .await;
+                    tracking.pending = decoded.as_ref().is_ok_and(|decoded| {
+                        decoded
+                            .row_errors
+                            .iter()
+                            .any(|(_, error)| matches!(error, LlmBackendError::Cancelled))
+                    });
+                    drop(tracking);
+                    self.append_response(&rows, decoded?, indices.as_ref(), &media_errors)
                 }
                 Err(error) => {
-                    if matches!(error, LlmBackendError::Cancelled)
-                        && self.dispatch.options.on_error != OnError::Envelope
-                    {
-                        return exec_err!("llm request cancelled");
-                    }
+                    tracking.pending = matches!(error, LlmBackendError::Cancelled);
+                    drop(tracking);
                     self.handle_failure(&error, count)?;
                     let nulls = new_null_array(self.value_type(), rows.num_rows());
                     let row_errors = (0..rows.num_rows())
@@ -628,6 +635,14 @@ impl Driver {
                 }
                 remaining -= size;
                 resolved.mime = resolved.mime.or(media.mime);
+                if let Some(edge) = options.image_max_edge {
+                    super::image::prepare(
+                        &mut resolved,
+                        edge,
+                        limit,
+                        options.image_resize_fallback,
+                    )?;
+                }
                 images.push(resolved);
             }
             Ok(images)
@@ -652,6 +667,11 @@ impl Driver {
     }
 
     fn handle_failure(&self, error: &LlmBackendError, rows: usize) -> Result<()> {
+        if matches!(error, LlmBackendError::Cancelled)
+            && self.dispatch.options.on_error != OnError::Envelope
+        {
+            return exec_err!("llm request cancelled");
+        }
         self.metrics.failed_rows.add(rows);
         match self.dispatch.options.on_error {
             OnError::Raise => exec_err!("llm backend failed: {error}"),
@@ -673,32 +693,105 @@ impl Driver {
         output
     }
 
-    fn append_response(
+    fn decode_outputs(
         &self,
-        rows: &RecordBatch,
         response: Outputs,
-        indices: Vec<Option<u64>>,
-        media_errors: &[(usize, LlmBackendError)],
-    ) -> Result<RecordBatch> {
-        let indices = (!media_errors.is_empty()).then(|| UInt64Array::from(indices));
-        let output_rows = (0..rows.num_rows())
-            .filter(|&row| indices.as_ref().is_none_or(|indices| indices.is_valid(row)));
-        let DecodedOutputs {
-            mut values,
-            usage,
-            schema_errors,
-        } = response.into_array(
-            self.value_type(),
-            self.dispatch.response_schema.as_ref(),
-            output_rows,
-        )?;
+        output_rows: impl Iterator<Item = usize>,
+    ) -> Result<DecodedOutputs> {
+        let usage = match &response {
+            Outputs::Completions(response) => response.usage,
+            Outputs::Embeddings(response) => response.usage,
+        };
         if let Some(usage) = usage {
             self.metrics.record_usage(usage)?;
         }
-        for (_, error) in &schema_errors {
+        response.into_array(
+            self.value_type(),
+            self.dispatch.response_schema.as_ref(),
+            output_rows,
+            self.dispatch.options.schema_mode,
+        )
+    }
+
+    async fn decode_response(
+        &self,
+        response: Outputs,
+        request: &LlmRequest,
+        indices: Option<&UInt64Array>,
+        row_count: usize,
+    ) -> Result<DecodedOutputs> {
+        let output_rows = (0..row_count)
+            .filter(|&row| indices.is_none_or(|indices| indices.is_valid(row)));
+        let decoded = self.decode_outputs(response, output_rows)?;
+        let retries = request.options.schema_retries.unwrap_or_default();
+        if retries == 0 || decoded.row_errors.is_empty() {
+            return Ok(decoded);
+        }
+
+        let mut selection: Vec<_> =
+            (0..decoded.values.len()).map(|row| (0, row)).collect();
+        let mut arrays = vec![decoded.values];
+        let mut row_errors = Vec::new();
+        'row: for (row, mut error) in decoded.row_errors {
+            // Vision rows with failed media reads were removed before dispatch.
+            let index = indices.map_or(row, |indices| indices.value(row) as usize);
+            let retry = LlmRequest {
+                model: request.model.clone(),
+                prompts: vec![request.prompts[index].clone()],
+                media: vec![request.media[index].clone()],
+                options: Arc::clone(&request.options),
+            };
+            for _ in 0..retries {
+                let response = tokio::select! {
+                    biased;
+                    () = self.cancel.cancelled() => Err(LlmBackendError::Cancelled),
+                    response = self.dispatch.generate(&retry, &self.metrics, &self.cancel, true) => response,
+                };
+                match response {
+                    Ok(response) => {
+                        let decoded =
+                            self.decode_outputs(response, std::iter::once(row))?;
+                        if let Some((_, mismatch)) = decoded.row_errors.into_iter().next()
+                        {
+                            error = mismatch;
+                        } else {
+                            selection[index] = (arrays.len(), 0);
+                            arrays.push(decoded.values);
+                            continue 'row;
+                        }
+                    }
+                    Err(failure) => {
+                        error = failure;
+                        break;
+                    }
+                }
+            }
+            row_errors.push((row, error));
+        }
+        let values = if arrays.len() == 1 {
+            arrays.pop().unwrap()
+        } else {
+            let arrays: Vec<_> = arrays.iter().map(AsRef::as_ref).collect();
+            interleave(&arrays, &selection)?
+        };
+        Ok(DecodedOutputs { values, row_errors })
+    }
+
+    fn append_response(
+        &self,
+        rows: &RecordBatch,
+        decoded: DecodedOutputs,
+        indices: Option<&UInt64Array>,
+        media_errors: &[(usize, LlmBackendError)],
+    ) -> Result<RecordBatch> {
+        let DecodedOutputs {
+            mut values,
+            row_errors,
+        } = decoded;
+        for (_, error) in &row_errors {
             self.handle_failure(error, 1)?;
         }
-        if let Some(indices) = &indices {
+        if let Some(indices) = indices {
             values = take(values.as_ref(), indices, None)?;
         }
         self.append_output(
@@ -706,7 +799,7 @@ impl Driver {
             values,
             media_errors
                 .iter()
-                .chain(&schema_errors)
+                .chain(&row_errors)
                 .map(|(row, error)| (*row, error)),
         )
     }
