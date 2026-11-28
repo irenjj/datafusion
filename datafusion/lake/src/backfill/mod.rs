@@ -11,6 +11,8 @@
 mod lance;
 mod paimon;
 mod plan;
+mod stage;
+mod wire;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -23,6 +25,7 @@ use url::Url;
 use crate::LakeObjectStores;
 
 pub use plan::{BackfillPlan, BackfillReceipt, BackfillWorkUnit};
+pub use stage::bridge_backfill_stage;
 
 /// The existing table that the coordinator will backfill.
 ///
@@ -102,7 +105,9 @@ pub async fn prepare_backfill<'a>(
 
 /// Write only the new columns for one attempt. The stream must supply every row
 /// in physical offset order, including deleted offsets, with the planned Arrow
-/// schema on every batch. Wrap a single batch in [futures::stream::iter].
+/// schema on every batch. Use [`bridge_backfill_stage`] to adapt a logical stream
+/// of visible rows from a distributed stage. Wrap a single batch in [futures::stream::iter].
+///
 /// The store must support [`object_store::CopyMode::Create`] to publish attempt
 /// files. Enable `S3CopyIfNotExists::Multipart` when building an Amazon S3 store.
 ///
