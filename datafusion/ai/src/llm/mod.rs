@@ -5,6 +5,8 @@
 //! LLM query planning and asynchronous inference with pluggable providers.
 
 mod backend;
+#[cfg(feature = "http")]
+mod http;
 mod logical;
 mod options;
 mod physical;
@@ -14,6 +16,8 @@ pub use backend::{
     CancellationToken, LlmBackend, LlmBackendError, LlmProviderRegistry, LlmRequest,
     LlmResponse, LlmUsage, MockLlmBackend,
 };
+#[cfg(feature = "http")]
+pub use http::{OpenAiHttpBackend, OpenAiHttpConfig};
 pub use logical::LlmNode;
 pub use options::{LlmOptions, OnError};
 pub use physical::{LlmExec, plan_llm};
