@@ -31,7 +31,10 @@ use self::filter::ScanFilter;
 use crate::lance_table::{LanceScan, LanceScanSpec};
 use crate::paimon_table::{PaimonScan, PaimonScanSpec, paimon_scan_error};
 use crate::scan::{LakeScan, LakeSource};
-use crate::{LAKE_SPLIT_EXT_VERSION, LakeSplitExt, LakeSplitPayload, RequiredIndexSpec};
+use crate::{
+    LAKE_SPLIT_EXT_VERSION, LakeObjectStores, LakeSplitExt, LakeSplitPayload,
+    RequiredIndexSpec,
+};
 
 /// Stable wire name for a split-free lake scan template.
 ///
@@ -67,6 +70,7 @@ type StorageProvider<T> = Arc<dyn Fn(&str) -> Result<T> + Send + Sync>;
 #[derive(Default)]
 pub struct LakeRuntimeConfig {
     lance: Option<StorageProvider<DatasetBuilder>>,
+    object_stores: LakeObjectStores,
     paimon: Option<StorageProvider<FileIO>>,
 }
 
@@ -84,6 +88,19 @@ impl LakeRuntimeConfig {
         provider: impl Fn(&str) -> Result<DatasetBuilder> + Send + Sync + 'static,
     ) -> Self {
         self.lance = Some(Arc::new(provider));
+        self
+    }
+
+    /// Supply worker-local Lance stores. A matching dataset URL takes precedence
+    /// over the builder supplied by [`Self::with_lance_builder`].
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_object_stores(mut self, stores: LakeObjectStores) -> Self {
+        self.object_stores = stores;
         self
     }
 
@@ -126,10 +143,12 @@ impl LakeRuntimeConfig {
     }
 
     pub(crate) fn lance_builder(&self, uri: &str) -> Result<DatasetBuilder> {
-        match &self.lance {
-            Some(provider) => provider(uri),
-            None => Ok(DatasetBuilder::from_uri(uri)),
+        if let Some(provider) = &self.lance
+            && !self.object_stores.matches_uri(uri)
+        {
+            return provider(uri);
         }
+        Ok(self.object_stores.lance_builder(uri))
     }
 
     pub(crate) fn paimon_file_io(&self, uri: &str) -> Result<FileIO> {

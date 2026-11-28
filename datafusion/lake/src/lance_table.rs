@@ -39,6 +39,7 @@ use crate::filter;
 use crate::media::{external, media_array, media_url};
 use crate::scan::{LakeScan, ScanHandle, make_batch, scan_plan};
 use crate::split::{InclusiveRowRange, LakeSplitExt, LakeSplitPayload};
+use crate::stores::LakeObjectStores;
 use crate::validation::{LakeTableOptions, RequiredIndexSpec, blob_mime};
 
 #[derive(Debug)]
@@ -82,7 +83,26 @@ impl LanceReadOnlyTable {
         version: Option<u64>,
         options: &LakeTableOptions,
     ) -> Result<Self> {
-        let builder = DatasetBuilder::from_uri(uri);
+        Self::open_with_stores(uri, version, options, &LakeObjectStores::default()).await
+    }
+
+    /// Open a pinned dataset using the supplied process-local object store bindings.
+    /// Unmatched URLs use Lance's default providers.
+    ///
+    /// # Errors
+    /// Returns a planning error for an unreadable dataset or failed table validation.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub async fn open_with_stores(
+        uri: &str,
+        version: Option<u64>,
+        options: &LakeTableOptions,
+        stores: &LakeObjectStores,
+    ) -> Result<Self> {
+        let builder = stores.lance_builder(uri);
         let builder = match version {
             Some(version) => builder.with_version(version),
             None => builder,

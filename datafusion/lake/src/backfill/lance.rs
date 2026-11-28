@@ -3,6 +3,7 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -12,12 +13,12 @@ use futures::{Stream, StreamExt, TryStreamExt, pin_mut, stream};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::table::format::{Fragment, Manifest, ManifestBuildConfig};
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::ObjectStore;
 use lance_table_runtime::commit::{
     CommitHooks, CommitTransactionOptions, commit_transaction,
 };
 use lance_table_runtime::write::open_update_writer;
-use lance_table_runtime::{FileFragment, Table, TableBuilder};
+use lance_table_runtime::{FileFragment, Table};
 use object_store::ObjectStoreExt;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -25,9 +26,10 @@ use url::Url;
 use crate::lance_table::lance_scan_error;
 use crate::media::external;
 
+use super::BackfillRuntime;
 use super::plan::{
-    BackfillPlan, BackfillReceipt, BackfillWorkUnit, PlanPayload, add_rows, dataset_url,
-    validate_columns,
+    BackfillPlan, BackfillReceipt, BackfillWorkUnit, FragmentLayout, PLAN_VERSION,
+    PlanPayload, add_rows, dataset_url, validate_columns,
 };
 
 const METADATA_CONCURRENCY: usize = 16;
@@ -35,23 +37,25 @@ const METADATA_CONCURRENCY: usize = 16;
 pub(super) async fn prepare(
     uri: &str,
     columns: &Schema,
-    runtime: &ObjectStoreParams,
+    runtime: BackfillRuntime<'_>,
 ) -> Result<(BackfillPlan, Vec<BackfillWorkUnit>)> {
     let uri = dataset_url(uri)?;
     let table = open(&uri, None, runtime).await?;
     column_schema(&table, columns)?;
-    let units = work_units(&table).await?;
+    let fragments = fragment_layouts(&table).await?;
+    let units: Vec<_> = fragments.iter().map(|fragment| fragment.unit).collect();
     let row_count = units
         .iter()
         .try_fold(0, |total, unit| add_rows(total, unit.row_count))?;
     let plan = BackfillPlan::new(PlanPayload {
-        version: 1,
+        version: PLAN_VERSION,
         dataset_uri: uri.into(),
         dataset_version: table.version_id(),
         manifest_identity: manifest_identity(table.manifest()),
         new_columns: columns.clone(),
         unit_count: units.len(),
         row_count,
+        fragments,
     })?;
     Ok((plan, units))
 }
@@ -61,8 +65,9 @@ pub(super) async fn write_unit(
     unit: &BackfillWorkUnit,
     attempt_id: &str,
     batches: impl Stream<Item = Result<RecordBatch>> + Send,
-    runtime: &ObjectStoreParams,
+    runtime: BackfillRuntime<'_>,
 ) -> Result<BackfillReceipt> {
+    let layout = plan.validate_unit(unit)?;
     let file_name = artifact_name(plan, unit, attempt_id)?;
     let uri = dataset_url(plan.dataset_uri())?;
     let artifact_uri = artifact_url(uri.clone(), &file_name)?;
@@ -72,8 +77,8 @@ pub(super) async fn write_unit(
         .ok_or_else(|| {
             plan_datafusion_err!("Missing Lance backfill fragment {}", unit.fragment_id)
         })?;
-    if work_unit(fragment).await? != *unit {
-        return plan_err!("Lance backfill work unit does not match the pinned fragment");
+    if fragment_layout(fragment).await? != *layout {
+        return plan_err!("Backfill layout does not match the pinned Lance fragment");
     }
     let schema = column_schema(&table, plan.new_columns())?;
     let store = table.object_store(None).await.map_err(lance_scan_error)?;
@@ -115,7 +120,13 @@ pub(super) async fn write_unit(
         store
             .copy_if_not_exists(&staged, &data_dir.join(file_name.as_str()))
             .await
-            .map_err(external)?;
+            .map_err(|e| match e {
+                object_store::Error::NotSupported { .. }
+                | object_store::Error::NotImplemented { .. } => external(e).context(
+                    "Lance backfill attempt publication requires CopyMode::Create. Configure Amazon S3 stores with S3CopyIfNotExists::Multipart",
+                ),
+                _ => external(e),
+            })?;
         file.path = file_name;
         Ok(BackfillReceipt {
             plan_fingerprint: plan.plan_fingerprint.clone(),
@@ -135,7 +146,7 @@ pub(super) async fn write_unit(
 pub(super) async fn finalize(
     plan: &BackfillPlan,
     winners: &HashMap<u32, &BackfillReceipt>,
-    runtime: &ObjectStoreParams,
+    runtime: BackfillRuntime<'_>,
 ) -> Result<u64> {
     let uri = dataset_url(plan.dataset_uri())?;
     let table = open_baseline(plan, &uri, runtime).await?;
@@ -154,13 +165,14 @@ pub(super) async fn finalize(
         .extend(columns.fields.iter().cloned());
     let preview = Arc::new(table.with_manifest_view(Arc::new(manifest)));
     let store = table.object_store(None).await.map_err(lance_scan_error)?;
-    let units = work_units(&table).await?;
-    if units.len() != winners.len() {
-        return plan_err!("Backfill receipts do not cover the pinned Lance fragments");
+    let layouts = fragment_layouts(&table).await?;
+    if layouts != plan.payload.fragments {
+        return plan_err!("Backfill layouts do not match the pinned Lance fragments");
     }
-    let assignments = units
+    let assignments = layouts
         .iter()
-        .map(|unit| {
+        .map(|layout| {
+            let unit = &layout.unit;
             let receipt = winners.get(&unit.fragment_id).ok_or_else(|| {
                 plan_datafusion_err!(
                     "Missing backfill receipt for Lance fragment {}",
@@ -214,7 +226,16 @@ pub(super) async fn finalize(
         CommitHooks::default(),
     ))
     .await
-    .map_err(lance_scan_error)?;
+    .map_err(|error| {
+        let error = lance_scan_error(error);
+        if uri.scheme() == "s3" {
+            error.context(
+                "Cannot publish the Lance backfill manifest with atomic PutMode::Create",
+            )
+        } else {
+            error
+        }
+    })?;
     Ok(manifest.version)
 }
 
@@ -228,14 +249,11 @@ async fn verify_artifact(
     receipt: &BackfillReceipt,
 ) -> Result<()> {
     let unit = receipt.work_unit;
-    let file_name = artifact_name(plan, &unit, &receipt.attempt_id)?;
+    validate_receipt_file(plan, receipt, uri)?;
     let file = &receipt.data_file;
     let data_dir = preview.data_dir();
-    if file.path != file_name
-        || artifact_url(uri.clone(), &file_name)?.as_str() != receipt.artifact_uri
-        || file.base_id.is_some()
-        || file.file_version().map_err(lance_scan_error)?
-            != preview.manifest().data_storage_format.lance_file_format()
+    if file.file_version().map_err(lance_scan_error)?
+        != preview.manifest().data_storage_format.lance_file_format()
         || file.fields.iter().any(|id| !field_ids.contains(id))
         || file.schema(columns) != *columns
     {
@@ -244,10 +262,9 @@ async fn verify_artifact(
             unit.fragment_id
         );
     }
-    file.validate(&data_dir).map_err(lance_scan_error)?;
     let meta = store
         .inner
-        .head(&data_dir.join(file_name.as_str()))
+        .head(&data_dir.join(file.path.as_str()))
         .await
         .map_err(external)?;
     if file.file_size_bytes.get().map(u64::from) != Some(meta.size) {
@@ -266,12 +283,50 @@ async fn verify_artifact(
     Ok(())
 }
 
+pub(super) fn validate_receipt_file(
+    plan: &BackfillPlan,
+    receipt: &BackfillReceipt,
+    uri: &Url,
+) -> Result<()> {
+    let unit = receipt.work_unit;
+    let file_name = artifact_name(plan, &unit, &receipt.attempt_id)?;
+    let file = &receipt.data_file;
+    let size = file.file_size_bytes.get();
+    if file.path != file_name
+        || artifact_url(uri.clone(), &file_name)?.as_str() != receipt.artifact_uri
+        || file.base_id.is_some()
+        || size.is_none()
+        || file.file_metadata_size_bytes > size
+        || file
+            .file_version()
+            .map_err(lance_scan_error)?
+            .to_manifest_string()
+            == "0.1"
+        || file.fields.is_empty()
+        || file.fields[0] < 0
+        || !file.fields.windows(2).all(|pair| pair[0] < pair[1])
+        || file.column_indices.len() != file.fields.len()
+        || !file
+            .column_indices
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(index, column)| usize::try_from(column) == Ok(index))
+    {
+        return plan_err!(
+            "Invalid backfill data file for Lance fragment {}",
+            unit.fragment_id
+        );
+    }
+    Ok(())
+}
+
 async fn open(
     uri: &Url,
     version: Option<u64>,
-    runtime: &ObjectStoreParams,
+    runtime: BackfillRuntime<'_>,
 ) -> Result<Table> {
-    let builder = TableBuilder::from_uri(uri.as_str()).with_store_params(runtime.clone());
+    let builder = runtime.lance_builder(uri);
     let builder = match version {
         Some(version) => builder.with_version(version),
         None => builder,
@@ -295,7 +350,7 @@ async fn open(
 async fn open_baseline(
     plan: &BackfillPlan,
     uri: &Url,
-    runtime: &ObjectStoreParams,
+    runtime: BackfillRuntime<'_>,
 ) -> Result<Table> {
     let table = open(uri, Some(plan.dataset_version()), runtime).await?;
     if table.version_id() != plan.dataset_version()
@@ -336,22 +391,15 @@ fn column_schema(table: &Table, columns: &Schema) -> Result<LanceSchema> {
     Ok(schema)
 }
 
-async fn work_units(table: &Table) -> Result<Vec<BackfillWorkUnit>> {
-    let units: Vec<_> = stream::iter(table.get_fragments())
-        .map(work_unit)
+async fn fragment_layouts(table: &Table) -> Result<Vec<FragmentLayout>> {
+    stream::iter(table.get_fragments())
+        .map(fragment_layout)
         .buffered(METADATA_CONCURRENCY)
         .try_collect()
-        .await?;
-    if !units
-        .windows(2)
-        .all(|pair| pair[0].fragment_id < pair[1].fragment_id)
-    {
-        return plan_err!("Lance backfill requires unique and ordered fragment IDs");
-    }
-    Ok(units)
+        .await
 }
 
-async fn work_unit(fragment: FileFragment) -> Result<BackfillWorkUnit> {
+async fn fragment_layout(fragment: FileFragment) -> Result<FragmentLayout> {
     let fragment_id = u32::try_from(fragment.metadata().id).map_err(|_| {
         plan_datafusion_err!("Invalid Lance fragment ID {}", fragment.metadata().id)
     })?;
@@ -359,9 +407,40 @@ async fn work_unit(fragment: FileFragment) -> Result<BackfillWorkUnit> {
     let row_count = u32::try_from(rows).map_err(|_| {
         plan_datafusion_err!("Lance fragment {fragment_id} exceeds u32 rows")
     })?;
-    Ok(BackfillWorkUnit {
-        fragment_id,
-        row_count: u64::from(row_count),
+    let deletion = fragment.metadata().deletion_file.as_ref();
+    let mut deleted_ranges: Vec<Range<u32>> = Vec::new();
+    if let Some(vector) = fragment
+        .get_deletion_vector()
+        .await
+        .map_err(lance_scan_error)?
+    {
+        if deletion
+            .and_then(|file| file.num_deleted_rows)
+            .is_some_and(|count| count != vector.len())
+        {
+            return plan_err!(
+                "Deletion count differs from the vector for Lance fragment {fragment_id}"
+            );
+        }
+        for offset in vector.to_sorted_iter() {
+            if offset >= row_count {
+                return plan_err!(
+                    "Deleted row offset exceeds the size of Lance fragment {fragment_id}"
+                );
+            }
+            match deleted_ranges.last_mut() {
+                Some(range) if range.end == offset => range.end += 1,
+                _ => deleted_ranges.push(offset..offset + 1),
+            }
+        }
+    }
+    Ok(FragmentLayout {
+        unit: BackfillWorkUnit {
+            fragment_id,
+            row_count: u64::from(row_count),
+        },
+        deletion_file_rev: deletion.map(|file| file.read_version),
+        deleted_ranges,
     })
 }
 
