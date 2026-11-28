@@ -16,6 +16,7 @@ mod scan;
 #[doc(hidden)]
 pub mod search;
 mod split;
+mod stores;
 mod validation;
 
 pub use lance_table::LanceReadOnlyTable;
@@ -28,4 +29,6 @@ pub use split::{
     InclusiveRowRange, LAKE_SPLIT_EXT_NAME, LAKE_SPLIT_EXT_VERSION, LakeSplitExt,
     LakeSplitPayload,
 };
+#[doc(hidden)]
+pub use stores::LakeObjectStores;
 pub use validation::{LakeTableOptions, RequiredIndexSpec};

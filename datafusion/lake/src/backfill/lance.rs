@@ -12,12 +12,12 @@ use futures::{Stream, StreamExt, TryStreamExt, pin_mut, stream};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::table::format::{Fragment, Manifest, ManifestBuildConfig};
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::ObjectStore;
 use lance_table_runtime::commit::{
     CommitHooks, CommitTransactionOptions, commit_transaction,
 };
 use lance_table_runtime::write::open_update_writer;
-use lance_table_runtime::{FileFragment, Table, TableBuilder};
+use lance_table_runtime::{FileFragment, Table};
 use object_store::ObjectStoreExt;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -25,6 +25,7 @@ use url::Url;
 use crate::lance_table::lance_scan_error;
 use crate::media::external;
 
+use super::BackfillRuntime;
 use super::plan::{
     BackfillPlan, BackfillReceipt, BackfillWorkUnit, PlanPayload, add_rows, dataset_url,
     validate_columns,
@@ -35,7 +36,7 @@ const METADATA_CONCURRENCY: usize = 16;
 pub(super) async fn prepare(
     uri: &str,
     columns: &Schema,
-    runtime: &ObjectStoreParams,
+    runtime: BackfillRuntime<'_>,
 ) -> Result<(BackfillPlan, Vec<BackfillWorkUnit>)> {
     let uri = dataset_url(uri)?;
     let table = open(&uri, None, runtime).await?;
@@ -61,7 +62,7 @@ pub(super) async fn write_unit(
     unit: &BackfillWorkUnit,
     attempt_id: &str,
     batches: impl Stream<Item = Result<RecordBatch>> + Send,
-    runtime: &ObjectStoreParams,
+    runtime: BackfillRuntime<'_>,
 ) -> Result<BackfillReceipt> {
     let file_name = artifact_name(plan, unit, attempt_id)?;
     let uri = dataset_url(plan.dataset_uri())?;
@@ -115,7 +116,13 @@ pub(super) async fn write_unit(
         store
             .copy_if_not_exists(&staged, &data_dir.join(file_name.as_str()))
             .await
-            .map_err(external)?;
+            .map_err(|e| match e {
+                object_store::Error::NotSupported { .. }
+                | object_store::Error::NotImplemented { .. } => external(e).context(
+                    "Lance backfill attempt publication requires CopyMode::Create. Configure Amazon S3 stores with S3CopyIfNotExists::Multipart",
+                ),
+                _ => external(e),
+            })?;
         file.path = file_name;
         Ok(BackfillReceipt {
             plan_fingerprint: plan.plan_fingerprint.clone(),
@@ -135,7 +142,7 @@ pub(super) async fn write_unit(
 pub(super) async fn finalize(
     plan: &BackfillPlan,
     winners: &HashMap<u32, &BackfillReceipt>,
-    runtime: &ObjectStoreParams,
+    runtime: BackfillRuntime<'_>,
 ) -> Result<u64> {
     let uri = dataset_url(plan.dataset_uri())?;
     let table = open_baseline(plan, &uri, runtime).await?;
@@ -214,7 +221,16 @@ pub(super) async fn finalize(
         CommitHooks::default(),
     ))
     .await
-    .map_err(lance_scan_error)?;
+    .map_err(|error| {
+        let error = lance_scan_error(error);
+        if uri.scheme() == "s3" {
+            error.context(
+                "Cannot publish the Lance backfill manifest with atomic PutMode::Create",
+            )
+        } else {
+            error
+        }
+    })?;
     Ok(manifest.version)
 }
 
@@ -269,9 +285,9 @@ async fn verify_artifact(
 async fn open(
     uri: &Url,
     version: Option<u64>,
-    runtime: &ObjectStoreParams,
+    runtime: BackfillRuntime<'_>,
 ) -> Result<Table> {
-    let builder = TableBuilder::from_uri(uri.as_str()).with_store_params(runtime.clone());
+    let builder = runtime.lance_builder(uri);
     let builder = match version {
         Some(version) => builder.with_version(version),
         None => builder,
@@ -295,7 +311,7 @@ async fn open(
 async fn open_baseline(
     plan: &BackfillPlan,
     uri: &Url,
-    runtime: &ObjectStoreParams,
+    runtime: BackfillRuntime<'_>,
 ) -> Result<Table> {
     let table = open(uri, Some(plan.dataset_version()), runtime).await?;
     if table.version_id() != plan.dataset_version()
