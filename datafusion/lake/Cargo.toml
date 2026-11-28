@@ -13,9 +13,6 @@ license = { workspace = true }
 repository = { workspace = true }
 publish = false
 
-[package.metadata.cargo-machete]
-ignored = ["datafusion-sql"]
-
 [lints]
 workspace = true
 

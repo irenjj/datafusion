@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{Array, RecordBatch, StructArray, UInt64Array};
@@ -24,6 +24,7 @@ use lance::dataset::fragment::FileFragment;
 use lance::dataset::scanner::{FragmentSlice, Scanner};
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance::session::UnregisteredExternalBlobPolicy;
+use lance_core::ROW_ID;
 use lance_core::datatypes::{BlobHandling, BlobVersion};
 use lance_core::utils::blob::blob_path;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -36,7 +37,7 @@ use url::Url;
 use crate::filter;
 use crate::media::{external, media_array, media_url};
 use crate::scan::{LakeScan, make_batch, scan_plan};
-use crate::split::{LakeSplitExt, LakeSplitPayload};
+use crate::split::{InclusiveRowRange, LakeSplitExt, LakeSplitPayload};
 use crate::validation::{LakeTableOptions, RequiredIndexSpec, blob_mime};
 
 #[derive(Debug)]
@@ -63,6 +64,8 @@ pub struct LanceReadOnlyTable {
     dataset: Arc<Dataset>,
     schema: SchemaRef,
     blobs: Arc<HashMap<String, BlobColumn>>,
+    required_indices: Vec<RequiredIndexSpec>,
+    vector_indices: HashMap<String, String>,
 }
 
 impl LanceReadOnlyTable {
@@ -144,12 +147,14 @@ impl LanceReadOnlyTable {
         }) {
             return not_impl_err!("Lance blob descriptors from overlay files");
         }
-        validate_indices(&dataset, &raw, options).await?;
+        let vector_indices = validate_indices(&dataset, &raw, options).await?;
 
         Ok(Self {
             dataset: Arc::new(dataset),
             schema: Arc::new(Schema::new_with_metadata(fields, raw.metadata().clone())),
             blobs: Arc::new(blobs),
+            required_indices: options.required_indices.clone(),
+            vector_indices,
         })
     }
 
@@ -170,6 +175,83 @@ impl LanceReadOnlyTable {
             filter::normalize(expr, &self.schema)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn dataset(&self) -> &Dataset {
+        &self.dataset
+    }
+
+    pub(crate) fn has_required_index(&self, index: &RequiredIndexSpec) -> bool {
+        self.required_indices.contains(index)
+    }
+
+    pub(crate) async fn select_vector_index(
+        &self,
+        column: &str,
+        scan: &mut Scanner,
+    ) -> Result<()> {
+        let name = self.vector_indices.get(column).ok_or_else(|| {
+            plan_datafusion_err!("Lance vector index for {column:?} was not validated")
+        })?;
+        let indices = self
+            .dataset
+            .load_indices()
+            .await
+            .map_err(lance_scan_error)?;
+        let segments = indices
+            .iter()
+            .filter(|index| &index.name == name)
+            .map(|index| index.uuid)
+            .collect();
+        scan.with_index_segments(segments)
+            .map_err(lance_scan_error)?;
+        Ok(())
+    }
+
+    pub(crate) fn scan_row_ranges(
+        &self,
+        schema: SchemaRef,
+        fragments: BTreeMap<u32, Vec<InclusiveRowRange>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let files = fragments
+            .into_iter()
+            .map(|(fragment_id, ranges)| {
+                let fragment = self
+                    .dataset
+                    .get_fragment(fragment_id as usize)
+                    .ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "Missing Lance fragment {fragment_id} at the pinned snapshot"
+                        )
+                    })?;
+                let metadata = fragment.metadata();
+                let size = metadata
+                    .files
+                    .iter()
+                    .filter_map(|file| file.file_size_bytes.get())
+                    .map(std::num::NonZeroU64::get)
+                    .fold(0, u64::saturating_add);
+                LakeSplitExt::into_file(
+                    LakeSplitPayload::Lance {
+                        dataset_uri: self.dataset.uri().into(),
+                        dataset_version: self.dataset_version(),
+                        fragment_id,
+                        row_ranges: Some(ranges),
+                        deletion_file_rev: metadata
+                            .deletion_file
+                            .as_ref()
+                            .map(|file| file.read_version),
+                    },
+                    size,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let scan = LanceScan {
+            dataset: Arc::clone(&self.dataset),
+            blobs: Arc::clone(&self.blobs),
+            filter: None,
+        };
+        scan_plan(LakeScan::Lance(scan), schema, None, files, None)
     }
 
     fn files(&self) -> Result<Vec<PartitionedFile>> {
@@ -311,8 +393,11 @@ impl LanceScan {
             Arc::clone(&self.dataset),
             fragment.metadata().clone(),
         );
-        let columns: BTreeSet<_> =
+        let mut columns: BTreeSet<_> =
             schema.fields().iter().map(|f| f.name().as_str()).collect();
+        if row_ranges.is_some() && columns.remove(ROW_ID) {
+            scanner.with_row_id();
+        }
         scanner
             .blob_handling(BlobHandling::BlobsDescriptions)
             .batch_size(batch_size)
@@ -567,7 +652,7 @@ fn join_uri(mut root: Url, relative: &str) -> Result<Url> {
     Ok(root)
 }
 
-fn lance_scan_error(error: lance::Error) -> DataFusionError {
+pub(crate) fn lance_scan_error(error: lance::Error) -> DataFusionError {
     if matches!(error, lance::Error::NotSupported { .. }) {
         DataFusionError::NotImplemented(error.to_string())
     } else {
@@ -579,9 +664,10 @@ async fn validate_indices(
     dataset: &Dataset,
     schema: &Schema,
     options: &LakeTableOptions,
-) -> Result<()> {
+) -> Result<HashMap<String, String>> {
+    let mut vector_indices = HashMap::new();
     if options.required_indices.is_empty() {
-        return Ok(());
+        return Ok(vector_indices);
     }
     let indices = dataset
         .load_indices()
@@ -658,6 +744,7 @@ async fn validate_indices(
                             );
                         }
                     }
+                    vector_indices.insert(column.to_owned(), name.to_owned());
                 }
                 ready = true;
                 break;
@@ -670,5 +757,5 @@ async fn validate_indices(
             );
         }
     }
-    Ok(())
+    Ok(vector_indices)
 }

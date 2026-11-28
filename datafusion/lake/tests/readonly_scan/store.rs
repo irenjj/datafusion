@@ -7,6 +7,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::BoxStream;
 use lance_io::object_store::WrappingObjectStore;
 use object_store::list::PaginatedListStore;
@@ -15,6 +16,7 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
 };
+use paimon::io::FileBlockCache;
 
 #[derive(Debug, Clone)]
 pub(super) struct Reads(Arc<Mutex<Vec<Read>>>);
@@ -34,6 +36,24 @@ impl Reads {
     pub(super) fn take(&self) -> Vec<Read> {
         std::mem::take(&mut *self.0.lock().unwrap())
     }
+}
+
+#[async_trait]
+impl FileBlockCache for Reads {
+    async fn get(&self, path: &str, range: Range<u64>) -> Option<Bytes> {
+        let object = path.rsplit('\0').next().unwrap();
+        self.0.lock().unwrap().push(Read {
+            path: Path::parse(object).unwrap(),
+            range: Some(range),
+        });
+        None
+    }
+
+    async fn put(&self, _: &str, _: u64, _: Bytes) {}
+
+    async fn invalidate_path(&self, _: &str) {}
+
+    async fn invalidate_prefix(&self, _: &str) {}
 }
 
 impl WrappingObjectStore for Reads {

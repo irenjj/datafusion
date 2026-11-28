@@ -20,7 +20,7 @@ tests() { cargo nextest run --locked --cargo-profile ci -p "$@"; }
 | ai-http         | `lint datafusion-ai --features http` and `tests datafusion-ai --features http`. Loopback tests cover transport and registry execution.                                                                                                                     | `cargo nextest run --locked --cargo-profile ci -p datafusion-ai --features http --test http`. Check core wiring with `lint datafusion --features ai-http`.                                      |
 | lake-storage    | `lint datafusion-lake` and `tests datafusion-lake`. Covers pinned Lance and Paimon scans, split replay, scalar pushdown, descriptor-only media projection and bounded resolution.                                                                          | Replay `cargo nextest run --locked --cargo-profile ci -p datafusion-lake --test readonly_scan --test split_contract` using generated local fixtures.                                            |
 | dist-checkpoint | TODO `lint datafusion-dist` and `tests datafusion-dist`. The lake tables are read-only. Checkpoint and DLQ routing belong to `datafusion-dist`.                                                                                                            | TODO restart, duplicate replay and interruption tests at the checkpoint commit boundary.                                                                                                        |
-| lake-retrieval  | TODO `lint datafusion-lake` and `tests datafusion-lake`. Add exact-oracle, ties and empty-input cases.                                                                                                                                                     | TODO differential retrieval fuzz with fixed seeds and stored failing cases.                                                                                                                     |
+| lake-retrieval  | `lint datafusion-lake`, `tests datafusion-lake` and `bash datafusion/lake/tests/check-dependencies.sh`. Covers indexed retrieval, weighted fusion, late reads and dependency isolation.                                                                    | `cargo nextest run --locked --cargo-profile ci -p datafusion-lake -E 'test(search::)'` replays the retrieval contract with local fixtures.                                                      |
 | dist-plan       | `lint datafusion-dist` and `tests datafusion-dist` (target `dist`). Covers map-only admission, zero-input file scan extensions, versioned operator and file codecs, split fingerprints and metric isolation.                                               | `DIST_FUZZ_CASES=36 DIST_FUZZ_SEED=2026 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --test dist fuzz`. Use `DIST_FUZZ_REPLAY=dataset_seed,case_seed` for one failing case. |
 | dist-ai         | `lint datafusion-dist --features ai` and `tests datafusion-dist --features ai`. Covers `LlmExec` transport, worker provider registration, speculation policy and metrics across attempts.                                                                  | `cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai --test dist ai_codec`.                                                                                          |
 | dist-runtime    | `lint datafusion-dist` and `tests datafusion-dist`. Covers deterministic worker recovery, attempt fencing and 256 seeded lease sequences.                                                                                                                  | [Replay high-sample proptest and both TLC configurations](#distributed-scheduler-replay).                                                                                                       |
@@ -42,6 +42,23 @@ Lance applies predicates in the fragment scanner. Paimon pushes predicates into 
 Top-level blobs project as `df.media_ref` v1. MIME takes the first declared value from field metadata, `fields.<column>.<key>`, or table metadata, with key order `df.media.mime`, `mime`, `content-type`. Any applicable blank declaration fails at open. Nested blob projections and Lance blob overlays are rejected at open. Lance preserves the storage block size configured by its builder. Its metadata tail prefetch can overlap inline payload bytes.
 
 The media resolver uses a caller's object store registry, with optional scoped Paimon FileIO bindings. It validates the URI for every reference. An explicit zero-length range without an ETag returns empty bytes without storage IO. With an ETag, the resolver checks object metadata without reading payload bytes. Paimon FileIO bindings expose object length and reject a supplied ETag because their API does not expose ETags.
+
+## Lake retrieval contract
+
+Open a snapshot with `LakeTableOptions::required_indices` listing the vector index and, for hybrid retrieval, the full-text index. Register the open handle in `LakeSearchCatalog` and register the two table functions with the host. Paimon retrieval requires Data Evolution, row tracking and global indexes. Primary-key search is unsupported.
+
+```sql
+SELECT id, _score FROM vector_search('items', 'embedding', '[1,2,3]', 10);
+
+SELECT id, _score FROM hybrid_search(
+  'items', 'embedding', '[1,2,3]', 'description', 'quartz',
+  10, 60, 1.0, 2.0, 'active = true'
+);
+```
+
+The UDTFs require literal `Expr` arguments at `TableFunctionImpl::call_with_args`. The host SQL planner can fold an argument before that call. The optional hybrid arguments are `rrf_k`, vector weight, text weight and `filter_sql`, in that order. The default `rrf_k` is 60 and each default weight is 1.0. The prefilter uses the scalar predicate contract above. An outer `WHERE` applies to the fused result after search.
+
+Each route retrieves up to `k` indexed candidates. Fusion uses one-based ranks and `Float64` arithmetic, orders equal fused scores by ascending row key and returns `_score` as non-null `Float32`. The read plan fetches projected columns for the fused row ranges, restores fusion order and errors if a fused row key is missing. The exact vector oracles use single-partition IVF-flat indexes. Recall on approximate indexes depends on the engine and index configuration.
 
 ## Distributed scheduler replay
 

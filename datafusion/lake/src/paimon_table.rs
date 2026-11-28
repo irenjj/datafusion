@@ -28,7 +28,7 @@ use paimon::spec::{
     BlobDescriptor, DataEvolutionIndexSourceMeta, DataType, FileKind, IndexManifest,
     Predicate, PredicateBuilder, Snapshot,
 };
-use paimon::{DataSplit, ReadBuilder, Table};
+use paimon::{DataSplit, ReadBuilder, RowRange, Table};
 use paimon_vindex_core::{diskann_io, io as ivfpq_io, ivfflat_io, ivfrq_io, ivfsq_io};
 use sha2::{Digest, Sha256};
 
@@ -51,6 +51,7 @@ pub struct PaimonReadOnlyTable {
     snapshot_id: i64,
     schema: SchemaRef,
     blobs: Arc<HashMap<String, Option<String>>>,
+    required_indices: Vec<RequiredIndexSpec>,
 }
 
 impl PaimonReadOnlyTable {
@@ -120,6 +121,7 @@ impl PaimonReadOnlyTable {
             snapshot_id: snapshot.id(),
             schema: Arc::new(Schema::new(fields)),
             blobs: Arc::new(blobs),
+            required_indices: options.required_indices.clone(),
         })
     }
 
@@ -137,6 +139,46 @@ impl PaimonReadOnlyTable {
     #[doc(hidden)]
     pub fn validate_prefilter(&self, filters: &[Expr]) -> Result<()> {
         self.translate(filters.iter()).map(|_| ())
+    }
+
+    pub(crate) fn table(&self) -> &Table {
+        &self.table
+    }
+
+    pub(crate) fn has_required_index(&self, index: &RequiredIndexSpec) -> bool {
+        self.required_indices.contains(index)
+    }
+
+    pub(crate) async fn scan_row_ranges(
+        &self,
+        schema: SchemaRef,
+        ranges: Vec<RowRange>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let columns: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        let mut read = self.table.new_read_builder();
+        configure_read(&mut read, &columns, None)?;
+        let plan = read
+            .new_scan()
+            .with_row_ranges(ranges)
+            .plan()
+            .await
+            .map_err(paimon_scan_error)?;
+        let (files, planned) =
+            split_files(self.table.location(), self.snapshot_id, plan.splits())?;
+        let scan = PaimonScan {
+            table: Arc::clone(&self.table),
+            snapshot_id: self.snapshot_id,
+            blobs: Arc::clone(&self.blobs),
+            columns: columns.into(),
+            predicate: None,
+            filter: None,
+            planned: Arc::new(planned),
+        };
+        scan_plan(LakeScan::Paimon(scan), schema, None, files, None)
     }
 
     fn translate<'a>(
@@ -460,7 +502,7 @@ fn contains_blob(dt: &DataType) -> bool {
     }
 }
 
-fn paimon_scan_error(error: paimon::Error) -> DataFusionError {
+pub(crate) fn paimon_scan_error(error: paimon::Error) -> DataFusionError {
     if matches!(error, paimon::Error::Unsupported { .. }) {
         DataFusionError::NotImplemented(error.to_string())
     } else {
