@@ -109,6 +109,19 @@ fn run_local_and_resume_two_parquet_splits() -> Result<()> {
 
 #[test]
 fn stateless_worker_receipts_and_partial_resume() -> Result<()> {
+    let counters = [
+        ("input_tokens", 11, 23),
+        ("output_tokens", 7, 13),
+        ("llm_requests", 2, 5),
+        ("llm_retries", 1, 3),
+    ];
+    let first_usage = json!({
+        "qwen-openai": {"input_tokens": 11, "output_tokens": 7, "requests": 2}
+    });
+    let second_usage = json!({
+        "qwen-openai": {"input_tokens": 5, "output_tokens": 3, "requests": 1},
+        "gpt-gateway": {"input_tokens": 18, "output_tokens": 10, "requests": 4}
+    });
     let dir = tempdir()?;
     let input = dir.path().join("input");
     let root = dir.path().join("output");
@@ -147,7 +160,7 @@ fn stateless_worker_receipts_and_partial_resume() -> Result<()> {
         ))
     };
     let result = run_split("0", "2")?;
-    let receipt: Value = serde_json::from_slice(&result)?;
+    let mut receipt: Value = serde_json::from_slice(&result)?;
     assert_eq!(receipt["metrics"]["output_rows"], 1);
     assert_eq!(receipt["artifact"]["attempt_id"], 2);
     assert!(receipt.get("batches").is_none());
@@ -158,7 +171,12 @@ fn stateless_worker_receipts_and_partial_resume() -> Result<()> {
             .join(artifact_path)
             .is_file()
     );
-    fs::write(&receipt_file, result)?;
+    for (name, first, _) in counters {
+        assert_eq!(receipt["metrics"][name], 0);
+        receipt["metrics"][name] = json!(first);
+    }
+    receipt["metrics"]["llm_usage_by_provider"] = first_usage.clone();
+    fs::write(&receipt_file, serde_json::to_vec(&receipt)?)?;
     let commit = || -> Result<()> {
         successful(
             worker()
@@ -174,6 +192,13 @@ fn stateless_worker_receipts_and_partial_resume() -> Result<()> {
         Ok(())
     };
     commit()?;
+    for (name, _, _) in counters {
+        receipt["metrics"].as_object_mut().unwrap().remove(name);
+    }
+    receipt["metrics"]
+        .as_object_mut()
+        .unwrap()
+        .remove("llm_usage_by_provider");
     let mut replay = worker()
         .arg("commit-split")
         .arg("--job")
@@ -185,7 +210,7 @@ fn stateless_worker_receipts_and_partial_resume() -> Result<()> {
         .stdin
         .take()
         .unwrap()
-        .write_all(&fs::read(&receipt_file)?)?;
+        .write_all(&serde_json::to_vec(&receipt)?)?;
     successful(replay.wait_with_output()?);
     run_split("1", "3")?;
     let resumed = plan()?;
@@ -203,7 +228,12 @@ fn stateless_worker_receipts_and_partial_resume() -> Result<()> {
         .output()?;
     assert!(!unfinished.status.success());
     assert!(String::from_utf8_lossy(&unfinished.stderr).contains("not committed"));
-    fs::write(&receipt_file, run_split("1", "4")?)?;
+    let mut receipt: Value = serde_json::from_slice(&run_split("1", "4")?)?;
+    for (name, _, second) in counters {
+        receipt["metrics"][name] = json!(second);
+    }
+    receipt["metrics"]["llm_usage_by_provider"] = second_usage.clone();
+    fs::write(&receipt_file, serde_json::to_vec(&receipt)?)?;
     commit()?;
     let finalized = successful(
         worker()
@@ -216,6 +246,49 @@ fn stateless_worker_receipts_and_partial_resume() -> Result<()> {
     assert_eq!(manifest["output_rows"], 2);
     assert_eq!(manifest["splits"][0]["winning_attempt_id"], 2);
     assert_eq!(manifest["splits"][1]["winning_attempt_id"], 4);
+    for (name, first, second) in counters {
+        assert_eq!(manifest["splits"][0]["metrics"][name], first);
+        assert_eq!(manifest["splits"][1]["metrics"][name], second);
+        assert_eq!(manifest[name], first + second);
+    }
+    assert_eq!(
+        manifest["splits"][0]["metrics"]["llm_usage_by_provider"],
+        first_usage
+    );
+    assert_eq!(
+        manifest["splits"][1]["metrics"]["llm_usage_by_provider"],
+        second_usage
+    );
+    let usage = &manifest["llm_usage_by_provider"];
+    assert_eq!(
+        usage,
+        &json!({
+            "qwen-openai": {"input_tokens": 16, "output_tokens": 10, "requests": 3},
+            "gpt-gateway": {"input_tokens": 18, "output_tokens": 10, "requests": 4}
+        })
+    );
+    for (field, total) in [
+        ("input_tokens", "input_tokens"),
+        ("output_tokens", "output_tokens"),
+        ("requests", "llm_requests"),
+    ] {
+        let sum: u64 = usage
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|provider| provider[field].as_u64().unwrap())
+            .sum();
+        assert_eq!(manifest[total], sum);
+    }
+    let manifest_path = root
+        .join("stages")
+        .join(stage.as_str().unwrap())
+        .join("STAGE_MANIFEST.json");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(manifest_path)?)?,
+        manifest
+    );
+    assert_eq!(plan()?["pending_splits"], json!([]));
     Ok(())
 }
 
@@ -291,10 +364,13 @@ fn ai_cli_plans_and_runs_with_runtime_mock() -> Result<()> {
             .env("DF_DIST_LLM_BACKEND", "mock")
             .output()?,
     );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&receipt)?["metrics"]["submitted_prompts"],
-        1
-    );
+    let receipt: Value = serde_json::from_slice(&receipt)?;
+    let metrics = &receipt["metrics"];
+    assert_eq!(metrics["submitted_prompts"], 1);
+    assert_eq!(metrics["llm_requests"], 1);
+    assert_eq!(metrics["llm_retries"], 0);
+    assert_eq!(metrics["input_tokens"], 0);
+    assert_eq!(metrics["output_tokens"], 0);
     Ok(())
 }
 
@@ -324,6 +400,23 @@ fn s3_inputs_and_outputs_require_s3_feature() -> Result<()> {
         );
         assert!(!job.exists());
     }
+    Ok(())
+}
+
+#[cfg(not(feature = "ai-http"))]
+#[test]
+fn named_providers_require_ai_http() -> Result<()> {
+    let dir = tempdir()?;
+    let output = worker()
+        .args(["plan", "--sql", "SELECT id FROM t", "--table", "t=unused.parquet", "--out"])
+        .arg(dir.path().join("job.json"))
+        .env("DF_DIST_LLM_PROVIDERS", r#"{"p":{"base_url":"https://provider.invalid/v1","api_key_env":"TEST_KEY"}}"#)
+        .output()?;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("DF_DIST_LLM_PROVIDERS requires the ai-http feature")
+    );
     Ok(())
 }
 

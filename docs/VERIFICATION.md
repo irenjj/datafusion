@@ -67,7 +67,29 @@ Each route retrieves up to `k` indexed candidates. Fusion uses one-based ranks a
 
 Use an output root dedicated to a job. On restart reuse its SQL, input inventory and `--row-key` (`--df.split_row_key`). The worker supports filesystem paths by default. Enable `--features s3` for `s3://bucket/key` URLs. End an S3 input prefix with `/` to read multiple files. Paths must be accessible to every worker, for example on a shared filesystem. Use the runtime `AWS_*` environment for S3. Enable `--features ai` for the mock backend. Enable `--features ai-http` to select `DF_DIST_LLM_BACKEND=openai`. `DF_DIST_LLM_PROVIDER` selects the provider name, and `OPENAI_BASE_URL`, `OPENAI_API_KEY` and optional `OPENAI_CA_CERT_FILE` configure the HTTP backend at runtime. Set `OPENAI_CA_CERT_FILE` to a PEM file on the planner and workers when the endpoint uses a custom CA.
 
+With `--features ai-http`, set `DF_DIST_LLM_PROVIDERS` to a JSON object mapping provider names to HTTP settings. This selects the named configuration ahead of the single-provider environment settings.
+
+```bash
+export DF_DIST_LLM_PROVIDERS='{
+  "qwen-openai": {
+    "base_url": "https://chat.example.com/v1",
+    "api_key_env": "DF_LLM_KEY_QWEN_OPENAI"
+  },
+  "gpt-gateway": {
+    "base_url": "https://embed.example.com/v1",
+    "api_key_env": "DF_LLM_KEY_GPT_GATEWAY"
+  }
+}'
+export DF_DIST_LLM_PROVIDER=qwen-openai
+```
+
+Supply each API key through its named environment variable. The JSON contains variable names and endpoint configuration. An optional `ca_cert_env` names a variable containing PEM text or the path to a PEM file on the coordinator and workers. For the single-provider setup, `OPENAI_CA_CERT_PEM` supplies PEM text directly and takes precedence over `OPENAI_CA_CERT_FILE`. The backend validates the key at startup and reads it for each request.
+
+In one SQL statement, use `"provider":"qwen-openai"` in the options for `llm()` or `vlm()`, and `"provider":"gpt-gateway"` in the options for `embed()`. Calls that omit `provider` use the name in `DF_DIST_LLM_PROVIDER` or the provider named `default` if that variable is unset. When the map has no `default` entry and no default name is configured, supply the provider name in each call.
+
 The `df.llm.exec` v2 codec carries the Chat, Embed or Vision task kind and the Vision media expression. Workers resolve media URIs and `df.media_ref` ranges through their session's object store registry. v2 workers can decode v1 Chat jobs. Deploy v2 workers before submitting v2 plans.
+
+For a custom HTTP S3 endpoint, set `AWS_ENDPOINT`, `AWS_ALLOW_HTTP=true`, `AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false` and `AWS_REGION`. Supply credentials through the AWS runtime environment. Input and output URLs each select their own bucket.
 
 ```bash
 dist-worker run-local --sql 'SELECT id FROM input' --table input=/shared/input --output-root /shared/out
@@ -82,7 +104,30 @@ python3 datafusion/dist/python/ray_driver.py --worker dist-worker --ray-address 
   --sql 'SELECT id FROM input' --table input=/shared/input --job stage-job.json --output-root /shared/out
 ```
 
+Run the driver on the Ray head to use the cluster's Python and Ray versions. On the `ray-vlm` head the driver runs with Python 3.10.18 and Ray 2.47.1. Copy only the driver script to the head and stream the worker environment from the caller's stdin.
+
+```bash
+kubectl -n ray-vlm cp datafusion/dist/python/ray_driver.py vlm-head-tfczb:/tmp/ray_driver.py -c ray-head
+kubectl -n ray-vlm exec -i vlm-head-tfczb -c ray-head -- \\
+  python3 -B /tmp/ray_driver.py --ray-address auto --secrets-stdin \\
+  --worker s3://artifacts/dist-worker --sql 'SELECT id FROM input' \\
+  --table input=s3://datasets/input/ --job /tmp/stage-job.json \\
+  --output-root s3://results/df-dist-run < /tmp/secrets.json
+```
+
+With `--ray-address auto` or no address, the driver calls `ray.init()`. Ray Client addresses such as `ray://head:10001` require matching Ray versions and matching Python major and minor versions. For example, Python 3.12 cannot connect as a Ray Client to Python 3.10. HTTP dashboard addresses belong to `ray job submit --address http://head:8265`, whose entrypoint can run the driver with `--ray-address auto`.
+
+The input is one JSON object mapping environment names to strings. Include the worker's S3 settings, provider configuration, credential values, and any CA variables. Use `--secrets-file PATH` with a regular `0600` file as an alternative to `--secrets-stdin`. In Ray Jobs mode the file must be available to the coordinator outside the submitted working directory. With neither option, the driver can collect recognized worker settings from its existing environment.
+
+The driver puts the environment object into Ray's object store before planning. The coordinator and tasks use it in their child process environments. The task decorator omits `runtime_env` because Ray's agent can log it at INFO level. Keep credentials out of the job submission runtime environment as well. Stage jobs carry plans and store locations. Data in the Ray object store is subject to the cluster's access and object spilling configuration.
+
+For a shared worker binary, pass its local path or command name. With `--worker s3://bucket/key`, both the coordinator and each task download the executable into a temporary directory using boto3 first and the AWS CLI as a fallback. The binary must run on both the coordinator and worker nodes.
+
 `plan` writes the complete inventory and a `pending_splits` list of split and first-attempt IDs. Use the `pending_splits` list when resuming. The driver checks attempt IDs before publication. Each accepted receipt names immutable files and carries byte counts, row counts and hashes. The sink streams the full candidate files to verify their hashes during commit and also reads an existing winner before accepting it. It validates the marker identity and file presence during resume and finalization. `COMMITTED.json` selects the first durable winner per split. Later attempts accept that winner after verification, even if their output differs. `STAGE_MANIFEST.json` lists those winners in split ID order. Read the Parquet files named by the manifest.
+
+Worker receipts carry `input_tokens`, `output_tokens`, `llm_requests` and `llm_retries` under `metrics`. Token counts use the usage reported by the provider for successful responses. A response without usage contributes zero tokens. Requests count backend attempts, including retries. The manifest keeps the counters under each winning split's `metrics` and sums them at the top level. Older receipts and checkpoints default missing usage counters to zero.
+
+`llm_usage_by_provider` records `input_tokens`, `output_tokens` and `requests` by resolved provider name in split metrics and in the stage manifest. The stage map merges winning splits. Older checkpoints without the map still contribute their aggregate counters. In a stage resumed from those checkpoints, provider totals cover the splits that recorded provider attribution. Provider names use ASCII letters, digits, underscores, periods or hyphens.
 
 `df.ai_error` columns require an explicit non-null output row key. A row with any failed envelope is routed to the DLQ, with one entry per failed column and stable ordering by row key and column name. A successful row retains the Arrow value type. The Python suite uses an injected executor and requires neither Ray nor a network connection.
 

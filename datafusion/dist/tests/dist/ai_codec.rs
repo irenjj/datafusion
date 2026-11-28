@@ -138,10 +138,7 @@ async fn llm_splits_match_local_results_and_isolate_retry_metrics() -> Result<()
         let output = prepared.execute_lease(&queue, &split, &token).await?;
         if split.split_id == first_split.split_id {
             assert_eq!(output.attempt_id, 1);
-            assert_eq!(
-                output.metrics.submitted_prompts,
-                first.metrics.submitted_prompts
-            );
+            assert_eq!(output.metrics, first.metrics);
             assert_eq!(rows(&output.batches)?, rows(&first.batches)?);
         } else {
             assert_eq!(output.attempt_id, 0);
@@ -150,6 +147,13 @@ async fn llm_splits_match_local_results_and_isolate_retry_metrics() -> Result<()
             output.metrics.output_rows,
             2 * output.metrics.submitted_prompts
         );
+        assert!(output.metrics.llm_requests > 0);
+        assert_eq!(output.metrics.llm_retries, 0);
+        let usage = &output.metrics.llm_usage_by_provider;
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage["offline"].requests, output.metrics.llm_requests);
+        assert_eq!(usage["offline"].input_tokens, output.metrics.input_tokens);
+        assert_eq!(usage["offline"].output_tokens, output.metrics.output_tokens);
         assert_eq!(queue.commit(&token, output)?, CommitOutcome::Committed);
     }
     let outputs = take_outputs(queue)?;
@@ -160,6 +164,7 @@ async fn llm_splits_match_local_results_and_isolate_retry_metrics() -> Result<()
     prompt_counts.sort_unstable();
     assert_eq!(prompt_counts, [1, 3]);
     assert_eq!(metric(decoded, "submitted_prompts"), 0);
+    assert_eq!(metric(decoded, "llm_requests"), 0);
     assert_matches_single_node(&stage, llm.schema().as_ref(), &baseline, &outputs)
 }
 

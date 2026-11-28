@@ -10,10 +10,29 @@ from contextlib import suppress
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
+import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 import time
+from urllib.parse import unquote, urlsplit
+
+
+_AWS_ENV = {
+    "AWS_ENDPOINT", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3",
+    "AWS_ALLOW_HTTP", "AWS_VIRTUAL_HOSTED_STYLE_REQUEST",
+    "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_BUCKET",
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+}
+_WORKER_ENV = _AWS_ENV | {
+    "OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_CA_CERT_FILE", "OPENAI_CA_CERT_PEM",
+    "DF_DIST_LLM_PROVIDERS", "DF_DIST_LLM_PROVIDER", "DF_DIST_LLM_BACKEND",
+}
 
 
 @dataclass(frozen=True)
@@ -96,32 +115,118 @@ def _cancel(executor, handle):
         executor.cancel(handle)
 
 
-def _invoke(executable, args, *, receipt=None, timeout=None):
-    result = subprocess.run(
-        [executable, *args],
-        input=None if receipt is None else json.dumps(receipt),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    if result.returncode:
-        raise RuntimeError(
-            f"dist-worker {args[0]} exited {result.returncode}: {result.stderr.strip()}"
+def _invoke(executable, args, *, payload, receipt=None, timeout=None):
+    try:
+        result = subprocess.run(
+            [executable, *args],
+            env={**os.environ, **payload},
+            input=None if receipt is None else json.dumps(receipt),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
         )
-    return json.loads(result.stdout) if result.stdout.strip() else None
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"dist-worker {args[0]} timed out") from None
+    if result.returncode:
+        detail = result.stderr
+        for secret in sorted(set(payload.values()), key=len, reverse=True):
+            if secret:
+                detail = detail.replace(secret, "[redacted]")
+        raise RuntimeError(f"dist-worker {args[0]} exited {result.returncode}: {detail.strip()}")
+    try:
+        return json.loads(result.stdout) if result.stdout.strip() else None
+    except ValueError:
+        raise RuntimeError(f"dist-worker {args[0]} returned invalid JSON") from None
+
+
+def _s3_worker_location(worker):
+    worker = os.fspath(worker)
+    if not worker.startswith("s3://"):
+        return None
+    uri = urlsplit(worker)
+    key = unquote(uri.path[1:])
+    if (not uri.netloc or not key or "@" in uri.netloc or ":" in uri.netloc
+            or uri.query or uri.fragment):
+        raise ValueError("--worker expects an S3 object URI (s3://bucket/key)")
+    return uri.netloc, key
+
+
+def _download_worker(bucket, key, path, env):
+    endpoint = (env.get("AWS_ENDPOINT_URL_S3")
+                or env.get("AWS_ENDPOINT_URL")
+                or env.get("AWS_ENDPOINT"))
+    region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION")
+    try:
+        import boto3
+        from botocore.config import Config
+    except ImportError as error:
+        aws = shutil.which("aws")
+        if aws is None:
+            raise RuntimeError(
+                "An S3 --worker requires boto3 or the AWS CLI on the coordinator "
+                "and Ray workers"
+            ) from error
+        args = [aws, "s3", "cp", f"s3://{bucket}/{key}", str(path), "--only-show-errors"]
+        if endpoint:
+            args.extend(("--endpoint-url", endpoint))
+        if region:
+            args.extend(("--region", region))
+        try:
+            subprocess.run(args, check=True, env=env, capture_output=True)
+        except subprocess.CalledProcessError:
+            raise RuntimeError("AWS CLI could not download the S3 worker") from None
+    else:
+        virtual_host = env.get("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "").lower()
+        config = None
+        if virtual_host in ("true", "false"):
+            style = "virtual" if virtual_host == "true" else "path"
+            config = Config(s3={"addressing_style": style})
+        credentials = {
+            option: env[var] for option, var in (
+                ("aws_access_key_id", "AWS_ACCESS_KEY_ID"),
+                ("aws_secret_access_key", "AWS_SECRET_ACCESS_KEY"),
+                ("aws_session_token", "AWS_SESSION_TOKEN"),
+            ) if var in env
+        }
+        try:
+            client = boto3.client(
+                "s3", endpoint_url=endpoint, region_name=region, config=config,
+                **credentials,
+            )
+            client.download_file(bucket, key, str(path))
+        except Exception:
+            raise RuntimeError("boto3 could not download the S3 worker") from None
+
+
+def _worker_executable(worker, directory, payload):
+    location = _s3_worker_location(worker)
+    if location is None:
+        return worker
+    bucket, key = location
+    target = Path(directory) / "dist-worker"
+    _download_worker(bucket, key, target, {
+        **{name: value for name, value in os.environ.items() if name not in payload},
+        **{name: value for name, value in payload.items() if name in _AWS_ENV},
+    })
+    target.chmod(0o700)
+    return str(target)
 
 
 class WorkerCli:
     """Adapter for the worker's serde JSON and Parquet artifact protocol."""
 
-    def __init__(self, executable, sql, tables, job_path, output_root, row_key=None):
+    def __init__(self, executable, sql, tables, job_path, output_root, row_key=None,
+                 *, local_executable=None, payload=None):
         self.executable = executable
+        self.local_executable = local_executable or executable
         self.sql = sql
         self.tables = tables
         self.job_path = Path(job_path)
         self.output_root = output_root
         self.row_key = row_key
+        self.payload = payload or {}
 
     def plan(self):
         args = ["plan", "--sql", self.sql, "--out", str(self.job_path),
@@ -130,14 +235,16 @@ class WorkerCli:
             args.extend(("--table", table))
         if self.row_key is not None:
             args.extend(("--row-key", self.row_key))
-        _invoke(self.executable, args)
+        _invoke(self.local_executable, args, payload=self.payload)
         return json.loads(self.job_path.read_bytes())
 
     def commit(self, receipt):
-        _invoke(self.executable, ["commit-split", "--job", str(self.job_path)], receipt=receipt)
+        _invoke(self.local_executable, ["commit-split", "--job", str(self.job_path)],
+                receipt=receipt, payload=self.payload)
 
     def finalize(self):
-        return _invoke(self.executable, ["finalize-stage", "--job", str(self.job_path)])
+        return _invoke(self.local_executable, ["finalize-stage", "--job", str(self.job_path)],
+                       payload=self.payload)
 
 
 class RayExecutor:
@@ -146,30 +253,48 @@ class RayExecutor:
     def __init__(self, worker, timeout, address=None):
         import ray
 
+        _validate_ray_address(address)
         if not ray.is_initialized():
-            ray.init(address=address)
+            if address in (None, "auto"):
+                ray.init()
+            else:
+                try:
+                    ray.init(address=address)
+                except RuntimeError as error:
+                    if address.startswith("ray://") and str(error).startswith("Version mismatch:"):
+                        raise ValueError(
+                            f"{error}\nRay Client requires matching Ray and Python major.minor "
+                            "versions. Run the driver on the head with --ray-address auto."
+                        ) from None
+                    raise
         self._ray = ray
-        self._job = ray.put(worker.job_path.read_bytes())
+        self._payload = ray.put(worker.payload)
+        self._job_path = worker.job_path
+        self._job = None
         self._worker = worker.executable
         self._timeout = timeout
-
         @ray.remote(num_cpus=1, max_retries=0)
-        def run_split(executable, job, split_id, attempt_id, timeout):
+        def run_split(executable, job, payload_refs, split_id, attempt_id, timeout):
+            # Ray dereferences top-level task arguments before executing the task.
+            payload = ray.get(payload_refs[0])
             with tempfile.TemporaryDirectory(prefix="dist-worker-") as directory:
                 path = Path(directory) / "stage-job.json"
                 path.write_bytes(job)
                 return _invoke(
-                    executable,
+                    _worker_executable(executable, directory, payload),
                     ["run-split", "--job", str(path), "--split-id", str(split_id),
                      "--attempt-id", str(attempt_id)],
                     timeout=timeout,
+                    payload=payload,
                 )
 
         self._run_split = run_split
 
     def submit(self, split_id, attempt_id):
+        if self._job is None:
+            self._job = self._ray.put(self._job_path.read_bytes())
         return self._run_split.remote(
-            self._worker, self._job, split_id, attempt_id, self._timeout
+            self._worker, self._job, (self._payload,), split_id, attempt_id, self._timeout
         )
 
     def wait(self, handles, timeout):
@@ -186,28 +311,87 @@ class RayExecutor:
         self._ray.cancel(handle)
 
 
+def _validate_ray_address(address):
+    if address and address.lower().startswith(("http://", "https://")):
+        raise ValueError("Use a ray:// client address or submit a Ray Job to the HTTP dashboard")
+
+
+def _read_payload(stream):
+    try:
+        payload = json.load(stream)
+    except (UnicodeError, ValueError):
+        raise ValueError("Expected one JSON object of environment names and string values") from None
+    if not isinstance(payload, dict) or not all(
+            name and "=" not in name and "\0" not in name
+            and isinstance(value, str) and "\0" not in value
+            for name, value in payload.items()):
+        raise ValueError("Expected one JSON object of environment names and string values")
+    return payload
+
+
+def _read_secrets_file(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, encoding="utf-8") as stream:
+            mode = os.fstat(stream.fileno()).st_mode
+            if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+                raise ValueError("--secrets-file must be a regular file with permissions 0600")
+            return _read_payload(stream)
+    except OSError:
+        raise ValueError("Could not open or read --secrets-file") from None
+
+
+def _inherited_payload():
+    names = set(_WORKER_ENV)
+    with suppress(ValueError, AttributeError):
+        for config in json.loads(os.environ.get("DF_DIST_LLM_PROVIDERS", "{}")).values():
+            for field in ("api_key_env", "ca_cert_env"):
+                name = config.get(field)
+                if isinstance(name, str):
+                    names.add(name)
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--worker", default="dist-worker")
+    parser.add_argument(
+        "--worker", default="dist-worker", help="Local executable or s3://bucket/key",
+    )
     parser.add_argument("--sql", required=True)
     parser.add_argument("--table", action="append", required=True)
     parser.add_argument("--job", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--row-key")
     parser.add_argument("--ray-address")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--secrets-stdin", action="store_true", help="Read the worker environment JSON from stdin")
+    source.add_argument("--secrets-file", type=Path, help="Read the worker environment JSON from a 0600 file")
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--max-attempts", type=int, default=3)
     args = parser.parse_args()
-    worker = WorkerCli(args.worker, args.sql, args.table, args.job,
-                       args.output_root, args.row_key)
-    print(json.dumps(drive(
-        worker,
-        lambda: RayExecutor(worker, args.timeout, args.ray_address),
-        timeout=args.timeout,
-        concurrency=args.concurrency,
-        max_attempts=args.max_attempts,
-    )))
+    with tempfile.TemporaryDirectory(prefix="dist-coordinator-") as directory:
+        try:
+            _validate_ray_address(args.ray_address)
+            if args.secrets_stdin:
+                payload = _read_payload(sys.stdin)
+            elif args.secrets_file:
+                payload = _read_secrets_file(args.secrets_file)
+            else:
+                payload = _inherited_payload()
+            worker = WorkerCli(args.worker, args.sql, args.table, args.job,
+                               args.output_root, args.row_key, payload=payload)
+            executor = RayExecutor(worker, args.timeout, args.ray_address)
+        except ValueError as error:
+            parser.error(str(error))
+        worker.local_executable = _worker_executable(args.worker, directory, payload)
+        print(json.dumps(drive(
+            worker,
+            lambda: executor,
+            timeout=args.timeout,
+            concurrency=args.concurrency,
+            max_attempts=args.max_attempts,
+        )))
 
 
 if __name__ == "__main__":

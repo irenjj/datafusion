@@ -290,6 +290,119 @@ async fn multimodal_parquet_outputs_match_single_node_and_resume() -> Result<()>
 
 #[cfg(feature = "ai-http")]
 #[test]
+fn named_providers_plan_together_and_select_the_configured_default() -> Result<()> {
+    let dir = tempdir()?;
+    let input = dir.path().join("input");
+    write_inputs(&input, &dir.path().join("assets"))?;
+    let job = dir.path().join("job.json");
+    let sql = r#"SELECT
+        llm(prompt, 'chat', '{"provider":"qwen-openai"}') AS chat,
+        vlm(prompt, image_uri, 'vision', '{"provider":"qwen-openai"}') AS vision,
+        embed(prompt, 'qwen3.7-text-embedding', '{"provider":"gpt-gateway","dimension":1024}') AS embedding,
+        llm(prompt, 'implicit', '{}') AS implicit
+        FROM t"#;
+    let command = || {
+        let mut cmd = worker();
+        cmd.args(["plan", "--sql", sql, "--table"])
+            .arg(format!("t={}", input.display()))
+            .arg("--out")
+            .arg(&job)
+            .env("DF_DIST_LLM_BACKEND", "legacy-backend-is-ignored")
+            .env(
+                "DF_DIST_LLM_PROVIDERS",
+                r#"{
+                    "qwen-openai":{"base_url":"https://qwen.invalid/v1","api_key_env":"DF_LLM_KEY_QWEN_OPENAI"},
+                    "gpt-gateway":{"base_url":"https://embed.invalid/v1","api_key_env":"DF_LLM_KEY_GPT_GATEWAY"}
+                }"#,
+            )
+            .env("DF_LLM_KEY_QWEN_OPENAI", "fixture-chat-credential")
+            .env("DF_LLM_KEY_GPT_GATEWAY", "fixture-embed-credential")
+            .env_remove("DF_DIST_LLM_PROVIDER");
+        cmd
+    };
+    let error = command().output()?;
+    assert!(!error.status.success());
+    assert!(
+        String::from_utf8_lossy(&error.stderr).contains("Unknown llm provider 'default'")
+    );
+
+    successful(
+        command()
+            .env("DF_DIST_LLM_PROVIDER", "qwen-openai")
+            .output()?,
+    );
+    let bytes = fs::read(&job)?;
+    let job_json: Value = serde_json::from_slice(&bytes)?;
+    let plan: Vec<u8> = serde_json::from_value(job_json["stage"]["plan_bytes"].clone())?;
+    for payload in [&bytes, &plan] {
+        let payload = String::from_utf8_lossy(payload);
+        for secret in [
+            "fixture-chat-credential",
+            "fixture-embed-credential",
+            "DF_LLM_KEY_QWEN_OPENAI",
+            "DF_LLM_KEY_GPT_GATEWAY",
+        ] {
+            assert!(!payload.contains(secret));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ai-http")]
+#[test]
+fn invalid_named_provider_settings_are_redacted() -> Result<()> {
+    let dir = tempdir()?;
+    let job = dir.path().join("job.json");
+    for (config, expected) in [
+        ("raw-secret-marker", "Invalid DF_DIST_LLM_PROVIDERS JSON"),
+        (
+            r#"{" ":{"base_url":"https://raw-secret-marker.invalid/v1","api_key_env":"DF_LLM_KEY_CONFIG_TEST"}}"#,
+            "non-empty provider name",
+        ),
+        (
+            r#"{"p":{"base_url":"ftp://raw-secret-marker.invalid/v1","api_key_env":"DF_LLM_KEY_CONFIG_TEST"}}"#,
+            "http:// or https://",
+        ),
+        (
+            r#"{"p":{"base_url":"https://qwen.invalid/v1","api_key_env":"DF_LLM_KEY_MISSING","ca_cert_env":"DF_LLM_CA_NOT_EXPORTED"}}"#,
+            "DF_LLM_KEY_MISSING",
+        ),
+        (
+            r#"{"p":{"base_url":"https://qwen.invalid/v1","api_key_env":"DF_LLM_KEY_CONFIG_TEST","ca_cert_env":"DF_LLM_CA_NOT_EXPORTED"}}"#,
+            "DF_LLM_CA_NOT_EXPORTED",
+        ),
+        (
+            r#"{"p":{"base_url":"https://qwen.invalid/v1","api_key_env":"DF_LLM_KEY_CONFIG_TEST","api_key":"raw-secret-marker"}}"#,
+            "Invalid DF_DIST_LLM_PROVIDERS JSON",
+        ),
+    ] {
+        let output = worker()
+            .args([
+                "plan",
+                "--sql",
+                "SELECT id FROM t",
+                "--table",
+                "t=unused.parquet",
+                "--out",
+            ])
+            .arg(&job)
+            .env("DF_DIST_LLM_PROVIDERS", config)
+            .env("DF_LLM_KEY_CONFIG_TEST", "raw-secret-marker")
+            .env_remove("DF_LLM_KEY_MISSING")
+            .env_remove("DF_LLM_CA_NOT_EXPORTED")
+            .env_remove("DF_DIST_LLM_PROVIDER")
+            .output()?;
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("raw-secret-marker"), "{error}");
+        assert!(!job.exists());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ai-http")]
+#[test]
 fn openai_ca_cert_is_loaded_at_runtime_and_kept_out_of_the_job() -> Result<()> {
     let ca_pem = "-----BEGIN CERTIFICATE-----
 MIIBjDCCATOgAwIBAgIUOm49mAs56opfNl4QYglVAoRyKBswCgYIKoZIzj0EAwIw
@@ -322,6 +435,7 @@ Nd3AeiouMgQrDh1/NJXdEw==
         .env("DF_DIST_LLM_BACKEND", "openai")
         .env("OPENAI_BASE_URL", "https://127.0.0.1:1/v1")
         .env_remove("OPENAI_CA_CERT_FILE")
+        .env_remove("OPENAI_CA_CERT_PEM")
         .env_remove("OPENAI_API_KEY");
         cmd
     };
@@ -331,6 +445,21 @@ Nd3AeiouMgQrDh1/NJXdEw==
     successful(command().env("OPENAI_CA_CERT_FILE", &ca_file).output()?);
     let with_ca: Value = serde_json::from_slice(&fs::read(&job)?)?;
     assert_eq!(with_ca, without_ca);
+    successful(command().env("OPENAI_CA_CERT_PEM", ca_pem).output()?);
+    let inline_ca: Value = serde_json::from_slice(&fs::read(&job)?)?;
+    assert_eq!(inline_ca, without_ca);
+    successful(
+        command()
+            .env(
+                "DF_DIST_LLM_PROVIDERS",
+                r#"{"default":{"base_url":"https://127.0.0.1:1/v1","api_key_env":"TEST_CA_KEY","ca_cert_env":"TEST_CA_PEM"}}"#,
+            )
+            .env("TEST_CA_KEY", "fixture-key")
+            .env("TEST_CA_PEM", ca_pem)
+            .output()?,
+    );
+    let named_ca: Value = serde_json::from_slice(&fs::read(&job)?)?;
+    assert_eq!(named_ca, without_ca);
 
     fs::write(&ca_file, "invalid CA")?;
     let output = command().env("OPENAI_CA_CERT_FILE", &ca_file).output()?;

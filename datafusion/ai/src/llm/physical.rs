@@ -269,8 +269,13 @@ impl LlmExec {
         }
         let (options, canonical_options_json) = LlmOptions::parse(options_json)?;
         let output_field = options.output_field(kind, &output_col)?;
-        let provider = registry.resolve(options.provider.as_deref())?;
-        let dispatch = Dispatch::try_new(model, options, kind, provider)?;
+        let provider_name = options
+            .provider
+            .as_deref()
+            .unwrap_or_else(|| registry.default_name())
+            .to_owned();
+        let provider = registry.resolve(Some(&provider_name))?;
+        let dispatch = Dispatch::try_new(model, options, kind, provider, provider_name)?;
         Ok(Self::new(
             input,
             prompt,
@@ -547,7 +552,7 @@ impl ExecutionPlan for LlmExec {
             Arc::clone(&self.prompt),
             self.media.clone(),
             Arc::clone(&self.dispatch),
-            LlmMetrics::new(&self.metrics, partition),
+            LlmMetrics::new(&self.metrics, partition, &self.dispatch.provider_name),
         )))
     }
 }

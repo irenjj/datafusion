@@ -304,6 +304,7 @@ impl Debug for RegisteredProvider {
 #[derive(Debug, Clone)]
 pub struct LlmProviderRegistry {
     providers: Arc<RwLock<HashMap<String, RegisteredProvider>>>,
+    default_provider: Arc<str>,
 }
 
 impl Default for LlmProviderRegistry {
@@ -316,12 +317,29 @@ impl Default for LlmProviderRegistry {
                     limit: None,
                 },
             )]))),
+            default_provider: Arc::from("default"),
         }
     }
 }
 
 impl LlmProviderRegistry {
+    /// Creates an empty registry and selects the name used for unnamed requests.
+    ///
+    /// # Public Only for Internal Use:
+    ///
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn empty_with_default(name: impl Into<Arc<str>>) -> Self {
+        Self {
+            providers: Arc::default(),
+            default_provider: name.into(),
+        }
+    }
+
     /// Registers or replaces a backend without a provider-wide concurrency cap.
+    /// Names must be nonempty and contain only ASCII letters, digits, `_`, `.`, or `-`.
     pub fn register(
         &self,
         name: impl Into<String>,
@@ -332,6 +350,7 @@ impl LlmProviderRegistry {
 
     /// Registers or replaces a backend with a cap on concurrent requests shared
     /// across queries and partitions. A request holds its slot through retries.
+    /// The name must follow the same rules as [`Self::register`].
     pub fn register_with_limit(
         &self,
         name: impl Into<String>,
@@ -366,14 +385,25 @@ impl LlmProviderRegistry {
         if name.trim().is_empty() {
             return plan_err!("llm provider name must be non-empty");
         }
+        if !name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+        }) {
+            return plan_err!(
+                "llm provider name may contain only ASCII letters, digits, _, ., or -"
+            );
+        }
         self.providers
             .write()
             .insert(name, RegisteredProvider { backend, limit });
         Ok(())
     }
 
+    pub(super) fn default_name(&self) -> &str {
+        &self.default_provider
+    }
+
     pub(super) fn resolve(&self, name: Option<&str>) -> Result<RegisteredProvider> {
-        let name = name.unwrap_or("default");
+        let name = name.unwrap_or_else(|| self.default_name());
         self.providers
             .read()
             .get(name)

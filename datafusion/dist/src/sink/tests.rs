@@ -270,6 +270,113 @@ async fn resume_skips_committed_and_finalizes_in_split_order() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn resumes_legacy_checkpoints_and_manifest_with_zero_usage() -> Result<()> {
+    let fixture = Fixture::plain()?;
+    let split = fixture.split(0, 0);
+    let artifact = fixture.write(&split, vec![1]).await?;
+    fixture.sink.commit_split(&split, artifact).await?;
+    let splits = &[split];
+    let manifest = fixture.sink.finalize_stage(splits).await?;
+    let mut legacy = serde_json::to_value(&manifest).map_err(json_error)?;
+    for name in [
+        "input_tokens",
+        "output_tokens",
+        "llm_requests",
+        "llm_retries",
+        "llm_usage_by_provider",
+    ] {
+        legacy.as_object_mut().unwrap().remove(name);
+    }
+    legacy["splits"][0]["metrics"]
+        .as_object_mut()
+        .unwrap()
+        .remove("llm_usage_by_provider");
+    for include_metrics in [true, false] {
+        let checkpoint = &mut legacy["splits"][0];
+        if !include_metrics {
+            checkpoint.as_object_mut().unwrap().remove("metrics");
+        }
+        fixture
+            .store
+            .put(
+                &fixture.sink.checkpoint_path(&splits[0]),
+                json_bytes(checkpoint)?.into(),
+            )
+            .await?;
+        fixture
+            .store
+            .put(&fixture.object(MANIFEST_FILE), json_bytes(&legacy)?.into())
+            .await?;
+        assert!(fixture.sink.resume_filter(splits).await?.is_empty());
+        let decoded = fixture.sink.finalize_stage(splits).await?;
+        assert!(decoded.splits[0].metrics.llm_usage_by_provider.is_empty());
+        assert_eq!(decoded, manifest);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_rejects_overflowing_usage_total() -> Result<()> {
+    let fixture = Fixture::plain()?;
+    let splits = [fixture.split(0, 0), fixture.split(1, 0)];
+    for (split, input_tokens) in splits.iter().zip([usize::MAX, 1]) {
+        let artifact = fixture.write(split, vec![1]).await?;
+        let metrics = SplitMetrics {
+            input_tokens,
+            ..Default::default()
+        };
+        fixture
+            .sink
+            .commit_split_with_metrics(split, artifact, metrics)
+            .await?;
+    }
+    let error = fixture.sink.finalize_stage(&splits).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Stage input_tokens count overflow")
+    );
+    assert!(
+        fixture
+            .sink
+            .read_json::<StageManifest>(&fixture.object(MANIFEST_FILE))
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_rejects_overflowing_provider_usage() -> Result<()> {
+    let fixture = Fixture::plain()?;
+    let splits = [fixture.split(0, 0), fixture.split(1, 0)];
+    for (split, requests) in splits.iter().zip([usize::MAX, 1]) {
+        let artifact = fixture.write(split, vec![1]).await?;
+        let metrics = SplitMetrics {
+            llm_usage_by_provider: BTreeMap::from([(
+                "qwen-openai".into(),
+                ProviderUsage {
+                    requests,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        fixture
+            .sink
+            .commit_split_with_metrics(split, artifact, metrics)
+            .await?;
+    }
+    let error = fixture.sink.finalize_stage(&splits).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Stage provider 'qwen-openai' requests count overflow")
+    );
+    Ok(())
+}
+
 #[cfg(feature = "ai")]
 mod ai {
     use std::fmt;
