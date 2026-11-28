@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-use arrow::datatypes::DataType;
-use datafusion_common::{Result, plan_err};
+use arrow::datatypes::{DataType, Schema};
+use datafusion_common::{Result, plan_datafusion_err, plan_err};
+use serde::{Deserialize, Serialize};
 
 /// Read constraints checked when opening a lake table.
 ///
@@ -25,7 +26,8 @@ pub struct LakeTableOptions {
 /// This is not a public API and is for internal use only; see [API policy] for details.
 /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
 #[doc(hidden)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequiredIndexSpec {
     /// A vector index at the expected fixed width.
     Vector {
@@ -68,6 +70,14 @@ impl RequiredIndexSpec {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_column(&self, schema: &Schema) -> Result<()> {
+        let column = self.column();
+        let field = schema.field_with_name(column).map_err(|_| {
+            plan_datafusion_err!("Lake index column {column:?} does not exist")
+        })?;
+        self.validate_dimension(field.data_type())
     }
 }
 
