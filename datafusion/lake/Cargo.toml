@@ -51,7 +51,9 @@ datafusion-optimizer = { workspace = true }
 lance-file = { git = "https://github.com/irenjj/lance.git", rev = "d7774c85fd5416ea5e10f1b5fe861bda7a603672", default-features = false }
 lance-linalg = { git = "https://github.com/irenjj/lance.git", rev = "d7774c85fd5416ea5e10f1b5fe861bda7a603672", default-features = false }
 lance-table = { git = "https://github.com/irenjj/lance.git", rev = "d7774c85fd5416ea5e10f1b5fe861bda7a603672", default-features = false }
-lance-testing = { git = "https://github.com/irenjj/lance.git", rev = "d7774c85fd5416ea5e10f1b5fe861bda7a603672", default-features = false, features = ["datafusion"] }
+lance-testing = { git = "https://github.com/irenjj/lance.git", rev = "d7774c85fd5416ea5e10f1b5fe861bda7a603672", default-features = false, features = [
+    "datafusion",
+] }
 prost = { workspace = true }
 prost-types = "0.14"
 tempfile = { workspace = true }
