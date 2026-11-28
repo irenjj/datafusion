@@ -108,8 +108,7 @@ impl LakeSplitExt {
         payload: LakeSplitPayload,
         size: u64,
     ) -> Result<PartitionedFile> {
-        let digest = Sha256::digest(encode(&payload)?);
-        let split_id = hex::encode(digest);
+        let split_id = payload_id(&payload)?;
         let split = Self {
             version: 1,
             split_id: split_id.clone(),
@@ -162,6 +161,13 @@ impl LakeSplitExt {
         })?;
         split.validate_header()?;
         Ok(split)
+    }
+
+    pub(crate) fn validate_identity(&self) -> Result<()> {
+        if self.split_id != payload_id(&self.payload)? {
+            return plan_err!("Lake split_id does not match the SHA-256 of its payload");
+        }
+        Ok(())
     }
 
     fn validate_header(&self) -> Result<()> {
@@ -295,4 +301,8 @@ pub(crate) fn paimon_ranges(split: &DataSplit) -> Result<Option<Vec<InclusiveRow
 fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
     serde_json::to_vec(value)
         .map_err(|e| plan_datafusion_err!("Cannot encode lake split: {e}"))
+}
+
+fn payload_id(payload: &LakeSplitPayload) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(encode(payload)?)))
 }

@@ -17,26 +17,33 @@ use datafusion_common::{
     plan_err,
 };
 use datafusion_datasource::PartitionedFile;
+use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::utils::conjunction;
 use datafusion_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::ExecutionPlan;
 use futures::{TryStreamExt, stream::BoxStream};
 use paimon::arrow::build_read_arrow_schema;
+use paimon::catalog::Identifier;
 use paimon::io::{FileRead, InputFile};
 use paimon::spec::{
     BlobDescriptor, DataEvolutionIndexSourceMeta, DataType, FileKind, IndexManifest,
     Predicate, PredicateBuilder, Snapshot,
 };
+use paimon::table::{SchemaManager, SnapshotManager};
 use paimon::{DataSplit, ReadBuilder, RowRange, Table};
 use paimon_vindex_core::{diskann_io, io as ivfpq_io, ivfflat_io, ivfrq_io, ivfsq_io};
 use sha2::{Digest, Sha256};
 
+use crate::dist::LakeRuntimeConfig;
 use crate::filter;
 use crate::media::{external, media_array};
-use crate::scan::{LakeScan, make_batch, projected_schema, scan_plan};
+use crate::scan::{LakeScan, ScanHandle, make_batch, projected_schema, scan_plan};
 use crate::split::{LakeSplitExt, LakeSplitPayload, paimon_ranges, partition_key};
 use crate::validation::{LakeTableOptions, RequiredIndexSpec, blob_mime};
+
+type BlobColumns = Arc<HashMap<String, Option<String>>>;
 
 /// Read-only [`TableProvider`] for a pinned Paimon snapshot.
 ///
@@ -50,7 +57,7 @@ pub struct PaimonReadOnlyTable {
     table: Arc<Table>,
     snapshot_id: i64,
     schema: SchemaRef,
-    blobs: Arc<HashMap<String, Option<String>>>,
+    blobs: BlobColumns,
     required_indices: Vec<RequiredIndexSpec>,
 }
 
@@ -75,52 +82,18 @@ impl PaimonReadOnlyTable {
         }
         .map_err(|e| plan_datafusion_err!("Cannot open Paimon snapshot: {e}"))?
         .ok_or_else(|| plan_datafusion_err!("Paimon table has no readable snapshot"))?;
-        let table = table
-            .copy_with_resolved_snapshot(&snapshot)
-            .await
-            .map_err(|e| plan_datafusion_err!("Cannot load Paimon snapshot schema: {e}"))?
-            .copy_with_options(HashMap::from([
-                ("blob-as-descriptor".into(), "true".into()),
-                ("blob-view.resolve.enabled".into(), "false".into()),
-            ]));
+        let table = pin_table(&table, &snapshot).await?;
         if snapshot.id() <= 0 || snapshot_id.is_some_and(|id| id != snapshot.id()) {
             return plan_err!("Invalid Paimon snapshot identity {}", snapshot.id());
         }
-        let raw = build_read_arrow_schema(table.schema().fields()).map_err(|e| {
-            plan_datafusion_err!("Cannot convert Paimon snapshot schema: {e}")
-        })?;
-        let mut blobs = HashMap::new();
-        let fields = raw
-            .fields()
-            .iter()
-            .zip(table.schema().fields())
-            .map(|(arrow, paimon)| {
-                if matches!(paimon.data_type(), DataType::Blob(_)) {
-                    blobs.insert(
-                        arrow.name().clone(),
-                        blob_mime(
-                            arrow.name(),
-                            |key| arrow.metadata().get(key),
-                            |key| table.schema().options().get(key),
-                        )?,
-                    );
-                    Ok(Arc::new(MediaRefType::field(
-                        arrow.name(),
-                        arrow.is_nullable(),
-                    )?))
-                } else if contains_blob(paimon.data_type()) {
-                    not_impl_err!("Paimon nested blob column {:?}", arrow.name())
-                } else {
-                    Ok(Arc::clone(arrow))
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let raw = raw_schema(&table)?;
+        let (schema, blobs) = lake_schema(&table, &raw)?;
         validate_indices(&table, &snapshot, &raw, options).await?;
         Ok(Self {
             table: Arc::new(table),
             snapshot_id: snapshot.id(),
-            schema: Arc::new(Schema::new(fields)),
-            blobs: Arc::new(blobs),
+            schema,
+            blobs,
             required_indices: options.required_indices.clone(),
         })
     }
@@ -169,16 +142,35 @@ impl PaimonReadOnlyTable {
             .map_err(paimon_scan_error)?;
         let (files, planned) =
             split_files(self.table.location(), self.snapshot_id, plan.splits())?;
-        let scan = PaimonScan {
-            table: Arc::clone(&self.table),
-            snapshot_id: self.snapshot_id,
-            blobs: Arc::clone(&self.blobs),
-            columns: columns.into(),
-            predicate: None,
-            filter: None,
-            planned: Arc::new(planned),
-        };
+        let scan = self.local_scan(None, columns, None, None, planned);
         scan_plan(LakeScan::Paimon(scan), schema, None, files, None)
+    }
+
+    fn local_scan(
+        &self,
+        filter_expr: Option<Expr>,
+        columns: Vec<String>,
+        predicate: Option<Predicate>,
+        filter: Option<Arc<dyn PhysicalExpr>>,
+        planned: HashSet<SplitFingerprint>,
+    ) -> PaimonScan {
+        PaimonScan {
+            spec: Arc::new(PaimonScanSpec {
+                table_uri: self.table.location().into(),
+                schema_id: self.table.schema().id(),
+                snapshot_id: self.snapshot_id,
+                filter_expr,
+                required_indices: self.required_indices.clone(),
+            }),
+            handle: Arc::new(ScanHandle::Local(Arc::new(OpenedPaimonScan {
+                table: Arc::clone(&self.table),
+                blobs: Arc::clone(&self.blobs),
+                columns,
+                predicate,
+                filter,
+            }))),
+            planned: Some(Arc::new(planned)),
+        }
     }
 
     fn translate<'a>(
@@ -227,54 +219,27 @@ impl TableProvider for PaimonReadOnlyTable {
         let (logical, predicates): (Vec<_>, Vec<_>) =
             self.translate(filters)?.into_iter().unzip();
         let predicate = (!predicates.is_empty()).then(|| Predicate::and(predicates));
+        let filter_expr = conjunction(logical);
         let output = projected_schema(&self.schema, projection)?;
-        let mut columns: BTreeSet<_> = output
-            .fields()
-            .iter()
-            .map(|field| field.name().as_str())
-            .collect();
         let mut read = self.table.new_read_builder();
-        let filter = if let Some(predicate) = &predicate {
-            read.with_filter(predicate.clone());
-            conjunction(logical).filter(|_| !read.is_exact_filter_pushdown(predicate))
-        } else {
-            None
-        };
-        let filter = filter
-            .as_ref()
+        let residual = push_filter(&mut read, predicate.as_ref(), filter_expr.as_ref());
+        let columns = read_columns(&output, residual);
+        let filter = residual
             .map(|expr| {
-                columns
-                    .extend(expr.column_refs().into_iter().map(|col| col.name.as_str()));
-                let fields = columns
-                    .iter()
-                    .map(|name| self.schema.field_with_name(name).cloned())
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                let input = DFSchema::try_from(Schema::new(fields))?;
+                let input = filter_schema(&self.schema, &columns)?;
                 state.create_physical_expr(expr.clone(), &input)
             })
             .transpose()?;
-        let columns: Vec<_> = columns.into_iter().map(str::to_owned).collect();
         let native_limit = filter.is_none().then_some(limit).flatten();
         configure_read(&mut read, &columns, native_limit)?;
 
-        let mut scan = PaimonScan {
-            table: Arc::clone(&self.table),
-            snapshot_id: self.snapshot_id,
-            blobs: Arc::clone(&self.blobs),
-            columns: columns.into(),
-            predicate: predicate.map(Arc::new),
-            filter,
-            planned: Arc::default(),
-        };
-        let files = if limit == Some(0) {
-            vec![]
+        let (files, planned) = if limit == Some(0) {
+            (vec![], HashSet::new())
         } else {
             let plan = read.new_scan().plan().await.map_err(paimon_scan_error)?;
-            let (files, planned) =
-                split_files(self.table.location(), self.snapshot_id, plan.splits())?;
-            scan.planned = Arc::new(planned);
-            files
+            split_files(self.table.location(), self.snapshot_id, plan.splits())?
         };
+        let scan = self.local_scan(filter_expr, columns, predicate, filter, planned);
         scan_plan(
             LakeScan::Paimon(scan),
             self.schema(),
@@ -346,63 +311,193 @@ fn split_files(
     Ok((ordered.into_iter().map(|(_, file)| file).collect(), planned))
 }
 
+pub(crate) struct PaimonScanSpec {
+    pub(crate) table_uri: String,
+    pub(crate) schema_id: i64,
+    pub(crate) snapshot_id: i64,
+    pub(crate) filter_expr: Option<Expr>,
+    pub(crate) required_indices: Vec<RequiredIndexSpec>,
+}
+
 #[derive(Clone)]
 pub(crate) struct PaimonScan {
+    pub(crate) spec: Arc<PaimonScanSpec>,
+    handle: Arc<ScanHandle<OpenedPaimonScan>>,
+    planned: Option<Arc<HashSet<SplitFingerprint>>>,
+}
+
+struct OpenedPaimonScan {
     table: Arc<Table>,
-    snapshot_id: i64,
-    blobs: Arc<HashMap<String, Option<String>>>,
-    columns: Arc<[String]>,
-    predicate: Option<Arc<Predicate>>,
+    blobs: BlobColumns,
+    columns: Vec<String>,
+    predicate: Option<Predicate>,
     filter: Option<Arc<dyn PhysicalExpr>>,
-    planned: Arc<HashSet<SplitFingerprint>>,
 }
 
 impl PaimonScan {
+    pub(crate) fn worker(spec: PaimonScanSpec, runtime: Arc<LakeRuntimeConfig>) -> Self {
+        Self {
+            spec: Arc::new(spec),
+            handle: Arc::new(ScanHandle::worker(runtime)),
+            planned: None,
+        }
+    }
+
+    pub(crate) fn is_worker(&self) -> bool {
+        self.handle.local().is_none()
+    }
+
+    pub(crate) fn check_transportable(&self) -> Result<()> {
+        if let Some(opened) = self.handle.local() {
+            if !opened.table.is_main_branch() {
+                return plan_err!(
+                    "The lake scan protocol requires the Paimon main branch"
+                );
+            }
+            check_direct_read(&opened.table)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_split(&self, payload: &LakeSplitPayload) -> Result<()> {
+        let LakeSplitPayload::Paimon {
+            table_uri,
+            snapshot_id,
+            data_split_json,
+            ..
+        } = payload
+        else {
+            return plan_err!("Expected a Paimon split");
+        };
+        if *snapshot_id != self.spec.snapshot_id
+            || *table_uri != self.spec.table_uri
+            || self.planned.as_ref().is_some_and(|planned| {
+                let fingerprint: SplitFingerprint =
+                    Sha256::digest(data_split_json).into();
+                !planned.contains(&fingerprint)
+            })
+        {
+            return plan_err!("Paimon split does not match the pinned table scan");
+        }
+        Ok(())
+    }
+
+    async fn open_snapshot(
+        &self,
+        runtime: Arc<LakeRuntimeConfig>,
+        output: &Schema,
+    ) -> Result<OpenedPaimonScan> {
+        let spec = &self.spec;
+        let file_io = runtime.paimon_file_io(&spec.table_uri)?;
+        let snapshot = SnapshotManager::new(file_io.clone(), spec.table_uri.clone())
+            .get_snapshot(spec.snapshot_id)
+            .await
+            .map_err(paimon_scan_error)?;
+        if snapshot.id() != spec.snapshot_id || snapshot.schema_id() != spec.schema_id {
+            return plan_err!(
+                "Opened Paimon snapshot does not match the pinned snapshot and schema"
+            );
+        }
+        let schema = SchemaManager::new(file_io.clone(), spec.table_uri.clone())
+            .schema(spec.schema_id)
+            .await
+            .map_err(paimon_scan_error)?;
+        if schema.id() != spec.schema_id {
+            return plan_err!("Opened Paimon schema does not match the pinned schema");
+        }
+        let table = Table::from_resolved_schema(
+            file_io,
+            Identifier::new("lake", "scan"),
+            spec.table_uri.clone(),
+            schema.as_ref().clone(),
+            "main",
+        )
+        .map_err(paimon_scan_error)?;
+        check_direct_read(&table)?;
+        let table = pin_table(&table, &snapshot).await?;
+        let raw = raw_schema(&table)?;
+        let (schema, blobs) = lake_schema(&table, &raw)?;
+        for required in &spec.required_indices {
+            required.validate_column(&raw)?;
+        }
+
+        let filter_expr = spec
+            .filter_expr
+            .as_ref()
+            .map(|expr| filter::normalize(expr, &schema))
+            .transpose()?;
+        let predicate = filter_expr
+            .as_ref()
+            .map(|expr| {
+                filter::paimon(
+                    expr,
+                    &PredicateBuilder::new(table.schema().fields()),
+                    false,
+                )
+            })
+            .transpose()?;
+        let residual = push_filter(
+            &mut table.new_read_builder(),
+            predicate.as_ref(),
+            filter_expr.as_ref(),
+        );
+        let columns = read_columns(output, residual);
+        let filter = residual
+            .map(|expr| {
+                create_physical_expr(
+                    expr,
+                    &filter_schema(&schema, &columns)?,
+                    &ExecutionProps::new(),
+                    &PhysicalPlanningContext::default(),
+                )
+            })
+            .transpose()?;
+        Ok(OpenedPaimonScan {
+            table: Arc::new(table),
+            blobs,
+            columns,
+            predicate,
+            filter,
+        })
+    }
+
     pub(crate) async fn open(
         self,
         payload: LakeSplitPayload,
         schema: SchemaRef,
         limit: Option<usize>,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        let LakeSplitPayload::Paimon {
-            table_uri,
-            snapshot_id,
-            data_split_json,
-            ..
-        } = &payload
-        else {
-            return plan_err!("Expected a Paimon split");
-        };
-        let fingerprint: SplitFingerprint = Sha256::digest(data_split_json).into();
-        if *snapshot_id != self.snapshot_id
-            || *table_uri != self.table.location()
-            || !self.planned.contains(&fingerprint)
-        {
-            return plan_err!("Paimon split does not match the pinned table scan");
-        }
         let split = payload.paimon_data_split()?;
-        let mut builder = self.table.new_read_builder();
-        if let Some(predicate) = &self.predicate {
-            builder.with_filter(predicate.as_ref().clone());
+        let opened = self
+            .handle
+            .get_or_open(|runtime| self.open_snapshot(runtime, &schema))
+            .await?;
+        let mut builder = opened.table.new_read_builder();
+        if let Some(predicate) = &opened.predicate {
+            builder.with_filter(predicate.clone());
         }
         // Paimon may use a data predicate only for pruning. Let FileStream
         // enforce fetch after exact row filtering in that case.
-        let native_limit = self.filter.is_none().then_some(limit).flatten();
-        configure_read(&mut builder, &self.columns, native_limit)?;
+        let native_limit = opened.filter.is_none().then_some(limit).flatten();
+        configure_read(&mut builder, &opened.columns, native_limit)?;
         let read = builder.new_read().map_err(paimon_scan_error)?;
         let splits = Box::pin(read.authorize_splits(&[split]))
             .await
             .map_err(paimon_scan_error)?;
         let stream = read.to_arrow(&splits).map_err(paimon_scan_error)?;
         Ok(Box::pin(stream.map_err(paimon_scan_error).and_then(
-            move |batch| futures::future::ready(self.project(batch, &schema)),
+            move |batch| futures::future::ready(opened.project(batch, &schema)),
         )))
     }
 
     pub(crate) fn row_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
-        self.filter.as_ref()
+        self.handle
+            .local()
+            .and_then(|opened| opened.filter.as_ref())
     }
+}
 
+impl OpenedPaimonScan {
     fn project(&self, batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
         let batch = if let Some(filter) = &self.filter {
             let array = filter.evaluate(&batch)?.into_array(batch.num_rows())?;
@@ -433,6 +528,97 @@ impl PaimonScan {
             .collect::<Result<Vec<_>>>()?;
         make_batch(Arc::clone(schema), columns, batch.num_rows())
     }
+}
+
+fn check_direct_read(table: &Table) -> Result<()> {
+    let options = table.schema().core_options();
+    if options.is_format_table() || options.query_auth_enabled() {
+        return plan_err!(
+            "The lake scan protocol requires a Paimon snapshot readable through FileIO"
+        );
+    }
+    Ok(())
+}
+
+async fn pin_table(table: &Table, snapshot: &Snapshot) -> Result<Table> {
+    Ok(table
+        .copy_with_resolved_snapshot(snapshot)
+        .await
+        .map_err(|e| plan_datafusion_err!("Cannot load Paimon snapshot schema: {e}"))?
+        .copy_with_options(HashMap::from([
+            ("blob-as-descriptor".into(), "true".into()),
+            ("blob-view.resolve.enabled".into(), "false".into()),
+        ])))
+}
+
+fn raw_schema(table: &Table) -> Result<SchemaRef> {
+    build_read_arrow_schema(table.schema().fields())
+        .map_err(|e| plan_datafusion_err!("Cannot convert Paimon snapshot schema: {e}"))
+}
+
+fn lake_schema(table: &Table, raw: &Schema) -> Result<(SchemaRef, BlobColumns)> {
+    let mut blobs = HashMap::new();
+    let fields = raw
+        .fields()
+        .iter()
+        .zip(table.schema().fields())
+        .map(|(arrow, paimon)| {
+            if matches!(paimon.data_type(), DataType::Blob(_)) {
+                blobs.insert(
+                    arrow.name().clone(),
+                    blob_mime(
+                        arrow.name(),
+                        |key| arrow.metadata().get(key),
+                        |key| table.schema().options().get(key),
+                    )?,
+                );
+                Ok(Arc::new(MediaRefType::field(
+                    arrow.name(),
+                    arrow.is_nullable(),
+                )?))
+            } else if contains_blob(paimon.data_type()) {
+                not_impl_err!("Paimon nested blob column {:?}", arrow.name())
+            } else {
+                Ok(Arc::clone(arrow))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((Arc::new(Schema::new(fields)), Arc::new(blobs)))
+}
+
+fn push_filter<'a>(
+    read: &mut ReadBuilder<'_>,
+    predicate: Option<&Predicate>,
+    logical: Option<&'a Expr>,
+) -> Option<&'a Expr> {
+    let predicate = predicate?;
+    read.with_filter(predicate.clone());
+    logical.filter(|_| !read.is_exact_filter_pushdown(predicate))
+}
+
+fn read_columns(output: &Schema, residual: Option<&Expr>) -> Vec<String> {
+    let mut columns: BTreeSet<_> = output
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect();
+    if let Some(residual) = residual {
+        columns.extend(
+            residual
+                .column_refs()
+                .into_iter()
+                .map(|col| col.name.as_str()),
+        );
+    }
+    columns.into_iter().map(str::to_owned).collect()
+}
+
+fn filter_schema(schema: &Schema, columns: &[String]) -> Result<DFSchema> {
+    let fields = columns
+        .iter()
+        .map(|name| schema.field_with_name(name).cloned())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    DFSchema::try_from(Schema::new(fields))
 }
 
 fn configure_read(

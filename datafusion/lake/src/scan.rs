@@ -17,11 +17,13 @@ use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_physical_expr::{PhysicalExpr, projection::ProjectionExprs};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use futures::lock::Mutex;
 use object_store::ObjectStore;
 
+use crate::dist::LakeRuntimeConfig;
 use crate::lance_table::LanceScan;
 use crate::paimon_table::PaimonScan;
-use crate::split::LakeSplitExt;
+use crate::split::{LakeSplitExt, LakeSplitPayload};
 
 #[derive(Clone)]
 pub(crate) enum LakeScan {
@@ -29,9 +31,67 @@ pub(crate) enum LakeScan {
     Paimon(PaimonScan),
 }
 
+impl LakeScan {
+    pub(crate) fn validate_split(&self, payload: &LakeSplitPayload) -> Result<()> {
+        match self {
+            Self::Lance(scan) => scan.validate_split(payload),
+            Self::Paimon(scan) => scan.validate_split(payload),
+        }
+    }
+
+    fn is_worker(&self) -> bool {
+        match self {
+            Self::Lance(scan) => scan.is_worker(),
+            Self::Paimon(scan) => scan.is_worker(),
+        }
+    }
+}
+
+pub(crate) enum ScanHandle<T> {
+    Local(Arc<T>),
+    Worker {
+        runtime: Arc<LakeRuntimeConfig>,
+        opened: Mutex<Option<Arc<T>>>,
+    },
+}
+
+impl<T> ScanHandle<T> {
+    pub(crate) fn worker(runtime: Arc<LakeRuntimeConfig>) -> Self {
+        Self::Worker {
+            runtime,
+            opened: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn local(&self) -> Option<&T> {
+        match self {
+            Self::Local(opened) => Some(opened),
+            Self::Worker { .. } => None,
+        }
+    }
+
+    pub(crate) async fn get_or_open<Fut: Future<Output = Result<T>>>(
+        &self,
+        open: impl FnOnce(Arc<LakeRuntimeConfig>) -> Fut,
+    ) -> Result<Arc<T>> {
+        match self {
+            Self::Local(opened) => Ok(Arc::clone(opened)),
+            Self::Worker { runtime, opened } => {
+                let mut opened = opened.lock().await;
+                if let Some(handle) = opened.as_ref() {
+                    return Ok(Arc::clone(handle));
+                }
+                let handle = Arc::new(open(Arc::clone(runtime)).await?);
+                *opened = Some(Arc::clone(&handle));
+                Ok(handle)
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
-struct LakeSource {
-    engine: LakeScan,
+pub(crate) struct LakeSource {
+    pub(crate) engine: LakeScan,
     table_schema: TableSchema,
     projection: Option<ProjectionExprs>,
     output_schema: SchemaRef,
@@ -46,17 +106,6 @@ pub(crate) fn scan_plan(
     files: Vec<PartitionedFile>,
     limit: Option<usize>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let output_schema = projected_schema(&schema, projection)?;
-    let projection =
-        projection.map(|indices| ProjectionExprs::from_indices(indices, &schema));
-    let source = LakeSource {
-        engine,
-        table_schema: schema.into(),
-        projection,
-        output_schema,
-        metrics: ExecutionPlanMetricsSet::new(),
-        batch_size: 8192,
-    };
     // FileScanConfig applies its fetch per partition. A pushed table limit
     // needs one ordered group to stop opening splits once the limit is met.
     let groups = if limit.is_some() || files.is_empty() {
@@ -67,15 +116,7 @@ pub(crate) fn scan_plan(
             .map(|file| FileGroup::new(vec![file]))
             .collect()
     };
-    // The file opener reads through a pinned engine handle. The registry
-    // lookup required by FileScanConfig does not select the lake's store.
-    let config =
-        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(source))
-            .with_file_groups(groups)
-            .with_limit(limit)
-            .with_preserve_order(limit.is_some())
-            .build();
-    Ok(DataSourceExec::from_data_source(config))
+    LakeSource::plan(engine, schema, projection, groups, limit)
 }
 
 pub(crate) fn projected_schema(
@@ -85,6 +126,46 @@ pub(crate) fn projected_schema(
     match indices {
         Some(indices) => Ok(Arc::new(schema.project(indices)?)),
         None => Ok(Arc::clone(schema)),
+    }
+}
+
+impl LakeSource {
+    pub(crate) fn plan(
+        engine: LakeScan,
+        schema: SchemaRef,
+        projection: Option<&[usize]>,
+        groups: Vec<FileGroup>,
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let output_schema = projected_schema(&schema, projection)?;
+        let projection =
+            projection.map(|indices| ProjectionExprs::from_indices(indices, &schema));
+        let source = Self {
+            engine,
+            table_schema: schema.into(),
+            projection,
+            output_schema,
+            metrics: ExecutionPlanMetricsSet::new(),
+            batch_size: 8192,
+        };
+        // The file opener reads through a pinned engine handle. The registry
+        // lookup required by FileScanConfig does not select the lake's store.
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(source),
+        )
+        .with_file_groups(groups)
+        .with_limit(limit)
+        .with_preserve_order(limit.is_some())
+        .build();
+        Ok(DataSourceExec::from_data_source(config))
+    }
+
+    pub(crate) fn with_fresh_metrics(&self) -> Self {
+        Self {
+            metrics: ExecutionPlanMetricsSet::new(),
+            ..self.clone()
+        }
     }
 }
 
@@ -158,22 +239,22 @@ struct LakeOpener {
 
 impl FileOpener for LakeOpener {
     fn open(&self, file: PartitionedFile) -> Result<FileOpenFuture> {
-        let split = LakeSplitExt::for_read(&file)?.clone();
+        let split = LakeSplitExt::for_read(&file)?;
+        if self.source.engine.is_worker() {
+            split.validate_identity()?;
+        }
+        self.source.engine.validate_split(&split.payload)?;
+        let payload = split.payload.clone();
         let source = self.source.clone();
         let limit = self.limit;
         Ok(Box::pin(async move {
             match source.engine {
                 LakeScan::Lance(scan) => {
-                    scan.open(
-                        split.payload,
-                        source.output_schema,
-                        source.batch_size,
-                        limit,
-                    )
-                    .await
+                    scan.open(payload, source.output_schema, source.batch_size, limit)
+                        .await
                 }
                 LakeScan::Paimon(scan) => {
-                    scan.open(split.payload, source.output_schema, limit).await
+                    scan.open(payload, source.output_schema, limit).await
                 }
             }
         }))

@@ -34,9 +34,10 @@ use lance_table_runtime::blob::locate::{
 use object_store::path::Path;
 use url::Url;
 
+use crate::dist::LakeRuntimeConfig;
 use crate::filter;
 use crate::media::{external, media_array, media_url};
-use crate::scan::{LakeScan, make_batch, scan_plan};
+use crate::scan::{LakeScan, ScanHandle, make_batch, scan_plan};
 use crate::split::{InclusiveRowRange, LakeSplitExt, LakeSplitPayload};
 use crate::validation::{LakeTableOptions, RequiredIndexSpec, blob_mime};
 
@@ -45,6 +46,8 @@ struct BlobColumn {
     field_id: u32,
     mime: Option<String>,
 }
+
+type BlobColumns = Arc<HashMap<String, BlobColumn>>;
 
 struct BlobLocation<'a> {
     base_id: Option<u32>,
@@ -63,7 +66,7 @@ struct BlobLocation<'a> {
 pub struct LanceReadOnlyTable {
     dataset: Arc<Dataset>,
     schema: SchemaRef,
-    blobs: Arc<HashMap<String, BlobColumn>>,
+    blobs: BlobColumns,
     required_indices: Vec<RequiredIndexSpec>,
     vector_indices: HashMap<String, String>,
 }
@@ -102,57 +105,13 @@ impl LanceReadOnlyTable {
             .await
             .map_err(|e| plan_datafusion_err!("Cannot open Lance snapshot: {e}"))?;
         let raw = Schema::from(dataset.schema());
-        let mut blobs = HashMap::new();
-        let fields = raw
-            .fields()
-            .iter()
-            .zip(&dataset.schema().fields)
-            .map(|(arrow, lance)| {
-                if !lance.is_blob() {
-                    if lance.children.iter().any(contains_blob) {
-                        return not_impl_err!(
-                            "Lance nested blob column {:?}",
-                            arrow.name()
-                        );
-                    }
-                    return Ok(Arc::clone(arrow));
-                }
-                let field_id = u32::try_from(lance.id).map_err(|_| {
-                    plan_datafusion_err!("Invalid Lance field ID {}", lance.id)
-                })?;
-                blobs.insert(
-                    arrow.name().clone(),
-                    BlobColumn {
-                        field_id,
-                        mime: blob_mime(
-                            arrow.name(),
-                            |key| arrow.metadata().get(key),
-                            |key| raw.metadata().get(key),
-                        )?,
-                    },
-                );
-                Ok(Arc::new(MediaRefType::field(
-                    arrow.name(),
-                    arrow.is_nullable(),
-                )?))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if dataset.iter_fragments().any(|fragment| {
-            fragment.overlays.iter().any(|overlay| {
-                blobs.values().any(|blob| {
-                    i32::try_from(blob.field_id)
-                        .is_ok_and(|id| overlay.data_file.fields.contains(&id))
-                })
-            })
-        }) {
-            return not_impl_err!("Lance blob descriptors from overlay files");
-        }
+        let (schema, blobs) = lake_schema(&dataset, &raw)?;
         let vector_indices = validate_indices(&dataset, &raw, options).await?;
 
         Ok(Self {
             dataset: Arc::new(dataset),
-            schema: Arc::new(Schema::new_with_metadata(fields, raw.metadata().clone())),
-            blobs: Arc::new(blobs),
+            schema,
+            blobs,
             required_indices: options.required_indices.clone(),
             vector_indices,
         })
@@ -246,12 +205,23 @@ impl LanceReadOnlyTable {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let scan = LanceScan {
-            dataset: Arc::clone(&self.dataset),
-            blobs: Arc::clone(&self.blobs),
-            filter: None,
-        };
+        let scan = self.local_scan(None);
         scan_plan(LakeScan::Lance(scan), schema, None, files, None)
+    }
+
+    fn local_scan(&self, filter: Option<Expr>) -> LanceScan {
+        LanceScan {
+            spec: Arc::new(LanceScanSpec {
+                dataset_uri: self.dataset.uri().into(),
+                dataset_version: self.dataset_version(),
+                required_indices: self.required_indices.clone(),
+                filter,
+            }),
+            handle: Arc::new(ScanHandle::Local(Arc::new(OpenedLanceScan {
+                dataset: Arc::clone(&self.dataset),
+                blobs: Arc::clone(&self.blobs),
+            }))),
+        }
     }
 
     fn files(&self) -> Result<Vec<PartitionedFile>> {
@@ -321,11 +291,7 @@ impl TableProvider for LanceReadOnlyTable {
             .iter()
             .map(|expr| filter::normalize(expr, &self.schema))
             .collect::<Result<Vec<_>>>()?;
-        let scan = LanceScan {
-            dataset: Arc::clone(&self.dataset),
-            blobs: Arc::clone(&self.blobs),
-            filter: conjunction(filters),
-        };
+        let scan = self.local_scan(conjunction(filters));
         let files = if limit == Some(0) {
             vec![]
         } else {
@@ -341,14 +307,82 @@ impl TableProvider for LanceReadOnlyTable {
     }
 }
 
+pub(crate) struct LanceScanSpec {
+    pub(crate) dataset_uri: String,
+    pub(crate) dataset_version: u64,
+    pub(crate) filter: Option<Expr>,
+    pub(crate) required_indices: Vec<RequiredIndexSpec>,
+}
+
 #[derive(Clone)]
 pub(crate) struct LanceScan {
+    pub(crate) spec: Arc<LanceScanSpec>,
+    handle: Arc<ScanHandle<OpenedLanceScan>>,
+}
+
+struct OpenedLanceScan {
     dataset: Arc<Dataset>,
-    blobs: Arc<HashMap<String, BlobColumn>>,
-    filter: Option<Expr>,
+    blobs: BlobColumns,
 }
 
 impl LanceScan {
+    pub(crate) fn worker(spec: LanceScanSpec, runtime: Arc<LakeRuntimeConfig>) -> Self {
+        Self {
+            spec: Arc::new(spec),
+            handle: Arc::new(ScanHandle::worker(runtime)),
+        }
+    }
+
+    pub(crate) fn is_worker(&self) -> bool {
+        self.handle.local().is_none()
+    }
+
+    pub(crate) fn validate_split(&self, payload: &LakeSplitPayload) -> Result<()> {
+        let LakeSplitPayload::Lance {
+            dataset_uri,
+            dataset_version,
+            ..
+        } = payload
+        else {
+            return plan_err!("Expected a Lance split");
+        };
+        if *dataset_version != self.spec.dataset_version
+            || *dataset_uri != self.spec.dataset_uri
+        {
+            return plan_err!("Lance split does not match the pinned dataset snapshot");
+        }
+        Ok(())
+    }
+
+    async fn open_snapshot(
+        &self,
+        runtime: Arc<LakeRuntimeConfig>,
+    ) -> Result<OpenedLanceScan> {
+        let dataset = runtime
+            .lance_builder(&self.spec.dataset_uri)?
+            .with_version(self.spec.dataset_version)
+            .load()
+            .await
+            .map_err(lance_scan_error)?;
+        if dataset.version_id() != self.spec.dataset_version
+            || dataset.uri() != self.spec.dataset_uri
+        {
+            return plan_err!("Opened Lance dataset does not match the pinned snapshot");
+        }
+        let raw = Schema::from(dataset.schema());
+        let (schema, blobs) = lake_schema(&dataset, &raw)?;
+        if let Some(filter) = &self.spec.filter {
+            filter::normalize(filter, &schema)?;
+        }
+        for required in &self.spec.required_indices {
+            required.validate_column(&raw)?;
+        }
+        Ok(OpenedLanceScan {
+            dataset: Arc::new(dataset),
+            blobs,
+        })
+    }
+
     pub(crate) async fn open(
         self,
         payload: LakeSplitPayload,
@@ -357,26 +391,24 @@ impl LanceScan {
         limit: Option<usize>,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let LakeSplitPayload::Lance {
-            dataset_uri,
-            dataset_version,
             fragment_id,
             row_ranges,
             deletion_file_rev,
+            ..
         } = payload
         else {
             return plan_err!("Expected a Lance split");
         };
-        if dataset_version != self.dataset.version_id()
-            || dataset_uri != self.dataset.uri()
-        {
-            return plan_err!("Lance split does not match the pinned dataset snapshot");
-        }
-        let fragment =
-            self.dataset
-                .get_fragment(fragment_id as usize)
-                .ok_or_else(|| {
-                    plan_datafusion_err!("Missing Lance fragment {fragment_id}")
-                })?;
+        let opened = self
+            .handle
+            .get_or_open(|runtime| self.open_snapshot(runtime))
+            .await?;
+        let fragment = opened
+            .dataset
+            .get_fragment(fragment_id as usize)
+            .ok_or_else(|| {
+                plan_datafusion_err!("Missing Lance fragment {fragment_id}")
+            })?;
         if fragment
             .metadata()
             .deletion_file
@@ -390,7 +422,7 @@ impl LanceScan {
         }
 
         let mut scanner = Scanner::from_fragment(
-            Arc::clone(&self.dataset),
+            Arc::clone(&opened.dataset),
             fragment.metadata().clone(),
         );
         let mut columns: BTreeSet<_> =
@@ -403,7 +435,7 @@ impl LanceScan {
             .batch_size(batch_size)
             .project(&columns.into_iter().collect::<Vec<_>>())
             .map_err(lance_scan_error)?;
-        if let Some(filter) = self.filter.clone() {
+        if let Some(filter) = self.spec.filter.clone() {
             scanner.filter_expr(filter);
         }
         if let Some(ranges) = row_ranges {
@@ -436,10 +468,14 @@ impl LanceScan {
         }
         let stream = scanner.try_into_stream().await.map_err(lance_scan_error)?;
         Ok(Box::pin(stream.map_err(lance_scan_error).and_then(
-            move |batch| futures::future::ready(self.project(&batch, &schema, &fragment)),
+            move |batch| {
+                futures::future::ready(opened.project(&batch, &schema, &fragment))
+            },
         )))
     }
+}
 
+impl OpenedLanceScan {
     fn project(
         &self,
         batch: &RecordBatch,
@@ -606,6 +642,53 @@ impl LanceScan {
             mime: mime.map(str::to_owned),
         })
     }
+}
+
+fn lake_schema(dataset: &Dataset, raw: &Schema) -> Result<(SchemaRef, BlobColumns)> {
+    let mut blobs = HashMap::new();
+    let fields = raw
+        .fields()
+        .iter()
+        .zip(&dataset.schema().fields)
+        .map(|(arrow, lance)| {
+            if !lance.is_blob() {
+                if lance.children.iter().any(contains_blob) {
+                    return not_impl_err!("Lance nested blob column {:?}", arrow.name());
+                }
+                return Ok(Arc::clone(arrow));
+            }
+            let field_id = u32::try_from(lance.id).map_err(|_| {
+                plan_datafusion_err!("Invalid Lance field ID {}", lance.id)
+            })?;
+            blobs.insert(
+                arrow.name().clone(),
+                BlobColumn {
+                    field_id,
+                    mime: blob_mime(
+                        arrow.name(),
+                        |key| arrow.metadata().get(key),
+                        |key| raw.metadata().get(key),
+                    )?,
+                },
+            );
+            Ok(Arc::new(MediaRefType::field(
+                arrow.name(),
+                arrow.is_nullable(),
+            )?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if dataset.iter_fragments().any(|fragment| {
+        fragment.overlays.iter().any(|overlay| {
+            blobs.values().any(|blob| {
+                i32::try_from(blob.field_id)
+                    .is_ok_and(|id| overlay.data_file.fields.contains(&id))
+            })
+        })
+    }) {
+        return not_impl_err!("Lance blob descriptors from overlay files");
+    }
+    let schema = Schema::new_with_metadata(fields, raw.metadata().clone());
+    Ok((Arc::new(schema), Arc::new(blobs)))
 }
 
 fn contains_blob(field: &lance_core::datatypes::Field) -> bool {
