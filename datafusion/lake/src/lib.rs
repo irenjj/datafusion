@@ -5,6 +5,8 @@
 //! Snapshot-pinned Lance and Paimon scans for the internal DataFusion lake layer.
 
 #[doc(hidden)]
+pub mod backfill;
+#[doc(hidden)]
 pub mod dist;
 mod filter;
 mod lance_table;
