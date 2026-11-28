@@ -9,12 +9,17 @@ mod lance_table;
 mod media;
 mod paimon_table;
 mod scan;
+#[doc(hidden)]
+pub mod search;
 mod split;
 mod validation;
 
 pub use lance_table::LanceReadOnlyTable;
 pub use media::LakeMediaResolver;
 pub use paimon_table::PaimonReadOnlyTable;
+pub use search::{
+    LakeSearchCatalog, PinnedLakeTable, hybrid_search_function, vector_search_function,
+};
 pub use split::{
     InclusiveRowRange, LAKE_SPLIT_EXT_NAME, LAKE_SPLIT_EXT_VERSION, LakeSplitExt,
     LakeSplitPayload,

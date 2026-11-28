@@ -48,7 +48,7 @@ fn field_with_mime(field: Field, mime: &str) -> Field {
     field
 }
 
-fn read_references(batches: &[RecordBatch]) -> Vec<Option<MediaRef>> {
+pub(super) fn read_references(batches: &[RecordBatch]) -> Vec<Option<MediaRef>> {
     batches
         .iter()
         .flat_map(|batch| {
@@ -103,14 +103,14 @@ fn read_references(batches: &[RecordBatch]) -> Vec<Option<MediaRef>> {
         .collect()
 }
 
-fn observed_lance(path: &str, reads: &Reads) -> DatasetBuilder {
+pub(super) fn observed_lance(path: &str, reads: &Reads) -> DatasetBuilder {
     DatasetBuilder::from_uri(path).with_store_params(ObjectStoreParams {
         object_store_wrapper: Some(Arc::new(reads.clone())),
         ..Default::default()
     })
 }
 
-fn object_read_ranges<'a>(
+pub(super) fn object_read_ranges<'a>(
     reads: &'a [Read],
     media: &MediaRef,
 ) -> impl Iterator<Item = &'a Range<u64>> {

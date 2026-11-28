@@ -21,9 +21,9 @@ use lance_core::{ROW_ADDR, ROW_ID};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::create_writer;
 use lance_index::scalar::bitmap::BitmapIndexPlugin;
-use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{BasicTrainer, VALUE_COLUMN_NAME};
+use lance_index::scalar::{index_files_to_table, inverted::InvertedIndexPlugin};
 use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::flat::{
     index::{FlatIndex, FlatQuantizer},
@@ -131,7 +131,7 @@ async fn attach_bitmap(
     publish_indices(table, vec![meta]).await;
 }
 
-async fn publish_indices(
+pub(super) async fn publish_indices(
     table: &lance_table_runtime::Table,
     indices: Vec<IndexMetadata>,
 ) {
@@ -257,28 +257,93 @@ async fn paimon_validates_index_publication_dimension_and_row_coverage() {
     );
 }
 
-async fn attach_vector(table: &lance_table_runtime::Table, dim: i32) {
-    let (store, _) = ObjectStore::from_uri(table.uri()).await.unwrap();
-    let uuid = Uuid::from_u128(2);
-    let root = table.indices_dir().join(uuid.to_string());
-    let addresses = table
+fn row_addresses(table: &lance_table_runtime::Table, fragments: usize) -> Vec<u64> {
+    table
         .manifest()
         .fragments
         .iter()
-        .flat_map(|frag| {
-            (0..u32::try_from(frag.physical_rows.unwrap()).unwrap()).map(|offset| {
-                u64::from(RowAddress::new_from_parts(
-                    u32::try_from(frag.id).unwrap(),
-                    offset,
-                ))
-            })
+        .take(fragments)
+        .flat_map(|fragment| {
+            let id = u32::try_from(fragment.id).unwrap();
+            let rows = u32::try_from(fragment.physical_rows.unwrap()).unwrap();
+            (0..rows).map(move |off| u64::from(RowAddress::new_from_parts(id, off)))
         })
-        .collect::<Vec<_>>();
-    let rows = addresses.len();
-    let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-        (0..rows).map(|_| Some((0..dim).map(|index| Some(index as f32)))),
-        dim,
+        .collect()
+}
+
+pub(super) async fn build_text_index(
+    table: &lance_table_runtime::Table,
+    values: Arc<dyn Array>,
+) -> IndexMetadata {
+    let (store, _) = ObjectStore::from_uri(table.uri()).await.unwrap();
+    let uuid = Uuid::from_u128(3);
+    let index_store = LanceIndexStore::with_format_version(
+        store,
+        table.indices_dir().join(uuid.to_string()),
+        Arc::new(LanceCache::with_capacity(1024 * 1024)),
+        ConcreteFileVersion::V2_2,
     );
+    let addresses = row_addresses(table, table.manifest().fragments.len());
+    let keys = RecordBatch::try_from_iter([
+        (VALUE_COLUMN_NAME, values),
+        (ROW_ID, Arc::new(UInt64Array::from(addresses)) as _),
+    ])
+    .unwrap();
+    let plugin = InvertedIndexPlugin;
+    let request = plugin
+        .new_training_request("{}", keys.schema().field(0))
+        .unwrap();
+    let input = Box::pin(RecordBatchStreamAdapter::new(
+        keys.schema(),
+        stream::iter([Ok(keys)]),
+    ));
+    let built = plugin
+        .train_index(
+            input,
+            &index_store,
+            request,
+            None,
+            lance_index::progress::noop_progress(),
+        )
+        .await
+        .unwrap();
+    IndexMetadata {
+        uuid,
+        name: "label_fts".into(),
+        fields: vec![table.schema().field_id("label").unwrap()],
+        covering_fields: Vec::new(),
+        dataset_version: table.manifest().version,
+        fragment_bitmap: Some(
+            table
+                .manifest()
+                .fragments
+                .iter()
+                .map(|f| f.id as u32)
+                .collect(),
+        ),
+        index_details: Some(Arc::new(built.index_details)),
+        index_version: i32::try_from(built.index_version).unwrap(),
+        created_at: None,
+        base_id: None,
+        files: Some(index_files_to_table(built.files)),
+        clustering_id: None,
+        metadata: Default::default(),
+    }
+}
+
+pub(super) async fn build_vector_index(
+    table: &lance_table_runtime::Table,
+    vectors: FixedSizeListArray,
+    name: &str,
+    uuid: Uuid,
+    fragments: usize,
+) -> IndexMetadata {
+    let (store, _) = ObjectStore::from_uri(table.uri()).await.unwrap();
+    let root = table.indices_dir().join(uuid.to_string());
+    let addresses = row_addresses(table, fragments);
+    let rows = addresses.len();
+    assert_eq!(vectors.len(), rows);
+    let dim = vectors.value_length();
     let distance = DistanceType::L2;
     let mut auxiliary_model = IvfModel::new(vectors.slice(0, 1), None);
     auxiliary_model.add_partition(u32::try_from(rows).unwrap());
@@ -332,9 +397,9 @@ async fn attach_vector(table: &lance_table_runtime::Table, dim: i32) {
         metric_type: pb::VectorMetricType::L2.into(),
         ..Default::default()
     };
-    let metadata = IndexMetadata {
+    IndexMetadata {
         uuid,
-        name: "embedding".into(),
+        name: name.into(),
         fields: vec![table.schema().field_id("vector").unwrap()],
         covering_fields: vec![],
         dataset_version: table.manifest().version,
@@ -343,6 +408,7 @@ async fn attach_vector(table: &lance_table_runtime::Table, dim: i32) {
                 .manifest()
                 .fragments
                 .iter()
+                .take(fragments)
                 .map(|f| u32::try_from(f.id).unwrap())
                 .collect(),
         ),
@@ -364,8 +430,7 @@ async fn attach_vector(table: &lance_table_runtime::Table, dim: i32) {
         ]),
         clustering_id: None,
         metadata: Default::default(),
-    };
-    publish_indices(table, vec![metadata]).await;
+    }
 }
 
 #[tokio::test]
@@ -374,7 +439,14 @@ async fn lance_validates_persisted_vector_dimension() {
         let directory = tempfile::tempdir().unwrap();
         let uri = directory.path().to_str().unwrap();
         let fixture = write_lance(uri, scalar_rows(0), WriteMode::Create).await;
-        attach_vector(&fixture, dimension).await;
+        let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            (0..6).map(|_| Some((0..dimension).map(|index| Some(index as f32)))),
+            dimension,
+        );
+        let index =
+            build_vector_index(&fixture, vectors, "embedding", Uuid::from_u128(2), 2)
+                .await;
+        publish_indices(&fixture, vec![index]).await;
         let opened = LanceReadOnlyTable::open(uri, None, &vector_index(2)).await;
         if dimension == 2 {
             opened.unwrap();

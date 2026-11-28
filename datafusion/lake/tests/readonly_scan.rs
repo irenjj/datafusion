@@ -8,6 +8,8 @@ mod fixtures;
 mod index;
 #[path = "readonly_scan/media.rs"]
 mod media;
+#[path = "readonly_scan/search.rs"]
+mod search;
 #[path = "readonly_scan/store.rs"]
 mod store;
 
