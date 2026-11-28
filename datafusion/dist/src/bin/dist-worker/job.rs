@@ -170,6 +170,14 @@ impl StageJob {
     }
 
     pub(super) fn sink(&self, output_root: Option<&str>) -> Result<ParquetSplitSink> {
+        self.sink_with_context(output_root, None)
+    }
+
+    pub(super) fn sink_with_context(
+        &self,
+        output_root: Option<&str>,
+        ctx: Option<&SessionContext>,
+    ) -> Result<ParquetSplitSink> {
         let job_root = self
             .output_root
             .as_deref()
@@ -184,10 +192,23 @@ impl StageJob {
                 "--output-root differs from the stage job's checkpoint root"
             );
         }
-        argument
+        let location = argument
             .or(job_root)
-            .ok_or_else(|| plan_datafusion_err!("--output-root is required"))?
-            .sink(&self.stage, &self.options)
+            .ok_or_else(|| plan_datafusion_err!("--output-root is required"))?;
+        let Some(ctx) = ctx else {
+            return location.sink(&self.stage, &self.options);
+        };
+        if location.0.scheme() == "s3" && !self.input_stores.contains(location.origin()) {
+            location.register(ctx)?;
+        }
+        ParquetSplitSink::try_new(
+            ctx.runtime_env()
+                .object_store_registry
+                .get_store(&location.0)?,
+            &location.store_path()?,
+            &self.stage,
+            &self.options,
+        )
     }
 }
 

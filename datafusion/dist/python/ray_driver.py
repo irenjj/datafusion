@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 # SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-"""Run the stateless dist-worker commands with Ray or an injected executor."""
+"""Run distributed Parquet stages with Ray workers or an injected executor."""
 
 import argparse
 from collections import deque
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 import json
 import math
@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from threading import Event
 import time
 from urllib.parse import unquote, urlsplit
 
@@ -44,11 +45,13 @@ class _Attempt:
 
 
 def drive(worker, executor_factory, *, timeout=60.0, concurrency=4,
-          max_attempts=3, clock=time.monotonic):
+          max_attempts=3, clock=time.monotonic, rate_limiter=None,
+          wait_for_dispatch=None):
     """Plan, execute, commit, and finalize using a worker command adapter.
 
     An executor provides submit(split_id, attempt_id), wait(handles, timeout),
-    result(handle), and cancel(handle). Only the driver can publish a receipt.
+    result(handle), and cancel(handle). Under an inflight limit, cancel must confirm
+    that the attempt stopped or raise. Only the driver can publish a receipt.
     """
     if not math.isfinite(timeout) or timeout <= 0 or min(concurrency, max_attempts) < 1:
         raise ValueError("timeout, concurrency, and max_attempts must be positive")
@@ -63,31 +66,61 @@ def drive(worker, executor_factory, *, timeout=60.0, concurrency=4,
 
     executor = executor_factory()
     active = {}
+    if wait_for_dispatch is None:
+        wait_for_dispatch = Event().wait
+
+    def retire(handle):
+        del active[handle]
+        if rate_limiter is not None:
+            rate_limiter.release()
 
     def retry(attempt, error):
         if attempt.tries >= max_attempts or attempt.attempt_id == 0xFFFFFFFF:
             raise RuntimeError(
-                f"split {attempt.split_id} exhausted attempts at {attempt.attempt_id}"
+                f"split {attempt.split_id} exhausted attempts at {attempt.attempt_id}: {error}"
             ) from error
         pending.append((attempt.split_id, attempt.attempt_id + 1, attempt.tries + 1))
 
     try:
         while pending or active:
             while pending and len(active) < concurrency:
+                if rate_limiter is not None and not rate_limiter.try_acquire():
+                    break
                 split_id, attempt_id, tries = pending.popleft()
-                handle = executor.submit(split_id, attempt_id)
+                try:
+                    handle = executor.submit(split_id, attempt_id)
+                except BaseException:
+                    if rate_limiter is not None:
+                        rate_limiter.release()
+                    raise
                 active[handle] = _Attempt(split_id, attempt_id, tries, clock() + timeout)
 
+            dispatch_delay = math.inf
+            if rate_limiter is not None and pending and len(active) < concurrency:
+                dispatch_delay = rate_limiter.delay()
+            if not active:
+                wait_for_dispatch(dispatch_delay)
+                continue
+
             deadline = min(attempt.deadline for attempt in active.values())
-            ready = executor.wait(tuple(active), max(0, deadline - clock()))
+            ready = executor.wait(
+                tuple(active), min(dispatch_delay, max(0, deadline - clock())),
+            )
             now = clock()
             for handle in ready:
                 attempt = active.get(handle)
                 if attempt is None or attempt.deadline <= now:
                     continue
-                del active[handle]
                 try:
                     receipt = executor.result(handle)
+                except Exception as error:
+                    executor.cancel(handle)
+                    retire(handle)
+                    retry(attempt, error)
+                    continue
+
+                retire(handle)
+                try:
                     artifact = receipt["artifact"]
                     if (artifact["split_id"], artifact["attempt_id"]) != (
                         attempt.split_id, attempt.attempt_id
@@ -100,12 +133,13 @@ def drive(worker, executor_factory, *, timeout=60.0, concurrency=4,
 
             for handle, attempt in tuple(active.items()):
                 if attempt.deadline <= now:
-                    del active[handle]
-                    _cancel(executor, handle)
+                    executor.cancel(handle)
+                    retire(handle)
                     retry(attempt, TimeoutError(f"attempt {attempt.attempt_id} expired"))
     finally:
-        for handle in active:
+        for handle in tuple(active):
             _cancel(executor, handle)
+            retire(handle)
 
     return worker.finalize()
 
@@ -113,6 +147,17 @@ def drive(worker, executor_factory, *, timeout=60.0, concurrency=4,
 def _cancel(executor, handle):
     with suppress(Exception):
         executor.cancel(handle)
+
+
+def _redact(detail, payload):
+    values = set()
+    for secret in payload.values():
+        if secret:
+            values.update((secret, json.dumps(secret)[1:-1]))
+            values.update(secret.splitlines())
+    for value in sorted(values - {""}, key=lambda value: (-len(value), value)):
+        detail = detail.replace(value, "[redacted]")
+    return detail
 
 
 def _invoke(executable, args, *, payload, receipt=None, timeout=None):
@@ -130,10 +175,7 @@ def _invoke(executable, args, *, payload, receipt=None, timeout=None):
     except subprocess.TimeoutExpired:
         raise TimeoutError(f"dist-worker {args[0]} timed out") from None
     if result.returncode:
-        detail = result.stderr
-        for secret in sorted(set(payload.values()), key=len, reverse=True):
-            if secret:
-                detail = detail.replace(secret, "[redacted]")
+        detail = _redact(result.stderr, payload)
         raise RuntimeError(f"dist-worker {args[0]} exited {result.returncode}: {detail.strip()}")
     try:
         return json.loads(result.stdout) if result.stdout.strip() else None
@@ -217,6 +259,8 @@ def _worker_executable(worker, directory, payload):
 class WorkerCli:
     """Adapter for the worker's serde JSON and Parquet artifact protocol."""
 
+    redact = staticmethod(_redact)
+
     def __init__(self, executable, sql, tables, job_path, output_root, row_key=None,
                  *, local_executable=None, payload=None):
         self.executable = executable
@@ -250,29 +294,16 @@ class WorkerCli:
 class RayExecutor:
     """Run one child process per Ray task and return its small JSON receipt."""
 
-    def __init__(self, worker, timeout, address=None):
-        import ray
-
-        _validate_ray_address(address)
-        if not ray.is_initialized():
-            if address in (None, "auto"):
-                ray.init()
-            else:
-                try:
-                    ray.init(address=address)
-                except RuntimeError as error:
-                    if address.startswith("ray://") and str(error).startswith("Version mismatch:"):
-                        raise ValueError(
-                            f"{error}\nRay Client requires matching Ray and Python major.minor "
-                            "versions. Run the driver on the head with --ray-address auto."
-                        ) from None
-                    raise
+    def __init__(self, worker, timeout, address=None, *, confirm_stop=False):
+        ray = _connect_ray(address)
         self._ray = ray
+        self._confirm_stop = confirm_stop
         self._payload = ray.put(worker.payload)
         self._job_path = worker.job_path
         self._job = None
         self._worker = worker.executable
         self._timeout = timeout
+
         @ray.remote(num_cpus=1, max_retries=0)
         def run_split(executable, job, payload_refs, split_id, attempt_id, timeout):
             # Ray dereferences top-level task arguments before executing the task.
@@ -298,17 +329,79 @@ class RayExecutor:
         )
 
     def wait(self, handles, timeout):
-        ready, pending = self._ray.wait(list(handles), timeout=timeout)
-        if ready and pending:
-            also_ready, _ = self._ray.wait(pending, num_returns=len(pending), timeout=0)
-            ready.extend(also_ready)
-        return ready
+        return _wait_ready(self._ray, handles, timeout)
 
     def result(self, handle):
         return self._ray.get(handle)
 
     def cancel(self, handle):
-        self._ray.cancel(handle)
+        if not self._confirm_stop:
+            with suppress(Exception):
+                self._ray.cancel(handle)
+            return
+        # The stateless task's subprocess timeout kills and reaps the child.
+        # Wait for its completion before reissuing an inflight permit.
+        try:
+            self._ray.get(handle, timeout=self._timeout)
+        except self._ray.exceptions.RayTaskError:
+            pass
+        except self._ray.exceptions.RayError:
+            with suppress(Exception):
+                self._ray.cancel(handle)
+            raise RuntimeError("Could not confirm termination of expired task") from None
+
+
+def _connect_ray(address):
+    import ray
+
+    _validate_ray_address(address)
+    if not ray.is_initialized():
+        if address in (None, "auto"):
+            ray.init()
+        else:
+            try:
+                ray.init(address=address)
+            except RuntimeError as error:
+                if address.startswith("ray://") and str(error).startswith("Version mismatch:"):
+                    raise ValueError(
+                        f"{error}\nRay Client requires matching Ray and Python major.minor "
+                        "versions. Run the driver on the head with --ray-address auto."
+                    ) from None
+                raise
+    return ray
+
+
+def _wait_ready(ray, handles, timeout):
+    ready, pending = ray.wait(list(handles), timeout=timeout)
+    if ready and pending:
+        also_ready, _ = ray.wait(pending, num_returns=len(pending), timeout=0)
+        ready.extend(also_ready)
+    return ready
+
+
+def _actor_job(stack, worker, args):
+    import worker_pool
+
+    ray = _connect_ray(args.ray_address)
+    # Ship code by value so Ray nodes do not need the driver's source directory.
+    ray.cloudpickle.register_pickle_by_value(worker_pool)
+    ray.cloudpickle.register_pickle_by_value(sys.modules[__name__])
+
+    @ray.remote(num_cpus=1, max_concurrency=2, max_restarts=0, max_task_retries=0)
+    class WorkerActor(worker_pool.DistWorkerActor):
+        def __init__(self, executable, job_id, job, payload_refs, timeout):
+            super().__init__(
+                executable, job_id, job, ray.get(payload_refs[0]), timeout,
+                _worker_executable, _redact,
+            )
+
+    executor = worker_pool.RayActorExecutor(ray, worker, args.timeout, WorkerActor, _wait_ready)
+    stack.callback(executor.close)
+    coordinator = worker_pool.ServeCoordinator(worker, executor.job_id)
+    stack.callback(coordinator.close)
+    pool_size = args.concurrency if args.pool_size is None else args.pool_size
+    capacity = int(ray.cluster_resources().get("CPU", 0))
+    return coordinator, executor, min(args.concurrency, pool_size, max(1, capacity))
 
 
 def _validate_ray_address(address):
@@ -369,10 +462,22 @@ def main():
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument("--execution-mode", choices=("actor", "task"), default="actor")
+    parser.add_argument("--pool-size", type=int, help="Maximum actor count (defaults to --concurrency)")
+    parser.add_argument("--max-global-inflight", type=int, help="Maximum active split attempts per job")
+    parser.add_argument("--max-splits-per-minute", type=int, help="Maximum split dispatch rate per job")
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="dist-coordinator-") as directory:
+    with ExitStack() as stack:
+        payload = {}
         try:
             _validate_ray_address(args.ray_address)
+            if args.pool_size is not None and args.pool_size < 1:
+                raise ValueError("--pool-size must be positive")
+            limiter = None
+            if args.max_global_inflight is not None or args.max_splits_per_minute is not None:
+                from rate_limiter import GlobalRateLimiter
+
+                limiter = GlobalRateLimiter(args.max_global_inflight, args.max_splits_per_minute)
             if args.secrets_stdin:
                 payload = _read_payload(sys.stdin)
             elif args.secrets_file:
@@ -381,17 +486,26 @@ def main():
                 payload = _inherited_payload()
             worker = WorkerCli(args.worker, args.sql, args.table, args.job,
                                args.output_root, args.row_key, payload=payload)
-            executor = RayExecutor(worker, args.timeout, args.ray_address)
+            directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="dist-coordinator-"))
+            if args.execution_mode == "actor":
+                coordinator, executor, concurrency = _actor_job(stack, worker, args)
+            else:
+                coordinator, concurrency = worker, args.concurrency
+                executor = RayExecutor(
+                    worker, args.timeout, args.ray_address,
+                    confirm_stop=args.max_global_inflight is not None,
+                )
+            worker.local_executable = _worker_executable(args.worker, directory, payload)
+            manifest = drive(
+                coordinator, lambda: executor,
+                timeout=args.timeout, concurrency=concurrency,
+                max_attempts=args.max_attempts, rate_limiter=limiter,
+            )
         except ValueError as error:
-            parser.error(str(error))
-        worker.local_executable = _worker_executable(args.worker, directory, payload)
-        print(json.dumps(drive(
-            worker,
-            lambda: executor,
-            timeout=args.timeout,
-            concurrency=args.concurrency,
-            max_attempts=args.max_attempts,
-        )))
+            parser.error(_redact(str(error), payload))
+        except (OSError, RuntimeError) as error:
+            parser.exit(1, f"{_redact(str(error), payload)}\n")
+    print(json.dumps(manifest))
 
 
 if __name__ == "__main__":

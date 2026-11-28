@@ -239,7 +239,8 @@ class RayWorkerTests(unittest.TestCase):
         stdout, stderr = StringIO(), StringIO()
         with tempfile.TemporaryDirectory() as directory:
             job_path = Path(directory) / "job.json"
-            argv = ["ray_driver.py", "--worker", "s3://artifacts/worker", "--secrets-stdin",
+            argv = ["ray_driver.py", "--execution-mode", "task",
+                    "--worker", "s3://artifacts/worker", "--secrets-stdin",
                     "--ray-address", "auto", "--timeout", "12", "--job", str(job_path),
                     "--sql", "SELECT id FROM t", "--table", "t=input", "--output-root", "output"]
             with (

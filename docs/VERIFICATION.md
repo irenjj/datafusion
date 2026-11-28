@@ -21,7 +21,7 @@ tests() { cargo nextest run --locked --cargo-profile ci -p "$@"; }
 | core-ai-http    | `cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm` covers embedding and vision through SQL and generated Parquet.                                                                                                 | [Replay loopback TLS with a custom CA](#ai-custom-ca-loopback).                                                                                                                                 |
 | lake-storage    | `lint datafusion-lake` and `tests datafusion-lake`. Covers pinned Lance and Paimon scans, split replay, scalar pushdown, descriptor-only media projection and bounded resolution.                                                                          | Replay `cargo nextest run --locked --cargo-profile ci -p datafusion-lake --test readonly_scan --test split_contract` using generated local fixtures.                                            |
 | dist-checkpoint | `lint datafusion-dist --features ai` and `tests datafusion-dist --features ai`. The first durable writer wins. Covers immutable artifacts, `df.ai_error` routing and restart from partial checkpoints.                                                     | Run `tests datafusion-dist --all-features` for the combined feature build.                                                                                                                      |
-| dist-worker     | `lint datafusion-dist`, `tests datafusion-dist` and `python3 -m unittest discover -s datafusion/dist/python -v`. Covers local execution, stateless subcommands and Ray scheduling through an injected executor.                                            | [Run the Parquet worker protocol](#distributed-parquet-worker).                                                                                                                                 |
+| dist-worker     | `lint datafusion-dist`, `tests datafusion-dist` and `python3 -m unittest discover -s datafusion/dist/python -v`. Covers stateless and persistent workers, lease recovery and job-wide admission limits.                                                    | [Run the Parquet worker protocol](#distributed-parquet-worker).                                                                                                                                 |
 | lake-retrieval  | `lint datafusion-lake`, `tests datafusion-lake` and `bash datafusion/lake/tests/check-dependencies.sh`. Covers indexed retrieval, weighted fusion, late reads and dependency isolation.                                                                    | `cargo nextest run --locked --cargo-profile ci -p datafusion-lake -E 'test(search::)'` replays the retrieval contract with local fixtures.                                                      |
 | dist-plan       | `lint datafusion-dist` and `tests datafusion-dist` (target `dist`). Covers map-only admission, zero-input file scan extensions, versioned operator and file codecs, split fingerprints and metric isolation.                                               | `DIST_FUZZ_CASES=36 DIST_FUZZ_SEED=2026 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --test dist fuzz`. Use `DIST_FUZZ_REPLAY=dataset_seed,case_seed` for one failing case. |
 | dist-ai         | `lint datafusion-dist --features ai` and `tests datafusion-dist --features ai`. Covers `LlmExec` transport, worker provider registration, speculation policy and metrics across attempts.                                                                  | `cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai --test dist ai_codec`.                                                                                          |
@@ -101,15 +101,16 @@ dist-worker commit-split --job stage-job.json --artifact attempt.json
 dist-worker finalize-stage --job stage-job.json
 
 python3 datafusion/dist/python/ray_driver.py --worker dist-worker --ray-address auto \\
+  --pool-size 4 --max-global-inflight 2 --max-splits-per-minute 120 \\
   --sql 'SELECT id FROM input' --table input=/shared/input --job stage-job.json --output-root /shared/out
 ```
 
-Run the driver on the Ray head to use the cluster's Python and Ray versions. On the `ray-vlm` head the driver runs with Python 3.10.18 and Ray 2.47.1. Copy only the driver script to the head and stream the worker environment from the caller's stdin.
+Run the driver on the Ray head to use the cluster's Python and Ray versions. On the `ray-vlm` head the driver runs with Python 3.10.18 and Ray 2.47.1. Copy the Python directory to the head and stream the worker environment from the caller's stdin.
 
 ```bash
-kubectl -n ray-vlm cp datafusion/dist/python/ray_driver.py vlm-head-tfczb:/tmp/ray_driver.py -c ray-head
+kubectl -n ray-vlm cp datafusion/dist/python vlm-head-tfczb:/tmp/dist-python -c ray-head
 kubectl -n ray-vlm exec -i vlm-head-tfczb -c ray-head -- \\
-  python3 -B /tmp/ray_driver.py --ray-address auto --secrets-stdin \\
+  python3 -B /tmp/dist-python/ray_driver.py --ray-address auto --secrets-stdin \\
   --worker s3://artifacts/dist-worker --sql 'SELECT id FROM input' \\
   --table input=s3://datasets/input/ --job /tmp/stage-job.json \\
   --output-root s3://results/df-dist-run < /tmp/secrets.json
@@ -119,9 +120,15 @@ With `--ray-address auto` or no address, the driver calls `ray.init()`. Ray Clie
 
 The input is one JSON object mapping environment names to strings. Include the worker's S3 settings, provider configuration, credential values, and any CA variables. Use `--secrets-file PATH` with a regular `0600` file as an alternative to `--secrets-stdin`. In Ray Jobs mode the file must be available to the coordinator outside the submitted working directory. With neither option, the driver can collect recognized worker settings from its existing environment.
 
-The driver puts the environment object into Ray's object store before planning. The coordinator and tasks use it in their child process environments. The task decorator omits `runtime_env` because Ray's agent can log it at INFO level. Keep credentials out of the job submission runtime environment as well. Stage jobs carry plans and store locations. Data in the Ray object store is subject to the cluster's access and object spilling configuration.
+The driver puts the environment object into Ray's object store before planning. Actors and tasks receive a tuple containing its reference and pass the values to their child processes through the environment. Keep credentials out of the job submission runtime environment because Ray's agent can log it at INFO level. The driver discards raw daemon stderr and redacts configured values in reported errors. Stage jobs carry plans and store locations. In-memory-only credential handling requires Ray's object store and any spill or fallback storage to be memory-backed.
 
-For a shared worker binary, pass its local path or command name. With `--worker s3://bucket/key`, both the coordinator and each task download the executable into a temporary directory using boto3 first and the AWS CLI as a fallback. The binary must run on both the coordinator and worker nodes.
+For a shared worker binary, pass its local path or command name. With `--worker s3://bucket/key`, the coordinator and each actor download the executable once using boto3 first and the AWS CLI as a fallback. The binary must run on both the coordinator and worker nodes. Actor mode is the default. `--pool-size` defaults to `--concurrency` and caps the number of one-CPU actors. Use `--execution-mode task` to run the stateless worker CLI per attempt, including compatibility with binaries built before `serve`.
+
+Each actor runs one split at a time in a resident `dist-worker serve` process. The daemon loads the stage once and reuses its runtime, object stores, and HTTP connection pools. A dedicated Tokio reactor thread keeps the clients active while the protocol thread waits on stdin. The coordinator uses a separate local daemon for the entire job's commits and finalization. On lease expiry the driver ignores the old receipt, revokes the attempt, and retries with the next attempt ID. Revocation kills and reaps a stuck daemon before reusing its slot. A replacement daemon loads the job again using the actor's existing executable. On Linux the daemon also receives a kill signal if its actor process dies.
+
+`--max-global-inflight` caps active split attempts across the job. `--max-splits-per-minute N` permits one initial dispatch and refills a one-token bucket every `60 / N` seconds. The coordinator queues excess work and counts retries as fresh dispatches. Backend request concurrency and retries within a split follow their own settings.
+
+`dist-worker serve` accepts newline-delimited JSON on stdin and replies with one JSON line per request on stdout. Send `{"command":"ping"}` to get the protocol name. Send `load_job` with a nonempty `job_id` and the parsed stage-job object in `job`. An optional `output_root` follows the same checkpoint-root rules as the stateless CLI. With that job ID, send `run_split` with `split_id` and `attempt_id`, `commit_split` with the resulting `receipt`, or `finalize_stage`. Success replies contain `ok: true` and `result`. Failure replies contain `ok: false` and an `error` object with `code` and `message`. After the last request, send `{"command":"shutdown"}` or close stdin.
 
 `plan` writes the complete inventory and a `pending_splits` list of split and first-attempt IDs. Use the `pending_splits` list when resuming. The driver checks attempt IDs before publication. Each accepted receipt names immutable files and carries byte counts, row counts and hashes. The sink streams the full candidate files to verify their hashes during commit and also reads an existing winner before accepting it. It validates the marker identity and file presence during resume and finalization. `COMMITTED.json` selects the first durable winner per split. Later attempts accept that winner after verification, even if their output differs. `STAGE_MANIFEST.json` lists those winners in split ID order. Read the Parquet files named by the manifest.
 
@@ -133,12 +140,15 @@ Worker receipts carry `input_tokens`, `output_tokens`, `llm_requests` and `llm_r
 
 ```bash
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --bin dist-worker
+cargo nextest run --locked --cargo-profile ci -p datafusion-dist --test worker serve
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai --test worker multimodal_parquet_outputs
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai-http --test worker openai_ca_cert
 cargo tree --locked -p datafusion-dist --features ai
 cargo tree --locked -p datafusion-dist --features ai-http
 python3 -m unittest discover -s datafusion/dist/python -v
 ```
+
+With Ray installed locally and the pinned `parquet-testing` fixtures available, set `DIST_WORKER_E2E` to the built `dist-worker` executable and rerun the Python suite to exercise the actor pool and read back its committed Parquet output.
 
 ## Distributed scheduler replay
 
