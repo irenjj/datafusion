@@ -10,6 +10,7 @@ mod http;
 mod logical;
 mod options;
 mod physical;
+mod schema;
 mod stream;
 
 pub use backend::{
@@ -36,7 +37,7 @@ pub enum TaskKind {
     Chat,
     /// Text embedding.
     Embed,
-    /// Text completion with one media reference per prompt.
+    /// Text completion with one or more ordered images per prompt.
     Vision,
 }
 

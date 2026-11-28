@@ -7,17 +7,24 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion_common::{DataFusionError, Result, plan_err};
-use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{
+    self, Deserialize, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor,
+};
 use serde_json::{Map, Value};
 
 use super::TaskKind;
+use super::schema::{ResponseSchema, SchemaInput};
 use crate::AiErrorType;
 
 const MAX_DIMENSION: u32 = 1 << 20;
 const DEFAULT_MEDIA_BYTES: u64 = 8 << 20;
 const MAX_MEDIA_BYTES: u64 = 32 << 20;
+const DEFAULT_MEDIA_ITEMS: u32 = 16;
+const MAX_MEDIA_ITEMS: u32 = 64;
+const DEFAULT_ROW_MEDIA_BYTES: u64 = 32 << 20;
+const MAX_ROW_MEDIA_BYTES: u64 = 128 << 20;
 
-/// Determines how an inference slice handles a terminal backend error.
+/// Determines how inference handles terminal request and row errors.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnError {
@@ -46,13 +53,17 @@ pub struct LlmOptions {
     pub timeout_ms: Option<u64>,
     /// Maximum retries after the initial attempt. Defaults to 3.
     pub max_retries: Option<usize>,
-    /// Action when a request fails permanently or exhausts retries.
+    /// Action when a request or an individual output row fails.
     #[serde(default)]
     pub on_error: OnError,
     /// Output dimension required for `embed()`.
     pub dimension: Option<u32>,
     /// Maximum bytes to read per media reference. Defaults to 8 MiB.
     pub max_media_bytes: Option<u64>,
+    /// Maximum images per vision row, between 1 and 64. Defaults to 16.
+    pub max_media_items: Option<u32>,
+    /// Maximum total image bytes per vision row. Defaults to 32 MiB and caps at 128 MiB.
+    pub max_row_media_bytes: Option<u64>,
     /// Reuse identical calls in a SELECT for non-volatile prompts. Defaults to true.
     pub deduplicate: Option<bool>,
     /// Optional system message.
@@ -65,14 +76,15 @@ pub struct LlmOptions {
     pub top_p: Option<f64>,
     /// Nonempty list of nonempty stop strings.
     pub stop: Option<Vec<String>>,
+    /// A JSON Schema object for typed `llm()` and `vlm()` completion values.
+    pub response_schema: Option<Value>,
     /// Provider-specific body fields. Credential keys are forbidden at any depth.
     pub extra_body: Option<Map<String, Value>>,
 }
 
 impl LlmOptions {
-    pub(super) fn parse(json: &str) -> Result<(Self, String)> {
-        // Check duplicate members before materializing the object. Let serde_json
-        // decode numbers so its arbitrary_precision representation stays internal.
+    pub(super) fn parse(json: &str) -> Result<(Self, String, Option<ResponseSchema>)> {
+        // Scan even overwritten members before letting serde_json decode values.
         let _: CheckedOptions =
             serde_json::from_str(json).map_err(|error| invalid_options(&error))?;
         let mut value: Value =
@@ -93,7 +105,14 @@ impl LlmOptions {
             );
         }
         value.sort_all_objects();
-        let canonical = value.to_string();
+        let schema = value
+            .get("response_schema")
+            .map(|_| SchemaInput::from_options(json))
+            .transpose()?;
+        let canonical = match &schema {
+            Some(schema) => schema.canonical_options(value.as_object().unwrap()),
+            None => value.to_string(),
+        };
         let options: Self =
             serde_json::from_value(value).map_err(|error| invalid_options(&error))?;
         if options
@@ -122,6 +141,24 @@ impl LlmOptions {
             return invalid_value("max_media_bytes", "at most 33554432 bytes");
         }
         if options
+            .max_media_items
+            .is_some_and(|limit| !(1..=MAX_MEDIA_ITEMS).contains(&limit))
+        {
+            return invalid_value(
+                "max_media_items",
+                &format!("between 1 and {MAX_MEDIA_ITEMS}"),
+            );
+        }
+        if options
+            .max_row_media_bytes
+            .is_some_and(|limit| limit > MAX_ROW_MEDIA_BYTES)
+        {
+            return invalid_value(
+                "max_row_media_bytes",
+                &format!("at most {MAX_ROW_MEDIA_BYTES} bytes"),
+            );
+        }
+        if options
             .temperature
             .is_some_and(|t| !t.is_finite() || t < 0.0)
         {
@@ -137,7 +174,18 @@ impl LlmOptions {
         {
             return invalid_value("stop", "a non-empty list of non-empty strings");
         }
-        Ok((options, canonical))
+        if schema.is_some()
+            && options
+                .extra_body
+                .as_ref()
+                .is_some_and(|body| body.contains_key("response_format"))
+        {
+            return plan_err!(
+                "response_schema conflicts with extra_body.response_format"
+            );
+        }
+        let schema = schema.as_ref().map(SchemaInput::compile).transpose()?;
+        Ok((options, canonical, schema))
     }
 
     pub(super) fn embedding_dimension(&self) -> Result<i32> {
@@ -153,13 +201,30 @@ impl LlmOptions {
         self.max_media_bytes.unwrap_or(DEFAULT_MEDIA_BYTES)
     }
 
-    pub(super) fn output_field(&self, kind: TaskKind, name: &str) -> Result<FieldRef> {
-        let data_type = match kind {
-            TaskKind::Embed => DataType::FixedSizeList(
+    pub(super) fn media_item_limit(&self) -> usize {
+        self.max_media_items.unwrap_or(DEFAULT_MEDIA_ITEMS) as usize
+    }
+
+    pub(super) fn row_media_byte_limit(&self) -> u64 {
+        self.max_row_media_bytes.unwrap_or(DEFAULT_ROW_MEDIA_BYTES)
+    }
+
+    pub(super) fn output_field(
+        &self,
+        kind: TaskKind,
+        name: &str,
+        schema: Option<&ResponseSchema>,
+    ) -> Result<FieldRef> {
+        let data_type = match (kind, schema) {
+            (TaskKind::Embed, Some(_)) => {
+                return plan_err!("embed() does not support response_schema");
+            }
+            (TaskKind::Embed, None) => DataType::FixedSizeList(
                 Arc::new(Field::new_list_field(DataType::Float32, false)),
                 self.embedding_dimension()?,
             ),
-            TaskKind::Chat | TaskKind::Vision => DataType::Utf8,
+            (_, Some(schema)) => schema.data_type().clone(),
+            (_, None) => DataType::Utf8,
         };
         let field = if self.on_error == OnError::Envelope {
             AiErrorType::new(data_type).field(name, false)?
@@ -198,11 +263,30 @@ impl<'de> Deserialize<'de> for CheckedOptions {
     fn deserialize<D: Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        deserializer.deserialize_any(OptionsVisitor).map(|()| Self)
+        OptionsVisitor::Root
+            .deserialize(deserializer)
+            .map(|()| Self)
     }
 }
 
-struct OptionsVisitor;
+#[derive(Clone, Copy)]
+enum OptionsVisitor {
+    Root,
+    Schema,
+    PropertyNames,
+    Other,
+}
+
+impl<'de> DeserializeSeed<'de> for OptionsVisitor {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
 
 impl<'de> Visitor<'de> for OptionsVisitor {
     type Value = ();
@@ -239,7 +323,7 @@ impl<'de> Visitor<'de> for OptionsVisitor {
         self,
         mut seq: A,
     ) -> std::result::Result<(), A::Error> {
-        while seq.next_element::<CheckedOptions>()?.is_some() {}
+        while seq.next_element_seed(Self::Other)?.is_some() {}
         Ok(())
     }
 
@@ -249,10 +333,17 @@ impl<'de> Visitor<'de> for OptionsVisitor {
     ) -> std::result::Result<(), A::Error> {
         // Check each key as it is read, including members a duplicate key might overwrite.
         while let Some(key) = map.next_key::<String>()? {
-            if is_sensitive_key(&key) {
+            if !matches!(self, Self::PropertyNames) && is_sensitive_key(&key) {
                 return Err(de::Error::custom("contains a sensitive credential key"));
             }
-            map.next_value::<CheckedOptions>()?;
+            let child = match (self, key.as_str()) {
+                (Self::Root, "response_schema")
+                | (Self::Schema, "items")
+                | (Self::PropertyNames, _) => Self::Schema,
+                (Self::Schema, "properties") => Self::PropertyNames,
+                _ => Self::Other,
+            };
+            map.next_value_seed(child)?;
         }
         Ok(())
     }
@@ -301,7 +392,7 @@ mod tests {
 
     #[test]
     fn parses_typed_options_and_recursively_sorts_json() {
-        let (options, canonical) = LlmOptions::parse(
+        let (options, canonical, _) = LlmOptions::parse(
             r#"{"top_p":0.75,"extra_body":{"z":[{"b":0.125,"a":2}],"a":{}}, "on_error":"ignore","max_retries":0,"temperature":0.25}"#,
         )
         .unwrap();
@@ -313,5 +404,31 @@ mod tests {
             canonical,
             r#"{"extra_body":{"a":{},"z":[{"a":2,"b":0.125}]},"max_retries":0,"on_error":"ignore","temperature":0.25,"top_p":0.75}"#
         );
+    }
+
+    #[test]
+    fn credential_scan_exempts_only_schema_property_names() {
+        let accepted =
+            r#"{"response_schema":{"properties":{"token":{"type":"string"}}}}"#;
+        serde_json::from_str::<CheckedOptions>(accepted).unwrap();
+        let valid = r#"{"response_schema":{"type":"object","properties":{
+            "token":{"type":"string"},
+            "rows":{"type":"array","items":{"type":"object","properties":{
+                "password":{"type":"integer"},"api_key":{"type":"boolean"}
+            }}}
+        }}}"#;
+        assert!(LlmOptions::parse(valid).is_ok());
+        for json in [
+            r#"{"extra_body":{"token":"x"}}"#,
+            r#"{"response_schema":{"properties":{"token":{"default":"x"}}},"extra_body":{"api_key":"x"}}"#,
+            r#"{"extra_body":{"response_schema":{"properties":{"token":{"type":"string"}}}}}"#,
+            r#"{"response_schema":{"properties":{"token":{"secret":"x"}}}}"#,
+            r#"{"response_schema":{"properties":{"token":{"default":{"password":"x"}}}}}"#,
+        ] {
+            assert!(
+                matches!(LlmOptions::parse(json), Err(DataFusionError::Plan(message)) if message.contains("sensitive credential key")),
+                "{json}"
+            );
+        }
     }
 }

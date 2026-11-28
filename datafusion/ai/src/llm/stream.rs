@@ -18,6 +18,7 @@ use arrow::datatypes::{DataType, SchemaRef, UInt64Type};
 use arrow::record_batch::RecordBatch;
 use futures::stream::{FuturesUnordered, Stream, StreamExt, once};
 use tokio::sync::{Semaphore, mpsc};
+use url::Url;
 
 use datafusion_common::{Result, exec_datafusion_err, exec_err, internal_err, plan_err};
 use datafusion_execution::SendableRecordBatchStream;
@@ -31,6 +32,7 @@ use datafusion_physical_plan::stream::{
 };
 
 use super::backend::RegisteredProvider;
+use super::schema::ResponseSchema;
 use super::{
     CancellationToken, LlmBackendError, LlmEmbeddingResponse, LlmOptions, LlmRequest,
     LlmResponse, LlmUsage, MediaPlan, OnError, TaskKind,
@@ -48,6 +50,7 @@ pub(super) struct Dispatch {
     pub(super) options: Arc<LlmOptions>,
     pub(super) kind: TaskKind,
     pub(super) provider_name: String,
+    response_schema: Option<ResponseSchema>,
     dimension: Option<i32>,
     provider: RegisteredProvider,
     slots: Arc<Semaphore>,
@@ -59,6 +62,7 @@ impl Dispatch {
     pub(super) fn try_new(
         model: String,
         options: LlmOptions,
+        response_schema: Option<ResponseSchema>,
         kind: TaskKind,
         provider: RegisteredProvider,
         provider_name: String,
@@ -80,6 +84,7 @@ impl Dispatch {
         Ok(Self {
             model,
             kind,
+            response_schema,
             dimension: (kind == TaskKind::Embed)
                 .then(|| options.embedding_dimension())
                 .transpose()?,
@@ -95,7 +100,7 @@ impl Dispatch {
     async fn generate(
         &self,
         prompts: Vec<String>,
-        media: Vec<Option<ResolvedMedia>>,
+        media: Vec<Option<Vec<ResolvedMedia>>>,
         metrics: &LlmMetrics,
         cancel: &CancellationToken,
     ) -> std::result::Result<Outputs, LlmBackendError> {
@@ -201,13 +206,35 @@ enum Outputs {
     Embeddings(LlmEmbeddingResponse),
 }
 
+struct DecodedOutputs {
+    values: ArrayRef,
+    usage: Option<LlmUsage>,
+    schema_errors: Vec<(usize, LlmBackendError)>,
+}
+
 impl Outputs {
-    fn into_array(self, value_type: &DataType) -> Result<(ArrayRef, Option<LlmUsage>)> {
+    fn into_array(
+        self,
+        value_type: &DataType,
+        schema: Option<&ResponseSchema>,
+        output_rows: impl Iterator<Item = usize>,
+    ) -> Result<DecodedOutputs> {
         match self {
-            Self::Completions(response) => Ok((
-                Arc::new(StringArray::from(response.outputs)),
-                response.usage,
-            )),
+            Self::Completions(response) => {
+                let (values, schema_errors) = if let Some(schema) = schema {
+                    schema.decode_array(response.outputs, output_rows)?
+                } else {
+                    (
+                        Arc::new(StringArray::from(response.outputs)) as ArrayRef,
+                        Vec::new(),
+                    )
+                };
+                Ok(DecodedOutputs {
+                    values,
+                    usage: response.usage,
+                    schema_errors,
+                })
+            }
             Self::Embeddings(response) => {
                 let DataType::FixedSizeList(item, dimension) = value_type else {
                     return internal_err!(
@@ -223,7 +250,11 @@ impl Outputs {
                     Arc::new(values),
                     None,
                 )?;
-                Ok((Arc::new(list), response.usage))
+                Ok(DecodedOutputs {
+                    values: Arc::new(list),
+                    usage: response.usage,
+                    schema_errors: Vec::new(),
+                })
             }
         }
     }
@@ -405,7 +436,7 @@ impl Driver {
                         continue;
                     }
                     let nulls = new_null_array(self.value_type(), slice.rows.num_rows());
-                    self.append_output(&slice.rows, nulls, None, &[])?
+                    self.append_output(&slice.rows, nulls, std::iter::empty())?
                 }
             };
             // A completed job has released both slots before awaiting output capacity.
@@ -502,7 +533,11 @@ impl Driver {
                 tracking.pending = false;
                 drop(tracking);
                 let nulls = new_null_array(self.value_type(), rows.num_rows());
-                return self.append_output(&rows, nulls, None, &media_errors);
+                return self.append_output(
+                    &rows,
+                    nulls,
+                    media_errors.iter().map(|(row, error)| (*row, error)),
+                );
             }
             let response = self
                 .dispatch
@@ -512,15 +547,7 @@ impl Driver {
             drop(tracking);
             match response {
                 Ok(response) => {
-                    let (mut output, usage) = response.into_array(self.value_type())?;
-                    if let Some(usage) = usage {
-                        self.metrics.record_usage(usage)?;
-                    }
-                    if !media_errors.is_empty() {
-                        output =
-                            take(output.as_ref(), &UInt64Array::from(indices), None)?;
-                    }
-                    self.append_output(&rows, output, None, &media_errors)
+                    self.append_response(&rows, response, indices, &media_errors)
                 }
                 Err(error) => {
                     if matches!(error, LlmBackendError::Cancelled)
@@ -530,7 +557,10 @@ impl Driver {
                     }
                     self.handle_failure(&error, count)?;
                     let nulls = new_null_array(self.value_type(), rows.num_rows());
-                    self.append_output(&rows, nulls, Some(&error), &media_errors)
+                    let row_errors = (0..rows.num_rows())
+                        .map(|row| (row, &error))
+                        .chain(media_errors.iter().map(|(row, error)| (*row, error)));
+                    self.append_output(&rows, nulls, row_errors)
                 }
             }
         }
@@ -540,22 +570,67 @@ impl Driver {
         &self,
         values: &dyn Array,
         row: usize,
-    ) -> std::result::Result<ResolvedMedia, LlmBackendError> {
+    ) -> std::result::Result<Vec<ResolvedMedia>, LlmBackendError> {
         let result = async {
-            let media = media_ref_at(values, row)?;
-            media.validate()?;
+            let list = match values.data_type() {
+                DataType::List(_) => Some(values.as_list::<i32>().value(row)),
+                DataType::LargeList(_) => Some(values.as_list::<i64>().value(row)),
+                DataType::FixedSizeList(_, _) => {
+                    Some(values.as_fixed_size_list().value(row))
+                }
+                _ => None,
+            };
+            let (values, items) = match &list {
+                Some(list) => (list.as_ref(), 0..list.len()),
+                None => (values, row..row + 1),
+            };
+            if items.is_empty() {
+                return exec_err!("media list must not be empty");
+            }
+            let options = &self.dispatch.options;
+            let item_limit = options.media_item_limit();
+            if items.len() > item_limit {
+                return exec_err!("media list exceeds max_media_items {item_limit}");
+            }
+            let references = items
+                .map(|item| {
+                    let media = media_ref_at(values, item)?;
+                    media.validate()?;
+                    if list.is_some()
+                        && (media.uri.contains(char::is_whitespace)
+                            || Url::parse(&media.uri).is_err())
+                    {
+                        return exec_err!("invalid media URI");
+                    }
+                    Ok(media)
+                })
+                .collect::<Result<Vec<_>>>()?;
             let resolver = self
                 .media
                 .as_ref()
                 .and_then(|media| media.resolver.as_ref())
                 .expect("vision media plan has a resolver");
-            let limit = self.dispatch.options.media_byte_limit();
-            let mut resolved = resolver.resolve(&media, Some(limit)).await?;
-            if resolved.bytes.len() as u64 > limit {
-                return exec_err!("resolved media exceeds max_bytes {limit}");
+            let limit = options.media_byte_limit();
+            let row_limit = options.row_media_byte_limit();
+            let mut remaining = row_limit;
+            let mut images = Vec::with_capacity(references.len());
+            for media in references {
+                let mut resolved =
+                    resolver.resolve(&media, Some(limit.min(remaining))).await?;
+                let size = resolved.bytes.len() as u64;
+                if size > limit {
+                    return exec_err!("resolved media exceeds max_bytes {limit}");
+                }
+                if size > remaining {
+                    return exec_err!(
+                        "resolved media exceeds max_row_media_bytes {row_limit}"
+                    );
+                }
+                remaining -= size;
+                resolved.mime = resolved.mime.or(media.mime);
+                images.push(resolved);
             }
-            resolved.mime = resolved.mime.or(media.mime);
-            Ok(resolved)
+            Ok(images)
         }
         .await;
         result.map_err(|error| {
@@ -590,18 +665,57 @@ impl Driver {
 
     fn value_type(&self) -> &DataType {
         let output = self.schema.fields().last().unwrap().data_type();
-        if let DataType::Struct(fields) = output {
+        if self.dispatch.options.on_error == OnError::Envelope
+            && let DataType::Struct(fields) = output
+        {
             return fields[0].data_type();
         }
         output
     }
 
-    fn append_output(
+    fn append_response(
+        &self,
+        rows: &RecordBatch,
+        response: Outputs,
+        indices: Vec<Option<u64>>,
+        media_errors: &[(usize, LlmBackendError)],
+    ) -> Result<RecordBatch> {
+        let indices = (!media_errors.is_empty()).then(|| UInt64Array::from(indices));
+        let output_rows = (0..rows.num_rows())
+            .filter(|&row| indices.as_ref().is_none_or(|indices| indices.is_valid(row)));
+        let DecodedOutputs {
+            mut values,
+            usage,
+            schema_errors,
+        } = response.into_array(
+            self.value_type(),
+            self.dispatch.response_schema.as_ref(),
+            output_rows,
+        )?;
+        if let Some(usage) = usage {
+            self.metrics.record_usage(usage)?;
+        }
+        for (_, error) in &schema_errors {
+            self.handle_failure(error, 1)?;
+        }
+        if let Some(indices) = &indices {
+            values = take(values.as_ref(), indices, None)?;
+        }
+        self.append_output(
+            rows,
+            values,
+            media_errors
+                .iter()
+                .chain(&schema_errors)
+                .map(|(row, error)| (*row, error)),
+        )
+    }
+
+    fn append_output<'a>(
         &self,
         rows: &RecordBatch,
         mut output: ArrayRef,
-        batch_error: Option<&LlmBackendError>,
-        media_errors: &[(usize, LlmBackendError)],
+        row_errors: impl Iterator<Item = (usize, &'a LlmBackendError)>,
     ) -> Result<RecordBatch> {
         if self.dispatch.options.on_error == OnError::Envelope {
             let DataType::Struct(fields) =
@@ -612,14 +726,11 @@ impl Driver {
             let mut code = StringBuilder::new();
             let mut message = StringBuilder::new();
             let mut retryable = BooleanBuilder::new();
-            let mut media_errors = media_errors.iter().peekable();
-            for row in 0..rows.num_rows() {
-                let error = if media_errors.peek().is_some_and(|(index, _)| *index == row)
-                {
-                    media_errors.next().map(|(_, error)| error)
-                } else {
-                    batch_error
-                };
+            let mut errors = vec![None; rows.num_rows()];
+            for (row, error) in row_errors {
+                errors[row] = Some(error);
+            }
+            for error in errors {
                 if let Some(error) = error {
                     let (kind, retry) = error.classification();
                     let wire_code = serde_json::to_value(kind)
@@ -703,12 +814,19 @@ impl PromptBatch {
     fn next_slice(&mut self, batch_size: usize) -> Result<PromptSlice> {
         let start = self.offset;
         let end = start + (self.rows.num_rows() - start).min(batch_size);
-        let is_null = self.values.is_null(start);
+        let list = self
+            .media
+            .as_ref()
+            .filter(|media| media.data_type().is_list());
+        let skip_row = |row| {
+            self.values.is_null(row) || list.is_some_and(|media| media.is_null(row))
+        };
+        let skipped = skip_row(start);
         let end = (start + 1..end)
-            .find(|&row| self.values.is_null(row) != is_null)
+            .find(|&row| skip_row(row) != skipped)
             .unwrap_or(end);
         let indices = start..end;
-        let prompts = if is_null {
+        let prompts = if skipped {
             Vec::new()
         } else {
             match self.values.data_type() {
@@ -740,7 +858,7 @@ impl PromptBatch {
         };
         self.offset = end;
         let len = end - start;
-        let media = if is_null {
+        let media = if skipped {
             None
         } else {
             self.media.as_ref().map(|media| media.slice(start, len))

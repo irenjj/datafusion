@@ -36,34 +36,18 @@ pub(super) struct LlmMarkerUdf {
 
 impl LlmMarkerUdf {
     pub(super) fn new(kind: TaskKind) -> Self {
-        let strings = [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View];
-        let mut signatures = Vec::new();
-        for prompt in &strings {
-            if kind == TaskKind::Vision {
-                for media in strings
-                    .iter()
-                    .cloned()
-                    .chain([MediaRefType::storage_type()])
-                {
-                    signatures.push(TypeSignature::Exact(vec![
-                        prompt.clone(),
-                        media,
-                        DataType::Utf8,
-                        DataType::Utf8,
-                    ]));
-                }
-            } else {
-                signatures.push(TypeSignature::Exact(vec![
-                    prompt.clone(),
-                    DataType::Utf8,
-                    DataType::Utf8,
-                ]));
-            }
-        }
-        Self {
-            kind,
-            signature: Signature::one_of(signatures, Volatility::Volatile),
-        }
+        let signature = if kind == TaskKind::Vision {
+            Signature::user_defined(Volatility::Volatile)
+        } else {
+            let signatures = [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View]
+                .into_iter()
+                .map(|prompt| {
+                    TypeSignature::Exact(vec![prompt, DataType::Utf8, DataType::Utf8])
+                })
+                .collect();
+            Signature::one_of(signatures, Volatility::Volatile)
+        };
+        Self { kind, signature }
     }
 }
 
@@ -74,6 +58,24 @@ impl ScalarUDFImpl for LlmMarkerUdf {
 
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        let [prompt, media, _, _] = arg_types else {
+            return plan_err!("vlm() requires prompt, media, model, and options_json");
+        };
+        let prompt = if prompt.is_string() {
+            prompt.clone()
+        } else {
+            DataType::Utf8
+        };
+        // Preserve the actual type and child field metadata for media validation.
+        let media = if media.is_null() {
+            DataType::Utf8
+        } else {
+            media.clone()
+        };
+        Ok(vec![prompt, media, DataType::Utf8, DataType::Utf8])
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
@@ -94,13 +96,15 @@ impl ScalarUDFImpl for LlmMarkerUdf {
         if let Some(Some(value)) = args.scalar_arguments.get(model_index) {
             required_string(value, self.kind, model_name)?;
         }
-        let options = match args.scalar_arguments.get(options_index) {
+        let (options, schema) = match args.scalar_arguments.get(options_index) {
             Some(Some(value)) => {
-                LlmOptions::parse(required_string(value, self.kind, options_name)?)?.0
+                let (options, _, schema) =
+                    LlmOptions::parse(required_string(value, self.kind, options_name)?)?;
+                (options, schema)
             }
-            _ => LlmOptions::default(),
+            _ => (LlmOptions::default(), None),
         };
-        options.output_field(self.kind, self.name())
+        options.output_field(self.kind, self.name(), schema.as_ref())
     }
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -135,13 +139,22 @@ fn constant_string_error<T>(kind: TaskKind, name: &str) -> Result<T> {
 }
 
 pub(super) fn validate_media_field(field: &Field) -> Result<()> {
-    match field.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(()),
-        DataType::Struct(_) if field.try_extension_type::<MediaRefType>().is_ok() => {
-            Ok(())
-        }
-        _ => plan_err!("vlm() media must be a string URI or a df.media_ref v1 field"),
+    let item = match field.data_type() {
+        DataType::List(item)
+        | DataType::LargeList(item)
+        | DataType::FixedSizeList(item, _) => item,
+        _ => field,
+    };
+    if item.data_type().is_string()
+        || (matches!(item.data_type(), DataType::Struct(_))
+            && item.try_extension_type::<MediaRefType>().is_ok())
+    {
+        return Ok(());
     }
+    plan_err!(
+        "vlm() media must be a string URI or a df.media_ref v1 field, or a List, LargeList, or FixedSizeList of either, got {}",
+        field.data_type()
+    )
 }
 
 #[derive(Debug)]
@@ -175,7 +188,9 @@ impl ExprPlanner for MarkerExprPlanner {
                 && (marker.kind != TaskKind::Chat
                     || literal_string(&folded, marker.kind, "options_json")
                         .and_then(LlmOptions::parse)
-                        .is_ok_and(|(options, _)| options.on_error == OnError::Envelope))
+                        .is_ok_and(|(options, _, schema)| {
+                            options.on_error == OnError::Envelope || schema.is_some()
+                        }))
             {
                 *options = folded;
             }
@@ -515,7 +530,7 @@ impl OptimizerRule for LlmProjectRule {
                     }
                 };
                 let model = literal_string(&model, kind, "model")?.to_owned();
-                let (typed_options, options) =
+                let (typed_options, options, schema) =
                     LlmOptions::parse(literal_string(&options, kind, "options_json")?)?;
                 self.registry.resolve(typed_options.provider.as_deref())?;
                 let reusable = typed_options.deduplicate.unwrap_or(true)
@@ -573,7 +588,7 @@ impl OptimizerRule for LlmProjectRule {
                         kind,
                         model,
                         options,
-                        typed_options.output_field(kind, &output)?,
+                        typed_options.output_field(kind, &output, schema.as_ref())?,
                     )?),
                 }));
                 Ok(Transformed::yes(Expr::Column(Column::from_name(output))))
@@ -597,6 +612,177 @@ fn literal_string<'a>(expr: &'a Expr, kind: TaskKind, name: &str) -> Result<&'a 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_common::DataFusionError;
+
+    fn result_field(kind: TaskKind, json: &str) -> Result<FieldRef> {
+        let udf = LlmMarkerUdf::new(kind);
+        let model = ScalarValue::from("model");
+        let options = ScalarValue::from(json);
+        let mut names = vec!["text", "model", "options"];
+        let mut scalars = vec![None, Some(&model), Some(&options)];
+        if kind == TaskKind::Vision {
+            names.insert(1, "media");
+            scalars.insert(1, None);
+        }
+        let arg_fields: Vec<_> = names
+            .into_iter()
+            .map(|name| Arc::new(Field::new(name, DataType::Utf8, true)))
+            .collect();
+        udf.return_field_from_args(ReturnFieldArgs {
+            arg_fields: &arg_fields,
+            scalar_arguments: &scalars,
+        })
+    }
+
+    #[test]
+    fn response_schema_derives_nested_arrow_types_in_declaration_order() {
+        let schema = r#"{"response_schema":{
+            "type":"object",
+            "properties":{
+                "total":{"type":"integer"},
+                "state":{"enum":["on","off"],"type":"string"},
+                "flag":{"type":["null","boolean"]},
+                "events":{"type":"array","items":{
+                    "type":"object",
+                    "properties":{"when":{"type":"number"},"label":{"type":"string"}},
+                    "required":["label"]
+                }}
+            },
+            "required":["events","flag","total"],
+            "additionalProperties":false
+        }}"#;
+        let events = DataType::Struct(
+            vec![
+                Field::new("when", DataType::Float64, true),
+                Field::new("label", DataType::Utf8, false),
+            ]
+            .into(),
+        );
+        let expected = DataType::Struct(
+            vec![
+                Field::new("total", DataType::Int64, false),
+                Field::new("state", DataType::Utf8, true),
+                Field::new("flag", DataType::Boolean, true),
+                Field::new(
+                    "events",
+                    DataType::List(Arc::new(Field::new_list_field(events, false))),
+                    false,
+                ),
+            ]
+            .into(),
+        );
+        for kind in [TaskKind::Chat, TaskKind::Vision] {
+            let field = result_field(kind, schema).unwrap();
+            assert_eq!(field.data_type(), &expected);
+            assert!(field.is_nullable());
+        }
+    }
+
+    #[test]
+    fn response_schema_rejects_unsupported_or_malformed_schemas() {
+        for (property, keyword) in [
+            (r#"{"type":"string","anyOf":[]}"#, "anyOf"),
+            (r#"{"type":"string","oneOf":[]}"#, "oneOf"),
+            (r#"{"type":"string","allOf":[]}"#, "allOf"),
+            (r##"{"$ref":"#/$defs/type"}"##, "$ref"),
+            (
+                r#"{"type":"object","patternProperties":{}}"#,
+                "patternProperties",
+            ),
+            (r#"{"type":"null"}"#, "null"),
+            (r#"{"type":["string","integer"]}"#, "type"),
+            (
+                r#"{"type":"array","items":[{"type":"string"}]}"#,
+                "response_schema",
+            ),
+            (
+                r#"{"type":"object","properties":{},"additionalProperties":true}"#,
+                "additionalProperties",
+            ),
+            (r#"{"type":"boolean","enum":["x"]}"#, "enum"),
+            (r#"{"type":"string","required":["other"]}"#, "required"),
+            (
+                r#"{"type":"object","properties":{"x":{"type":"string"}},"required":["unknown"]}"#,
+                "required",
+            ),
+        ] {
+            let json = format!(
+                r#"{{"response_schema":{{"type":"object","properties":{{"field":{property}}}}}}}"#,
+            );
+            let error = result_field(TaskKind::Chat, &json).unwrap_err();
+            assert!(
+                matches!(error, DataFusionError::Plan(ref message) if message.contains(keyword)),
+                "{error} for {property}"
+            );
+        }
+        for schema in [
+            "null",
+            r#"{"type":"object","properties":{}}"#,
+            r#"{"type":["object","null"],"properties":{"a":{"type":"integer"}}}"#,
+            r#"{"type":"string"}"#,
+        ] {
+            let error = result_field(
+                TaskKind::Chat,
+                &format!(r#"{{"response_schema":{schema}}}"#),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, DataFusionError::Plan(ref message) if message.contains("response_schema")),
+                "{error} for {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn embed_rejects_response_schema_at_planning() {
+        let error = result_field(
+            TaskKind::Embed,
+            r#"{"dimension":2,"response_schema":{"type":"object","properties":{"x":{"type":"string"}}}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, DataFusionError::Plan(message) if message.contains("embed()") && message.contains("response_schema"))
+        );
+    }
+
+    #[test]
+    fn response_schema_bounds_depth_and_total_properties() {
+        let object = |children: &str| {
+            format!(r#"{{"type":"object","properties":{{{children}}}}}"#)
+        };
+        let depth = (0..16).fold(r#"{"type":"string"}"#.to_owned(), |schema, _| {
+            object(&format!(r#""nested":{schema}"#))
+        });
+        let wide = (0..513)
+            .map(|i| format!(r#""f{i}":{{"type":"boolean"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (schema, limit) in [
+            (depth, "16"),
+            (object(&wide), ""), // A single object at this width remains valid.
+            (
+                object(&format!(
+                    r#""left":{},"right":{}"#,
+                    object(&wide),
+                    object(&wide)
+                )),
+                "1024",
+            ),
+        ] {
+            let result = result_field(
+                TaskKind::Chat,
+                &format!(r#"{{"response_schema":{schema}}}"#),
+            );
+            if limit.is_empty() {
+                result.unwrap();
+            } else {
+                assert!(
+                    matches!(result, Err(DataFusionError::Plan(message)) if message.contains(limit)),
+                    "expected a planning limit of {limit}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn embedding_result_requires_an_explicit_bounded_dimension() {
@@ -613,7 +799,7 @@ mod tests {
                 })
                 .unwrap_err();
             assert!(
-                matches!(error, datafusion_common::DataFusionError::Plan(message) if message.contains("dimension"))
+                matches!(error, DataFusionError::Plan(message) if message.contains("dimension"))
             );
         }
         let options = ScalarValue::from(r#"{"dimension":1024}"#);
