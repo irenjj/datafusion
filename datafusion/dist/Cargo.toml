@@ -15,10 +15,12 @@ publish = false
 workspace = true
 
 [features]
+ai = ["dep:datafusion-ai", "datafusion-ai/runtime"]
 parquet_encryption = ["datafusion/parquet_encryption"]
 
 [dependencies]
 datafusion = { workspace = true, features = ["parquet"] }
+datafusion-ai = { workspace = true, optional = true, features = ["runtime"] }
 datafusion-proto = { workspace = true, features = ["parquet"] }
 futures = { workspace = true }
 hex = { workspace = true }

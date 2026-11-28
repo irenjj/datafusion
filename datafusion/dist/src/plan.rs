@@ -80,7 +80,7 @@ pub struct Split {
     pub fingerprint: String,
 }
 
-/// An optimized map-only stage with an empty Parquet scan.
+/// An optimized map-only stage with an empty file scan.
 #[derive(Clone, Debug)]
 pub struct StagePlan {
     /// Coordinator-assigned stage identifier.
@@ -376,7 +376,7 @@ pub fn split_plan_for_distribution_with_codecs(
     let output_schema = plan.schema();
     let codec = DistPhysicalCodec::new(codecs.physical.clone());
     let mut files = Vec::new();
-    let template = rewrite_map_plan(plan, true, &codecs.physical, &mut |scan| {
+    let template = rewrite_map_plan(plan, true, &codecs.physical, &mut |_, scan| {
         for file in scan.file_groups.iter().flat_map(FileGroup::files) {
             files.push(
                 SplitFileEnvelope::encode_file(file, &codec, &codecs.file_extensions)
@@ -395,7 +395,7 @@ pub fn split_plan_for_distribution_with_codecs(
     let plan_bytes = physical_plan_to_bytes_with_proto_converter(
         template,
         &codec,
-        &MapPlanProtoConverter,
+        &MapPlanProtoConverter(&codec),
     )
     .map_err(as_plan_error)?
     .to_vec();
@@ -491,12 +491,14 @@ pub fn decode_stage_template_with_codecs(
     let task_ctx = worker_ctx.task_ctx();
     let codec = DistPhysicalCodec::new(codecs.physical.clone());
     let template = decode_plan(&stage.plan_bytes, &task_ctx, &codec)?;
-    let template = rewrite_map_plan(template, false, &codecs.physical, &mut |scan| {
+    let mut validate_scan = |_: &Arc<dyn ExecutionPlan>, scan: &FileScanConfig| {
         if !scan.file_groups.is_empty() {
-            return plan_err!("Map-only stage template must have an empty Parquet scan");
+            return plan_err!("Map-only stage template must have an empty file scan");
         }
         Ok(None)
-    })?;
+    };
+    let template =
+        rewrite_map_plan(template, false, &codecs.physical, &mut validate_scan)?;
     if template.schema() != stage.output_schema {
         return plan_err!(
             "Template output schema differs from stage {}",
@@ -539,7 +541,7 @@ pub fn bind_split_to_template_with_extensions(
     let codec = DistPhysicalCodec::new(stage.codecs.physical.clone());
     // Deserializing for each attempt gives the scan and all operators fresh metrics.
     let template = decode_plan(&stage.plan_bytes, &stage.task_ctx, &codec)?;
-    let plan = rewrite_map_plan(template, false, &stage.codecs.physical, &mut |scan| {
+    let mut bind_scan = |node: &Arc<dyn ExecutionPlan>, scan: &FileScanConfig| {
         let mut file = SplitFileEnvelope::decode_file(
             &split.file_proto,
             scan,
@@ -577,6 +579,10 @@ pub fn bind_split_to_template_with_extensions(
         {
             return plan_err!("Split byte range is outside the file or empty");
         }
+        if !scan.file_source().is::<ParquetSource>() {
+            return bind_extension_split(&stage.codecs.physical, node, scan, file)
+                .map(Some);
+        }
         // File-level counts and bounds may describe the whole file even when
         // DataFusion's scan repartitioner has assigned a range of it.
         if file.range.is_some() {
@@ -592,7 +598,8 @@ pub fn bind_split_to_template_with_extensions(
             .with_statistics(statistics)
             .build();
         Ok(Some(DataSourceExec::from_data_source(config)))
-    })?;
+    };
+    let plan = rewrite_map_plan(template, false, &stage.codecs.physical, &mut bind_scan)?;
     if plan.schema() != stage.output_schema {
         return plan_err!(
             "Bound plan output schema differs from stage {}",
@@ -612,7 +619,10 @@ fn rewrite_map_plan(
     plan: Arc<dyn ExecutionPlan>,
     strip_round_robin: bool,
     registry: &DistExtensionRegistry,
-    replace_scan: &mut impl FnMut(&FileScanConfig) -> Result<Option<Arc<dyn ExecutionPlan>>>,
+    replace_scan: &mut impl FnMut(
+        &Arc<dyn ExecutionPlan>,
+        &FileScanConfig,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let name = plan.name();
     let distribution = plan.input_distribution_requirements();
@@ -632,7 +642,50 @@ fn rewrite_map_plan(
     {
         let Some((scan, parquet)) = source.downcast_to_file_source::<ParquetSource>()
         else {
-            return plan_err!("Map-only distribution requires a Parquet FileScanConfig");
+            let Some(scan) = source.data_source().downcast_ref::<FileScanConfig>() else {
+                return plan_err!(
+                    "Map-only distribution requires a Parquet FileScanConfig"
+                );
+            };
+            if scan.limit.is_some() {
+                return plan_err!(
+                    "Map-only distribution does not support FileScanConfig.limit"
+                );
+            }
+            if !strip_round_robin && !scan.file_groups.is_empty() {
+                return plan_err!(
+                    "Map-only stage template must have empty file groups for {} FileSource",
+                    scan.file_source().file_type()
+                );
+            }
+            if scan.preserve_order
+                || !scan.output_ordering.is_empty()
+                || scan.output_partitioning.is_some()
+                || scan.expr_adapter_factory.is_some()
+            {
+                return plan_err!(
+                    "Map-only distribution does not support ordered, explicitly partitioned, or custom-adapter {} FileSource scans",
+                    scan.file_source().file_type()
+                );
+            }
+
+            let replacement = replace_scan(&plan, scan)?;
+            let template = if strip_round_robin {
+                let template = replacement.as_ref().unwrap_or(&plan);
+                for file in scan.file_groups.iter().flat_map(FileGroup::files) {
+                    bind_extension_split(registry, template, scan, file.clone())?;
+                }
+                template
+            } else {
+                &plan
+            };
+            if !registry
+                .policy_for(template.as_ref())?
+                .is_some_and(|policy| policy.map_only)
+            {
+                return Err(unsupported_file_source(scan));
+            }
+            return Ok(replacement.unwrap_or(plan));
         };
         if scan.limit.is_some() {
             return plan_err!(
@@ -669,7 +722,7 @@ fn rewrite_map_plan(
                 "Map-only distribution does not support custom Parquet reader factories"
             );
         }
-        return Ok(replace_scan(scan)?.unwrap_or(plan));
+        return Ok(replace_scan(&plan, scan)?.unwrap_or(plan));
     }
 
     if plan.fetch().is_some() {
@@ -716,6 +769,47 @@ fn rewrite_map_plan(
     }
 }
 
+fn bind_extension_split(
+    registry: &DistExtensionRegistry,
+    node: &Arc<dyn ExecutionPlan>,
+    scan: &FileScanConfig,
+    mut file: PartitionedFile,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let source = scan.file_source();
+    if file.range.is_some() {
+        if !source.supports_repartitioning() {
+            return plan_err!(
+                "Split byte range is not supported by {} FileSource",
+                source.file_type()
+            );
+        }
+        file.statistics = None;
+    }
+    let bound = registry
+        .bind_split(node, file)?
+        .ok_or_else(|| unsupported_file_source(scan))?;
+    if bound.schema() != node.schema() {
+        return plan_err!(
+            "Bound {} FileSource changed its output schema",
+            source.file_type()
+        );
+    }
+    if bound.properties().output_partitioning().partition_count() != 1 {
+        return plan_err!(
+            "Bound {} FileSource must have one partition",
+            source.file_type()
+        );
+    }
+    Ok(bound)
+}
+
+fn unsupported_file_source(scan: &FileScanConfig) -> DataFusionError {
+    plan_datafusion_err!(
+        "Map-only distribution does not support {} FileSource",
+        scan.file_source().file_type()
+    )
+}
+
 fn decode_plan(
     bytes: &[u8],
     task_ctx: &TaskContext,
@@ -725,7 +819,7 @@ fn decode_plan(
         bytes,
         task_ctx,
         codec,
-        &MapPlanProtoConverter,
+        &MapPlanProtoConverter(codec),
     )
     .map_err(as_plan_error)
 }

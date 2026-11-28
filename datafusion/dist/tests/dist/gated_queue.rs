@@ -285,7 +285,7 @@ async fn non_speculatable_plan_rejects_speculation() -> Result<()> {
     Ok(())
 }
 
-fn take_outputs(queue: LeasedSplitQueue) -> Result<Vec<SplitOutput>> {
+pub(super) fn take_outputs(queue: LeasedSplitQueue) -> Result<Vec<SplitOutput>> {
     let outputs = queue.committed_outputs()?;
     drop(queue);
     Ok(outputs

@@ -2,14 +2,18 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-//! Map-only physical plan transport and local execution of Parquet splits.
+//! Map-only physical plan transport and local execution of file splits.
 
+#[cfg(feature = "ai")]
+mod ai;
 mod codec;
 mod fingerprint;
 mod plan;
 mod runner;
 mod scheduler;
 
+#[cfg(feature = "ai")]
+pub use ai::LlmExecCodec;
 pub use codec::{
     DistExtensionRegistry, DistPhysicalCodec, ExtensionOperatorPolicy,
     NamedPhysicalExtensionCodec,
