@@ -262,7 +262,7 @@ class WorkerCli:
     redact = staticmethod(_redact)
 
     def __init__(self, executable, sql, tables, job_path, output_root, row_key=None,
-                 *, local_executable=None, payload=None):
+                 *, local_executable=None, payload=None, prepared=False):
         self.executable = executable
         self.local_executable = local_executable or executable
         self.sql = sql
@@ -271,15 +271,17 @@ class WorkerCli:
         self.output_root = output_root
         self.row_key = row_key
         self.payload = payload or {}
+        self._prepared = prepared
 
     def plan(self):
-        args = ["plan", "--sql", self.sql, "--out", str(self.job_path),
-                "--output-root", self.output_root]
-        for table in self.tables:
-            args.extend(("--table", table))
-        if self.row_key is not None:
-            args.extend(("--row-key", self.row_key))
-        _invoke(self.local_executable, args, payload=self.payload)
+        if not self._prepared:
+            args = ["plan", "--sql", self.sql, "--out", str(self.job_path),
+                    "--output-root", self.output_root]
+            for table in self.tables:
+                args.extend(("--table", table))
+            if self.row_key is not None:
+                args.extend(("--row-key", self.row_key))
+            _invoke(self.local_executable, args, payload=self.payload)
         return json.loads(self.job_path.read_bytes())
 
     def commit(self, receipt):
@@ -414,8 +416,12 @@ def _read_payload(stream):
         payload = json.load(stream)
     except (UnicodeError, ValueError):
         raise ValueError("Expected one JSON object of environment names and string values") from None
+    return _validate_payload(payload)
+
+
+def _validate_payload(payload):
     if not isinstance(payload, dict) or not all(
-            name and "=" not in name and "\0" not in name
+            isinstance(name, str) and name and "=" not in name and "\0" not in name
             and isinstance(value, str) and "\0" not in value
             for name, value in payload.items()):
         raise ValueError("Expected one JSON object of environment names and string values")
@@ -445,15 +451,63 @@ def _inherited_payload():
     return {name: os.environ[name] for name in names if name in os.environ}
 
 
+def _replay_args(args):
+    options = ["--base-output-root", args.base_output_root, "--output-root", args.output_root,
+               "--sql", args.sql, "--row-key", args.row_key, "--batch-size", str(args.batch_size)]
+    for table in args.table:
+        options.extend(("--table", table))
+    if args.stage_table is not None:
+        options.extend(("--stage-table", args.stage_table))
+    return options
+
+
+def _run_stage(stack, args, payload, limiter):
+    directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="dist-coordinator-"))
+    job_path = args.job or str(Path(directory) / "stage-job.json")
+    replay = _replay_args(args) if args.base_output_root is not None else None
+    worker = WorkerCli(args.worker, args.sql, args.table, job_path, args.output_root,
+                       args.row_key, payload=payload, prepared=replay is not None)
+    if replay is not None:
+        worker.local_executable = _worker_executable(args.worker, directory, payload)
+        if args.execution_mode == "local":
+            return _invoke(worker.local_executable, ["replay-dlq", *replay,
+                                                     "--timeout-secs", str(args.timeout),
+                                                     "--max-attempts", str(args.max_attempts)],
+                           payload=payload)
+        prepared = _invoke(worker.local_executable, ["plan-replay-dlq", *replay, "--out", job_path],
+                           payload=payload)
+        if "result" in prepared:
+            return prepared["result"]
+        attempt_id = prepared["attempt_id"]
+    if args.execution_mode == "actor":
+        coordinator, executor, concurrency = _actor_job(stack, worker, args)
+    else:
+        coordinator, concurrency = worker, args.concurrency
+        executor = RayExecutor(worker, args.timeout, args.ray_address,
+                               confirm_stop=args.max_global_inflight is not None)
+    if replay is None:
+        worker.local_executable = _worker_executable(args.worker, directory, payload)
+    manifest = drive(coordinator, lambda: executor, timeout=args.timeout, concurrency=concurrency,
+                     max_attempts=args.max_attempts, rate_limiter=limiter)
+    if replay is not None:
+        return _invoke(worker.local_executable,
+                       ["finalize-replay-dlq", *replay, "--attempt-id", str(attempt_id)],
+                       payload=payload)
+    return manifest
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--worker", default="dist-worker", help="Local executable or s3://bucket/key",
     )
     parser.add_argument("--sql", required=True)
-    parser.add_argument("--table", action="append", required=True)
-    parser.add_argument("--job", required=True)
+    parser.add_argument("--table", action="append", default=[])
+    parser.add_argument("--job")
     parser.add_argument("--output-root", required=True)
+    parser.add_argument("--base-output-root", help="Replay the failed keys from this finalized stage")
+    parser.add_argument("--stage-table", help="Use a finalized stage as the replay source (name=path)")
+    parser.add_argument("--batch-size", type=int, default=8192, help="Maximum replay source rows per split")
     parser.add_argument("--row-key")
     parser.add_argument("--ray-address")
     source = parser.add_mutually_exclusive_group()
@@ -462,7 +516,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--max-attempts", type=int, default=3)
-    parser.add_argument("--execution-mode", choices=("actor", "task"), default="actor")
+    parser.add_argument("--execution-mode", choices=("local", "actor", "task"), default="actor")
     parser.add_argument("--pool-size", type=int, help="Maximum actor count (defaults to --concurrency)")
     parser.add_argument("--max-global-inflight", type=int, help="Maximum active split attempts per job")
     parser.add_argument("--max-splits-per-minute", type=int, help="Maximum split dispatch rate per job")
@@ -471,6 +525,15 @@ def main():
         payload = {}
         try:
             _validate_ray_address(args.ray_address)
+            if args.base_output_root is None:
+                if not args.job or not args.table:
+                    raise ValueError("--table and --job are required when planning a stage")
+                if args.execution_mode == "local" or args.stage_table is not None:
+                    raise ValueError("Local execution and --stage-table require --base-output-root")
+            elif not args.row_key or args.batch_size < 1:
+                raise ValueError("Replay requires --row-key and a positive --batch-size")
+            if not math.isfinite(args.timeout) or args.timeout <= 0 or min(args.concurrency, args.max_attempts) < 1:
+                raise ValueError("timeout, concurrency, and max_attempts must be positive")
             if args.pool_size is not None and args.pool_size < 1:
                 raise ValueError("--pool-size must be positive")
             limiter = None
@@ -484,27 +547,11 @@ def main():
                 payload = _read_secrets_file(args.secrets_file)
             else:
                 payload = _inherited_payload()
-            worker = WorkerCli(args.worker, args.sql, args.table, args.job,
-                               args.output_root, args.row_key, payload=payload)
-            directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="dist-coordinator-"))
-            if args.execution_mode == "actor":
-                coordinator, executor, concurrency = _actor_job(stack, worker, args)
-            else:
-                coordinator, concurrency = worker, args.concurrency
-                executor = RayExecutor(
-                    worker, args.timeout, args.ray_address,
-                    confirm_stop=args.max_global_inflight is not None,
-                )
-            worker.local_executable = _worker_executable(args.worker, directory, payload)
-            manifest = drive(
-                coordinator, lambda: executor,
-                timeout=args.timeout, concurrency=concurrency,
-                max_attempts=args.max_attempts, rate_limiter=limiter,
-            )
+            manifest = _run_stage(stack, args, payload, limiter)
         except ValueError as error:
-            parser.error(_redact(str(error), payload))
-        except (OSError, RuntimeError) as error:
-            parser.exit(1, f"{_redact(str(error), payload)}\n")
+            parser.error(_redact(str(error), {**_inherited_payload(), **payload}))
+        except (OSError, RuntimeError, ImportError) as error:
+            parser.exit(1, f"{_redact(str(error), {**_inherited_payload(), **payload})}\n")
     print(json.dumps(manifest))
 
 

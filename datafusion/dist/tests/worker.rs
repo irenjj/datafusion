@@ -23,6 +23,9 @@ mod ai;
 #[path = "worker/serve.rs"]
 mod serve;
 
+#[path = "worker/replay.rs"]
+mod replay;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn worker() -> Command {

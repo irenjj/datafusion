@@ -187,6 +187,55 @@ def run_stage(*, sql, tables, output_root, row_key=None, worker="dist-worker",
     return StageResult._from_document(manifest, stage_root)
 
 
+def replay_dlq(*, base_output_root, output_root, sql, row_key, tables=(), stage_table=None,
+               worker="dist-worker", execution_mode=None, ray_address=None,
+               concurrency=4, pool_size=None, batch_size=8192, timeout=60.0,
+               max_attempts=3, secrets=None) -> StageResult:
+    """Replay failed keys and load the merged stage using the regular manifest layout.
+
+    Bind the replay SQL's source to one Parquet location in ``tables``, or pass a
+    ``name=path`` string in ``stage_table``. Secrets are sent as worker environment
+    settings over stdin. With a Ray address or pool size the default mode is actor,
+    otherwise it is local.
+    """
+    if isinstance(tables, Mapping):
+        tables = [f"{name}={os.fspath(path)}" for name, path in tables.items()]
+    elif isinstance(tables, str):
+        raise TypeError("tables must be a mapping or an iterable of name=path strings")
+    ray_driver._validate_ray_address(ray_address)
+    if execution_mode is None:
+        execution_mode = "actor" if ray_address is not None or pool_size is not None else "local"
+    base = _location(base_output_root)
+    root = _location(output_root)
+    if isinstance(base, Path):
+        base = base.resolve()
+    if isinstance(root, Path):
+        root = root.resolve()
+    command = [
+        sys.executable, "-B", str(Path(ray_driver.__file__).resolve()),
+        f"--worker={os.fspath(worker)}", f"--sql={sql}", f"--row-key={row_key}",
+        f"--base-output-root={_uri(base)}", f"--output-root={_uri(root)}",
+        f"--execution-mode={execution_mode}", f"--batch-size={batch_size}",
+        f"--concurrency={concurrency}", f"--timeout={timeout}", f"--max-attempts={max_attempts}",
+    ]
+    command.extend(f"--table={table}" for table in tables)
+    for flag, value in (("stage-table", stage_table), ("ray-address", ray_address), ("pool-size", pool_size)):
+        if value is not None:
+            command.append(f"--{flag}={value}")
+    payload = {}
+    if secrets is not None:
+        payload = ray_driver._validate_payload(dict(secrets))
+        command.append("--secrets-stdin")
+    result = subprocess.run(
+        command, input=None if secrets is None else json.dumps(payload),
+        capture_output=True, text=True, errors="replace", check=False,
+    )
+    if result.returncode:
+        detail = ray_driver._redact(result.stderr, {**ray_driver._inherited_payload(), **payload})
+        raise RuntimeError(f"Replay driver exited {result.returncode}: {detail.strip()}")
+    return StageResult._from_document(_decode_manifest(result.stdout), root)
+
+
 @dataclass(frozen=True)
 class _S3Path:
     bucket: str

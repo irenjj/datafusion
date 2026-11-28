@@ -169,10 +169,29 @@ Worker receipts carry `input_tokens`, `output_tokens`, `llm_requests` and `llm_r
 
 `df.ai_error` columns require an explicit non-null output row key. A row with any failed envelope is routed to the DLQ, with one entry per failed column and stable ordering by row key and column name. A successful row retains the Arrow value type. The Python suite uses an injected executor and requires neither Ray nor a network connection.
 
+Replay into a dedicated output root with the original Parquet source and a query that returns the same data schema as the base stage. Use `--stage-table input=PATH` for a manifest-backed source. The worker snapshots only the distinct failed keys before planning the SQL. A base without failures skips source access and SQL planning.
+
+```bash
+dist-worker replay-dlq --base-output-root /shared/base --output-root /shared/replayed \
+  --table input=/shared/input --row-key id \
+  --sql "SELECT id, llm(prompt, 'retry-model', '{\"on_error\":\"envelope\"}') AS label FROM input"
+
+dist-worker query-stage --output-root /shared/replayed --sql 'SELECT COUNT(*) FROM data'
+```
+
+For Ray, pass `--execution-mode actor` or `--execution-mode task` and optionally `--ray-address`. Actor mode accepts `--pool-size`. Install Ray in the driver's Python environment and supply `--ray-driver PATH` or `DF_DIST_RAY_DRIVER` if the driver scripts are installed separately. `--secrets-stdin` reads the same environment JSON as the Ray driver. The Python SDK exposes `replay_dlq(...)`, which accepts `execution_mode`, `ray_address`, and a `secrets` mapping and returns a `StageResult`.
+
+The replay summary includes `prev_data_rows`, `new_data_rows`, and `remaining_dlq_rows` as unique-key counts. The manifest's `dlq_rows` still counts failed cells. For a key with multiple failed cells, the checkpoint must include the split's original row count so the worker can verify key uniqueness. The output keeps upstream successful Parquet files byte for byte and reports inference usage from the replay's winning splits. The worker checks the winner checksums, schema, row counts and key sets before publishing `STAGE_MANIFEST.json`. Both `query-stage` and `StageResult.load()` read the published root directly.
+
+The coordinator holds the key set in memory and buffers one winning Parquet object at a time for integrity checks and copying. `--batch-size` bounds the number of selected source rows written to each retry input file. Temporary snapshots and retry receipts stay under `_replay/`. Concurrent invocations can execute separate attempts. The first valid manifest wins, and repeating the same request after publication returns that winner's counts. Restarting a failed invocation can repeat inference for the base's failed keys.
+
+The daemon also accepts `{"command":"replay_dlq","options":{...}}` for local execution. The options are `base_output_root`, `output_root`, `sql`, `row_key`, and optionally `table`, `stage_table`, or `batch_size`.
+
 ```bash
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --bin dist-worker
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai -E 'test(manifest_table::) + test(query_stage_and_plan_next_stage)'
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --test worker serve
+cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai -E 'test(replay)'
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai --test worker multimodal_parquet_outputs
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai-http --test worker openai_ca_cert
 cargo tree --locked -p datafusion-dist --features ai
@@ -180,7 +199,7 @@ cargo tree --locked -p datafusion-dist --features ai-http
 python3 -m unittest discover -s datafusion/dist/python -v
 ```
 
-With Ray installed locally and the pinned `parquet-testing` fixtures available, set `DIST_WORKER_E2E` to the built `dist-worker` executable and rerun the Python suite to exercise the actor pool and read back its committed Parquet output.
+With Ray installed locally and the pinned `parquet-testing` fixtures available, set `DIST_WORKER_E2E` to the built `dist-worker` executable and rerun the Python suite to exercise the actor pool and read back its committed Parquet output. Set `DIST_WORKER_REPLAY_E2E` to a worker built with `ai` and install PyArrow to exercise both Ray replay modes with the mock inference backend.
 
 ## Distributed scheduler replay
 

@@ -7,19 +7,17 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::arrow::json::writer::{LineDelimited, WriterBuilder};
 use datafusion::common::{Result, exec_datafusion_err, plan_datafusion_err, plan_err};
-use datafusion_dist::{
-    AttemptArtifact, LeaseConfig, SinkOptions, SplitMetrics, SystemClock,
-};
+use datafusion_dist::{AttemptArtifact, LeaseConfig, SinkOptions, SplitMetrics};
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 mod job;
 mod local;
+mod replay;
 mod serve;
 
 use job::{PlanningOptions, StageJob};
@@ -30,6 +28,7 @@ dist-worker run-split --job JOB --split-id N --attempt-id N [--output-root PATH]
 dist-worker commit-split --job JOB [--artifact FILE|-] [--output-root PATH]
 dist-worker finalize-stage --job JOB [--output-root PATH]
 dist-worker query-stage --output-root PATH --sql SQL
+dist-worker replay-dlq --base-output-root BASE --output-root PATH --sql SQL --row-key COLUMN [--table name=path | --stage-table name=PATH] [--execution-mode local|actor|task] [--batch-size N] [--pool-size N] [--ray-address ADDRESS] [--secrets-stdin]
 dist-worker serve
 dist-worker run-local --sql SQL --table name=path --output-root PATH [--row-key COLUMN] [--timeout-secs N] [--max-attempts N]";
 
@@ -151,26 +150,32 @@ async fn run(command: &str, args: Result<Arguments>) -> Result<()> {
             args.finish()?;
             config.validate()?;
             let job = StageJob::plan(options).await?;
-            let manifest = local::run(
-                &job,
-                config,
-                Arc::new(SystemClock::default()),
-                async |stage, queue, split, token| {
-                    tokio::time::timeout(
-                        config.lease_ttl,
-                        stage.execute_lease(queue, split, token),
-                    )
-                    .await
-                    .map_err(|_| {
-                        exec_datafusion_err!(
-                            "Split {} execution timed out",
-                            split.split_id
-                        )
-                    })?
-                },
-            )
-            .await?;
+            let manifest = local::run_with_timeout(&job, config).await?;
             write_json(io::stdout().lock(), &manifest)
+        }
+        "replay-dlq" => replay::cli(args).await,
+        "plan-replay-dlq" => {
+            let file = args.required("--out")?;
+            let options = replay::ReplayOptions::from_args(&mut args)?;
+            args.finish()?;
+            let planned = match options.prepare().await? {
+                replay::Preparation::Complete(result) => {
+                    replay::PlannedReplay::Complete { result }
+                }
+                replay::Preparation::Pending(pending) => {
+                    write_json(File::create(file)?, &pending.job)?;
+                    replay::PlannedReplay::Pending {
+                        attempt_id: pending.attempt_id,
+                    }
+                }
+            };
+            write_json(io::stdout().lock(), &planned)
+        }
+        "finalize-replay-dlq" => {
+            let attempt_id = args.number("--attempt-id", None)?;
+            let options = replay::ReplayOptions::from_args(&mut args)?;
+            args.finish()?;
+            write_json(io::stdout().lock(), &options.finalize(attempt_id).await?)
         }
         _ => plan_err!("Unknown command '{command}'.\n{USAGE}"),
     }
@@ -205,6 +210,10 @@ impl Arguments {
             if !key.starts_with("--") {
                 return plan_err!("Expected a flag beginning with --");
             }
+            if key == "--secrets-stdin" {
+                parsed.0.entry(key).or_default().push(String::new());
+                continue;
+            }
             let value = args
                 .next()
                 .ok_or_else(|| plan_datafusion_err!("{key} needs a value"))?;
@@ -232,6 +241,10 @@ impl Arguments {
     fn required(&mut self, key: &str) -> Result<String> {
         self.flag(key)?
             .ok_or_else(|| plan_datafusion_err!("{key} is required"))
+    }
+
+    fn switch(&mut self, key: &str) -> Result<bool> {
+        Ok(self.flag(key)?.is_some())
     }
 
     fn number<T: FromStr>(&mut self, key: &str, default: Option<T>) -> Result<T> {

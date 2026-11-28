@@ -10,6 +10,7 @@ mod codec;
 mod fingerprint;
 mod manifest_table;
 mod plan;
+mod replay;
 mod runner;
 mod scheduler;
 mod sink;
@@ -30,6 +31,7 @@ pub use plan::{
     decode_stage_template_with_extensions, split_plan_for_distribution,
     split_plan_for_distribution_with_codecs, split_plan_for_distribution_with_extensions,
 };
+pub use replay::{DlqReplay, ReplaySummary};
 pub use runner::LocalWorker;
 pub use scheduler::{
     CommitOutcome, LeaseConfig, LeaseError, LeaseToken, LeasedSplitQueue, ManualClock,

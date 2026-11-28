@@ -9,10 +9,32 @@ use std::sync::Arc;
 use datafusion::common::{DataFusionError, Result, exec_datafusion_err, exec_err};
 use datafusion_dist::{
     LeaseConfig, LeaseError, LeaseToken, LeasedSplitQueue, MonotonicClock, PreparedStage,
-    Split, SplitOutput, SplitState, StageManifest,
+    Split, SplitOutput, SplitState, StageManifest, SystemClock,
 };
 
 use super::job::StageJob;
+
+pub(super) async fn run_with_timeout(
+    job: &StageJob,
+    config: LeaseConfig,
+) -> Result<StageManifest> {
+    run(
+        job,
+        config,
+        Arc::new(SystemClock::default()),
+        async |stage, queue, split, token| {
+            tokio::time::timeout(
+                config.lease_ttl,
+                stage.execute_lease(queue, split, token),
+            )
+            .await
+            .map_err(|_| {
+                exec_datafusion_err!("Split {} execution timed out", split.split_id)
+            })?
+        },
+    )
+    .await
+}
 
 pub(super) async fn run(
     job: &StageJob,

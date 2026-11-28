@@ -6,9 +6,13 @@ use std::collections::BTreeSet;
 use std::io::{self, BufRead};
 
 use datafusion::common::{Result, exec_datafusion_err, plan_datafusion_err, plan_err};
-use datafusion_dist::{LocalWorker, ParquetSplitSink, PreparedStage, StageManifest};
+use datafusion_dist::{
+    LeaseConfig, LocalWorker, ParquetSplitSink, PreparedStage, ReplaySummary,
+    StageManifest,
+};
 use serde::{Deserialize, Serialize};
 
+use super::replay::{ReplayOptions, lease_config};
 use super::{AttemptReceipt, StageJob, write_json};
 
 #[derive(Deserialize)]
@@ -32,6 +36,11 @@ enum Request {
     FinalizeStage {
         job_id: String,
     },
+    ReplayDlq {
+        options: Box<ReplayOptions>,
+        timeout_secs: Option<f64>,
+        max_attempts: Option<u32>,
+    },
     Shutdown,
 }
 
@@ -54,6 +63,7 @@ enum Response {
     Pong { protocol: &'static str },
     Receipt(AttemptReceipt),
     Manifest(StageManifest),
+    Replay(Box<ReplaySummary>),
     Ack,
 }
 
@@ -160,6 +170,17 @@ impl Server {
                 let loaded = self.job(&job_id)?;
                 let manifest = loaded.sink.finalize_stage(&loaded.job.splits).await?;
                 Ok(Response::Manifest(manifest))
+            }
+            Request::ReplayDlq {
+                options,
+                timeout_secs,
+                max_attempts,
+            } => {
+                let config = lease_config(
+                    timeout_secs.unwrap_or(60.0),
+                    max_attempts.unwrap_or_else(|| LeaseConfig::default().max_attempts),
+                )?;
+                Ok(Response::Replay(Box::new(options.run(config).await?)))
             }
             Request::Shutdown => Ok(Response::Ack),
         }
