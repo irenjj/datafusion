@@ -35,6 +35,7 @@ use datafusion_proto::physical_plan::{
 };
 use datafusion_proto::protobuf;
 use prost::Message;
+use serde::{Deserialize, Serialize};
 
 use crate::codec::{
     DistExtensionRegistry, DistPhysicalCodec, MapPlanProtoConverter, is_builtin,
@@ -68,7 +69,7 @@ impl DistCodecs {
 }
 
 /// One file or byte range, with IDs scoped to its stage.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Split {
     /// Split identifier within the stage.
     pub split_id: u64,
@@ -81,7 +82,7 @@ pub struct Split {
 }
 
 /// An optimized map-only stage with an empty file scan.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StagePlan {
     /// Coordinator-assigned stage identifier.
     pub stage_id: u64,
@@ -105,7 +106,7 @@ pub struct PreparedStage {
 }
 
 /// Counters collected from one split attempt.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SplitMetrics {
     /// Rows returned by the stage root.
     pub output_rows: usize,
