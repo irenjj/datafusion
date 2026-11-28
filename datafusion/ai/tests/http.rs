@@ -20,6 +20,7 @@ use datafusion_execution::TaskContext;
 use datafusion_execution::config::SessionConfig;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::test::TestMemoryExec;
 use futures::TryStreamExt;
 use serde_json::{Value, json};
@@ -36,6 +37,7 @@ struct Capture {
     request_line: String,
     headers: HashMap<String, String>,
     body: Value,
+    raw_body: Vec<u8>,
 }
 
 impl Capture {
@@ -74,6 +76,7 @@ async fn read_request(listener: &TcpListener) -> (Capture, TcpStream) {
         request_line: request_line.trim_end().to_owned(),
         headers,
         body: serde_json::from_slice(&body).unwrap(),
+        raw_body: body,
     };
     (capture, reader.into_inner())
 }
@@ -192,38 +195,62 @@ async fn embeddings_reorder_a_full_batch_and_reject_schema_mismatches() {
 }
 
 #[tokio::test]
-async fn vision_posts_text_and_inline_image_with_authorization() {
+async fn vision_posts_text_and_ordered_inline_images_with_authorization() {
     let (listener, backend) = bind(Some(KEY)).await;
-    for (mime, expected_mime) in [
-        (Some("image/png"), "image/png"),
-        (None, "application/octet-stream"),
+    let image = |bytes, mime: Option<&str>| ResolvedMedia {
+        bytes: bytes::Bytes::from_static(bytes),
+        mime: mime.map(str::to_owned),
+        etag: None,
+    };
+    for (images, urls) in [
+        (
+            vec![image(b"\x00\xff", Some("image/png"))],
+            vec!["data:image/png;base64,AP8="],
+        ),
+        (
+            vec![image(b"\x00\xff", None)],
+            vec!["data:application/octet-stream;base64,AP8="],
+        ),
+        (
+            vec![
+                image(b"a", Some("image/png")),
+                image(b"b", None),
+                image(b"c", Some("image/jpeg")),
+            ],
+            vec![
+                "data:image/png;base64,YQ==",
+                "data:application/octet-stream;base64,Yg==",
+                "data:image/jpeg;base64,Yw==",
+            ],
+        ),
     ] {
         let request = LlmRequest {
-            media: vec![Some(ResolvedMedia {
-                bytes: bytes::Bytes::from_static(b"\x00\xff"),
-                mime: mime.map(str::to_owned),
-                etag: None,
-            })],
+            media: vec![Some(images)],
             ..request(LlmOptions::default())
         };
+        let blocks = std::iter::once(json!({"type": "text", "text": "prompt"}))
+            .chain(
+                urls.into_iter()
+                    .map(|url| json!({"type": "image_url", "image_url": {"url": url}})),
+            )
+            .collect::<Vec<_>>();
         let (result, ()) = timeout(TEST_TIMEOUT, async {
-            tokio::join!(
-                backend.generate(request, CancellationToken::new()),
-                async {
-                    let (capture, mut socket) = read_request(&listener).await;
-                    capture.assert_request(Some(KEY), &json!({
+            tokio::join!(backend.generate(request, CancellationToken::new()), async {
+                let (capture, mut socket) = read_request(&listener).await;
+                capture.assert_request(
+                    Some(KEY),
+                    &json!({
                         "model": "test-model",
-                        "messages": [{"role": "user", "content": [
-                            {"type": "text", "text": "prompt"},
-                            {"type": "image_url", "image_url": {"url": format!("data:{expected_mime};base64,AP8=")}},
-                        ]}],
+                        "messages": [{"role": "user", "content": blocks}],
                         "stream": false,
                         "n": 1,
-                    }));
-                    socket.write_all(success().as_bytes()).await.unwrap();
-                },
-            )
-        }).await.unwrap();
+                    }),
+                );
+                socket.write_all(success().as_bytes()).await.unwrap();
+            },)
+        })
+        .await
+        .unwrap();
         assert_eq!(result.unwrap().outputs, [Some("generated".to_owned())]);
     }
 }
@@ -340,11 +367,97 @@ async fn posts_single_prompt_and_maps_usage() {
     let (result, capture) =
         exchange(LlmOptions::default(), None, &success(), false).await;
     capture.assert_request(None, &basic_body("prompt"));
+    let legacy_body = json!({
+        "messages": [{"role": "user", "content": "prompt"}],
+        "model": "test-model",
+        "stream": false,
+        "n": 1
+    });
+    assert_eq!(capture.raw_body, legacy_body.to_string().as_bytes());
     let response = result.unwrap();
     assert_eq!(response.outputs, [Some("generated".into())]);
     let usage = response.usage.unwrap();
     assert_eq!(usage.input_tokens, 17);
     assert_eq!(usage.output_tokens, 4);
+}
+
+#[tokio::test]
+async fn posts_normalized_response_schema() {
+    let options = serde_json::from_str(
+        r#"{
+            "response_schema": {
+                "type":"object",
+                "properties":{
+                    "records":{"type":"array","items":{
+                        "type":"object",
+                        "properties":{
+                            "score":{"type":"number"},
+                            "token":{"type":"string","enum":["a","b"]}
+                        },
+                        "required":["score"]
+                    }}
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let (result, capture) = exchange(options, Some(KEY), &success(), false).await;
+    assert!(result.is_ok());
+    let mut expected = basic_body("prompt");
+    expected["response_format"] = json!({
+        "type":"json_schema",
+        "json_schema":{
+            "name":"df_response",
+            "strict":true,
+            "schema":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["records"],
+                "properties":{
+                    "records":{"type":["array","null"],"items":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":["score","token"],
+                        "properties":{
+                            "score":{"type":"number"},
+                            "token":{"type":["string","null"],"enum":["a","b",null]}
+                        }
+                    }}
+                }
+            }
+        }
+    });
+    capture.assert_request(Some(KEY), &expected);
+}
+
+#[tokio::test]
+async fn rejects_conflicting_response_format_before_http() -> Result<()> {
+    let (listener, backend) = bind(None).await;
+    let registry = LlmProviderRegistry::default();
+    registry.register("http", Arc::new(backend))?;
+    let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+    let error = LlmExec::try_new_with_registry(
+        Arc::new(EmptyExec::new(schema)),
+        Arc::new(Column::new("text", 0)),
+        "test-model".into(),
+        r#"{
+            "provider":"http",
+            "response_schema":{"type":"object","properties":{"text":{"type":"string"}}},
+            "extra_body":{"response_format":{"type":"json_object"}}
+        }"#,
+        "answer".into(),
+        &registry,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, DataFusionError::Plan(message) if message.contains("response_schema") && message.contains("response_format"))
+    );
+    assert!(
+        timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -390,6 +503,20 @@ async fn sends_system_message_and_generation_options() {
     body["top_p"] = json!(0.75);
     body["stop"] = json!(["stop", "end"]);
     capture.assert_request(Some(KEY), &body);
+    let legacy_body = json!({
+        "messages": [
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "prompt"}
+        ],
+        "model": "test-model",
+        "stream": false,
+        "n": 1,
+        "temperature": 0.25,
+        "max_tokens": 12,
+        "top_p": 0.75,
+        "stop": ["stop", "end"]
+    });
+    assert_eq!(capture.raw_body, legacy_body.to_string().as_bytes());
 }
 
 #[tokio::test]

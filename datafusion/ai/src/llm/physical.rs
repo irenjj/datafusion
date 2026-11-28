@@ -183,7 +183,7 @@ impl LlmExec {
         &self.dispatch.model
     }
 
-    /// Returns the validated, recursively sorted JSON options.
+    /// Returns the validated canonical JSON options, retaining response property order.
     pub fn options_json(&self) -> &str {
         &self.canonical_options_json
     }
@@ -267,15 +267,16 @@ impl LlmExec {
             (_, Some(_)) => return plan_err!("Only vision inference accepts media"),
             (_, None) => {}
         }
-        let (options, canonical_options_json) = LlmOptions::parse(options_json)?;
-        let output_field = options.output_field(kind, &output_col)?;
+        let (options, canonical_options_json, schema) = LlmOptions::parse(options_json)?;
+        let output_field = options.output_field(kind, &output_col, schema.as_ref())?;
         let provider_name = options
             .provider
             .as_deref()
             .unwrap_or_else(|| registry.default_name())
             .to_owned();
         let provider = registry.resolve(Some(&provider_name))?;
-        let dispatch = Dispatch::try_new(model, options, kind, provider, provider_name)?;
+        let dispatch =
+            Dispatch::try_new(model, options, schema, kind, provider, provider_name)?;
         Ok(Self::new(
             input,
             prompt,

@@ -12,6 +12,8 @@ mod fuzz;
 mod harness;
 #[path = "llm/scripted_backend.rs"]
 mod scripted_backend;
+#[path = "llm/vision.rs"]
+mod vision;
 
 #[cfg(feature = "ai-http")]
 #[tokio::test]
@@ -63,6 +65,116 @@ async fn loopback_http_sql_reaches_the_registered_backend()
     let (plan, batches) = query?;
     assert_eq!(harness::exec_nodes(plan.as_ref()).len(), 1);
     assert_eq!(harness::strings(&batches, 0), [Some("via HTTP")]);
+    Ok(())
+}
+
+#[cfg(feature = "ai-http")]
+#[tokio::test]
+async fn structured_chat_sql_returns_typed_envelopes_over_http()
+-> datafusion::common::Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use datafusion::arrow::array::{Array, AsArray};
+    use datafusion::arrow::datatypes::{DataType, Int64Type};
+    use datafusion::llm::{OpenAiHttpBackend, OpenAiHttpConfig};
+    use datafusion_ai::AiErrorType;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend = OpenAiHttpBackend::try_new(OpenAiHttpConfig {
+        base_url: format!("http://{}/v1", listener.local_addr()?),
+        api_key: Some("structured-sql-test-key".into()),
+        api_key_env: None,
+        ca_cert_pem: None,
+    })?;
+    let ctx = harness::test_context(8, 1);
+    ctx.state()
+        .llm_provider_registry()
+        .register("http", Arc::new(backend))?;
+    harness::register_text(&ctx, "t", &[Some("good"), Some("bad")])?;
+
+    let unwrapped = ctx
+        .sql(
+            r#"SELECT llm(text, 'm', concat(
+                '{"provider":"http","response_schema":',
+                '{"type":"object","properties":{"token":{"type":"string"}}}}'
+            )) AS answer FROM t"#,
+        )
+        .await?;
+    assert!(matches!(
+        unwrapped.schema().field(0).data_type(),
+        DataType::Struct(_)
+    ));
+
+    let serve = async {
+        for _ in 0..2 {
+            let (endpoint, body, socket) =
+                read_http_request(&listener, "structured-sql-test-key").await;
+            assert_eq!(endpoint, "/v1/chat/completions");
+            let format = &body["response_format"]["json_schema"];
+            assert_eq!(format["name"], "df_response");
+            assert_eq!(format["strict"], true);
+            assert_eq!(format["schema"]["additionalProperties"], false);
+            let content = match body["messages"][0]["content"].as_str().unwrap() {
+                "good" => r#"{"token":"yes","score":7}"#,
+                "bad" => r#"{"token":"yes","score":"7"}"#,
+                text => panic!("unexpected prompt {text}"),
+            };
+            let response = json!({"choices":[{"message":{"content":content}}]});
+            write_http_response(socket, &response.to_string()).await;
+        }
+    };
+    let run = harness::run(
+        &ctx,
+        r#"SELECT llm(text, 'm', '{"provider":"http","on_error":"envelope","response_schema":{"type":"object","properties":{"token":{"type":"string"},"score":{"type":"integer"}},"required":["token","score"]}}') AS answer
+        FROM t ORDER BY id"#,
+    );
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(run, serve) })
+            .await
+            .unwrap();
+    let (plan, batches) = result?;
+    let schema = plan.schema();
+    schema.field(0).try_extension_type::<AiErrorType>()?;
+    let DataType::Struct(envelope_fields) = schema.field(0).data_type() else {
+        panic!("expected an envelope");
+    };
+    let DataType::Struct(value_fields) = envelope_fields[0].data_type() else {
+        panic!("expected a structured value");
+    };
+    assert_eq!(value_fields[0].name(), "token");
+    assert_eq!(value_fields[1].name(), "score");
+
+    let rows: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            let envelope = batch.column(0).as_struct();
+            let value = envelope.column(0).as_struct();
+            let code = envelope.column(1).as_string::<i32>();
+            let retryable = envelope.column(3).as_boolean();
+            (0..batch.num_rows()).map(move |row| {
+                (
+                    value.is_valid(row).then(|| {
+                        (
+                            value.column(0).as_string::<i32>().value(row),
+                            value.column(1).as_primitive::<Int64Type>().value(row),
+                        )
+                    }),
+                    code.is_valid(row).then(|| code.value(row)),
+                    retryable.is_valid(row).then(|| retryable.value(row)),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (Some(("yes", 7)), None, None),
+            (None, Some("SCHEMA_MISMATCH"), Some(false))
+        ]
+    );
     Ok(())
 }
 

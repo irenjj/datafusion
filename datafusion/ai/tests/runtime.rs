@@ -2,12 +2,13 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow::array::{
-    Array, AsArray, FixedSizeListArray, Int32Array, StringArray, StructArray, UInt64Array,
+    Array, AsArray, FixedSizeListArray, Int32Array, ListBuilder, StringArray,
+    StringBuilder, StructArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -192,6 +193,43 @@ fn worker_decode_rejects_invalid_identifiers_options_and_sensitive_keys() -> Res
             matches!(&error, DataFusionError::Plan(actual) if actual.contains(message) && !actual.contains("sentinel"),),
             "{error}"
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn worker_decode_preserves_schema_order_and_canonical_bytes() -> Result<()> {
+    let ctx = task_context(&LlmProviderRegistry::default());
+    let input = input(&[Some("prompt")])?;
+    let options = r#"{
+        "response_schema":{
+            "type":"object",
+            "required":["z","a"],
+            "properties":{
+                "z":{"type":"object","properties":{"y":{"type":"integer"},"x":{"type":"boolean"}}},
+                "a":{"type":"string","enum":["second","first"]}
+            }
+        },
+        "extra_body":{"z":0,"a":1}
+    }"#;
+    let first = decode(Arc::clone(&input), options, &ctx)?;
+    let second = decode(Arc::clone(&input), first.options_json(), &ctx)?;
+    let third = decode(input, options, &ctx)?;
+    let expected = r#"{"extra_body":{"a":1,"z":0},"response_schema":{"properties":{"z":{"properties":{"y":{"type":"integer"},"x":{"type":"boolean"}},"type":"object"},"a":{"enum":["second","first"],"type":"string"}},"required":["z","a"],"type":"object"}}"#;
+    for exec in [&first, &second, &third] {
+        assert_eq!(exec.options_json(), expected);
+        assert_eq!(exec.schema(), first.schema());
+        let schema = exec.schema();
+        let DataType::Struct(fields) = schema.field(2).data_type() else {
+            panic!("expected struct output");
+        };
+        assert_eq!(fields[0].name(), "z");
+        assert_eq!(fields[1].name(), "a");
+        let DataType::Struct(nested) = fields[0].data_type() else {
+            panic!("expected a nested struct");
+        };
+        assert_eq!(nested[0].name(), "y");
+        assert_eq!(nested[1].name(), "x");
     }
     Ok(())
 }
@@ -638,7 +676,7 @@ async fn vision_envelopes_keep_struct_references_and_failures_aligned() -> Resul
         let attempt = next_attempt(&mut attempts).await;
         assert_eq!(attempt.prompts, ["a"]);
         assert_eq!(
-            attempt.media[0].as_ref().unwrap().mime.as_deref(),
+            attempt.media[0].as_ref().unwrap()[0].mime.as_deref(),
             Some("image/png")
         );
         attempt.succeed();
@@ -684,6 +722,159 @@ async fn vision_envelopes_keep_struct_references_and_failures_aligned() -> Resul
     Ok(())
 }
 
+#[tokio::test]
+async fn vision_list_errors_are_row_local_and_byte_budget_stops_reads() -> Result<()> {
+    #[derive(Debug, Default)]
+    struct Resolver(Mutex<Vec<(String, Option<u64>)>>);
+
+    #[async_trait]
+    impl MediaResolver for Resolver {
+        async fn resolve(
+            &self,
+            media: &MediaRef,
+            max_bytes: Option<u64>,
+        ) -> Result<ResolvedMedia> {
+            self.0.lock().unwrap().push((media.uri.clone(), max_bytes));
+            let payload: &[u8] = match media.uri.as_str() {
+                "memory://test/a" | "memory://test/b" => b"12",
+                "memory://test/big-first" | "memory://test/big-second" => b"123",
+                "memory://test/per-image-overflow" => b"1234",
+                uri => panic!("unexpected media read for {uri}"),
+            };
+            // Exercise the executor's budget checks even if a resolver returns too much.
+            Ok(ResolvedMedia {
+                bytes: bytes::Bytes::from_static(payload),
+                mime: Some("image/png".into()),
+                etag: None,
+            })
+        }
+    }
+
+    let mut media = ListBuilder::new(StringBuilder::new());
+    let unread = Some("memory://test/unread");
+    for images in [
+        &[Some("memory://test/a"), Some("memory://test/b")][..],
+        &[],
+        &[unread, None],
+        &[Some(" \t")],
+        &[Some("invalid//uri")],
+        &[unread; 6],
+        &[
+            Some("memory://test/big-first"),
+            Some("memory://test/big-second"),
+            unread,
+            unread,
+            unread,
+        ],
+        &[Some("memory://test/per-image-overflow")],
+        &[Some("memory://test/a")],
+    ] {
+        media.append_value(images.iter().copied());
+    }
+    let media = media.finish();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("text", DataType::Utf8, false),
+        Field::new("media", media.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                "first",
+                "empty",
+                "null_item",
+                "blank_uri",
+                "invalid_uri",
+                "item_budget",
+                "row_budget",
+                "one_image_budget",
+                "last",
+            ])),
+            Arc::new(media),
+        ],
+    )?;
+    let (registry, mut attempts) = script(1)?;
+    let resolver = Arc::new(Resolver::default());
+    let exec = LlmExec::try_new_task_with_registry(
+        TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?,
+        Arc::new(Column::new("text", 0)),
+        Some(
+            MediaPlan::new(Arc::new(Column::new("media", 1)))
+                .with_resolver(resolver.clone()),
+        ),
+        TaskKind::Vision,
+        "model".into(),
+        r#"{"provider":"script","batch_size":9,"on_error":"envelope","max_media_items":5,"max_media_bytes":3,"max_row_media_bytes":4}"#,
+        "answer".into(),
+        &registry,
+    )?;
+    let output = exec
+        .execute(0, task_context(&registry))?
+        .try_collect::<Vec<_>>();
+    let (output, ()) = tokio::join!(output, async {
+        let attempt = next_attempt(&mut attempts).await;
+        assert_eq!(attempt.prompts, ["first", "last"]);
+        attempt.succeed();
+    });
+    let output = output?;
+    assert_eq!(output.len(), 1);
+    let envelope = output[0].column(2).as_struct();
+    let values = envelope.column(0).as_string::<i32>();
+    let codes = envelope.column(1).as_string::<i32>();
+    let messages = envelope.column(2).as_string::<i32>();
+    let retryable = envelope.column(3).as_boolean();
+    for (row, detail) in [
+        "empty",
+        "non-NULL media reference",
+        "blank",
+        "invalid media URI",
+        "max_media_items",
+        "max_row_media_bytes",
+        "max_bytes",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = row + 1;
+        assert!(values.is_null(row));
+        assert_eq!(codes.value(row), "PERMANENT_HTTP");
+        assert!(
+            messages.value(row).contains(detail),
+            "{}",
+            messages.value(row)
+        );
+        assert!(retryable.is_valid(row));
+        assert!(!retryable.value(row));
+    }
+    for (row, value) in [(0, "answer:first"), (8, "answer:last")] {
+        assert_eq!(values.value(row), value);
+        assert!(
+            envelope.columns()[1..]
+                .iter()
+                .all(|field| field.is_null(row))
+        );
+    }
+    let reads = resolver.0.lock().unwrap();
+    assert_eq!(
+        reads
+            .iter()
+            .map(|(uri, cap)| (uri.as_str(), *cap))
+            .collect::<Vec<_>>(),
+        [
+            ("memory://test/a", Some(3)),
+            ("memory://test/b", Some(2)),
+            ("memory://test/big-first", Some(3)),
+            ("memory://test/big-second", Some(1)),
+            ("memory://test/per-image-overflow", Some(3)),
+            ("memory://test/a", Some(3)),
+        ]
+    );
+    assert_eq!(submitted(&exec), 2);
+    assert_eq!(metric(&exec, "failed_rows"), 7);
+    assert_eq!(metric(&exec, "llm_retries"), 0);
+    Ok(())
+}
+
 #[test]
 fn llm_exec_declares_checkpoint_output_and_row_guarantees() -> Result<()> {
     let input = input(&[Some("prompt")])?;
@@ -710,7 +901,7 @@ type Reply = std::result::Result<LlmResponse, LlmBackendError>;
 
 struct Attempt {
     prompts: Vec<String>,
-    media: Vec<Option<ResolvedMedia>>,
+    media: Vec<Option<Vec<ResolvedMedia>>>,
     cancel: CancellationToken,
     reply: oneshot::Sender<Reply>,
 }
@@ -762,6 +953,308 @@ fn script(
     let registry = LlmProviderRegistry::default();
     registry.register_with_limit("script", Arc::new(ScriptedBackend(send)), limit)?;
     Ok((registry, recv))
+}
+
+#[tokio::test]
+async fn structured_batch_isolates_a_malformed_middle_row() -> Result<()> {
+    let (registry, mut attempts) = script(1)?;
+    let ctx = task_context(&registry);
+    let options = r#"{
+        "provider":"script","batch_size":3,"on_error":"envelope",
+        "response_schema":{"type":"object","properties":{
+            "id":{"type":"integer"},
+            "items":{"type":"array","items":{"type":["object","null"],"properties":{
+                "passed":{"type":"boolean"},
+                "score":{"type":"number"}
+            },"required":["passed"]}}
+        },"required":["id"]}
+    }"#;
+    let exec = decode(input(&[Some("a"), Some("b"), Some("c")])?, options, &ctx)?;
+    let schema = exec.schema();
+    validate_checkpoint_target(&exec, &schema)?;
+    schema.field(2).try_extension_type::<AiErrorType>()?;
+    let collect = exec.execute(0, ctx)?.try_collect::<Vec<_>>();
+    let (result, ()) = tokio::join!(collect, async {
+        let attempt = next_attempt(&mut attempts).await;
+        assert_eq!(attempt.prompts, ["a", "b", "c"]);
+        attempt
+            .reply
+            .send(Ok(LlmResponse {
+                outputs: [
+                    Some(r#"{"items":[{"passed":true,"score":1.25},null],"id":1}"#),
+                    Some(r#"{"id":2,"items":[{"passed":false}"#),
+                    Some(r#"{"id":3}"#),
+                ]
+                .map(|output| output.map(str::to_owned))
+                .to_vec(),
+                usage: Some(LlmUsage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                }),
+            }))
+            .unwrap();
+    });
+    let batches = result?;
+    assert_eq!(batches.len(), 1);
+    let envelope = batches[0].column(2).as_struct();
+    let value = envelope.column(0).as_struct();
+    assert_eq!(
+        value
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int64Type>()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some(1), None, Some(3)]
+    );
+    assert!(value.is_null(1));
+    let items = value.column(1).as_list::<i32>();
+    assert_eq!(items.null_count(), 2);
+    let first_items = items.value(0);
+    let first_items = first_items.as_struct();
+    assert!(first_items.column(0).as_boolean().value(0));
+    assert_eq!(
+        first_items
+            .column(1)
+            .as_primitive::<arrow::datatypes::Float64Type>()
+            .value(0),
+        1.25
+    );
+    assert!(first_items.is_null(1));
+    assert_eq!(
+        envelope
+            .column(1)
+            .as_string::<i32>()
+            .iter()
+            .collect::<Vec<_>>(),
+        [None, Some("SCHEMA_MISMATCH"), None]
+    );
+    assert_eq!(
+        envelope.column(3).as_boolean().iter().collect::<Vec<_>>(),
+        [None, Some(false), None]
+    );
+    let messages = envelope.column(2).as_string::<i32>();
+    assert!(messages.value(1).contains("JSON"));
+    assert!(messages.is_null(0) && messages.is_null(2));
+    assert_eq!(metric(&exec, "failed_rows"), 1);
+    assert_eq!(metric(&exec, "backend_attempts"), 1);
+    assert_eq!(metric(&exec, "input_tokens"), 10);
+    assert_eq!(metric(&exec, "output_tokens"), 20);
+    assert_no_attempt(&mut attempts);
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_types_are_checked_without_coercion() -> Result<()> {
+    let outputs = [
+        (Some(r#"{"id":"123"}"#), "64-bit integer"),
+        (Some(r#"{"id":1.5}"#), "64-bit integer"),
+        (Some(r#"{"id":9223372036854775808}"#), "64-bit integer"),
+        (
+            Some(r#"{"id":{"$serde_json::private::Number":"42"}}"#),
+            "64-bit integer",
+        ),
+        (Some(r#"{"id":null}"#), "null"),
+        (Some(r#"{"state":"ok"}"#), "missing"),
+        (Some(r#"{"id":1,"unknown":123}"#), "undeclared"),
+        (Some(r#"{"id":1,"state":true}"#), "string"),
+        (Some(r#"{"id":1,"state":"secret-canary"}"#), "enum"),
+        (Some(r#"{"id":1,"state":"ok","state":"ok"}"#), "duplicate"),
+        (None, "missing"),
+    ];
+    let (registry, mut attempts) = script(1)?;
+    let ctx = task_context(&registry);
+    let exec = decode(
+        input(&vec![Some("p"); outputs.len()])?,
+        r#"{
+            "provider":"script", "batch_size":16, "on_error":"envelope",
+            "response_schema":{"type":"object","properties":{
+                "id":{"type":"integer"},
+                "state":{"type":"string","enum":["ok","fail"]}
+            },"required":["id"]}
+        }"#,
+        &ctx,
+    )?;
+    let collect = exec.execute(0, ctx)?.try_collect::<Vec<_>>();
+    let (batches, ()) = tokio::join!(collect, async {
+        let attempt = next_attempt(&mut attempts).await;
+        assert_eq!(attempt.prompts.len(), outputs.len());
+        attempt
+            .reply
+            .send(Ok(LlmResponse {
+                outputs: outputs
+                    .iter()
+                    .map(|(output, _)| output.map(str::to_owned))
+                    .collect(),
+                usage: None,
+            }))
+            .unwrap();
+    });
+    let batches = batches?;
+    let envelope = batches[0].column(2).as_struct();
+    assert_eq!(envelope.column(0).null_count(), outputs.len());
+    for (row, (_, expected)) in outputs.iter().enumerate() {
+        assert_eq!(
+            envelope.column(1).as_string::<i32>().value(row),
+            "SCHEMA_MISMATCH"
+        );
+        let message = envelope.column(2).as_string::<i32>().value(row);
+        assert!(message.contains(expected), "{message}");
+        assert!(!message.contains("secret-canary"), "{message}");
+        assert!(!envelope.column(3).as_boolean().value(row));
+    }
+    assert_eq!(metric(&exec, "failed_rows"), outputs.len());
+    assert_eq!(metric(&exec, "backend_attempts"), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_failures_support_ignore_log_and_raise() -> Result<()> {
+    for on_error in ["ignore", "log", "raise"] {
+        let (registry, mut attempts) = script(1)?;
+        let ctx = task_context(&registry);
+        let exec = decode(
+            input(&[Some("a"), Some("b"), None])?,
+            &format!(
+                r#"{{"provider":"script","batch_size":2,"on_error":"{on_error}",
+                "response_schema":{{"type":"object","properties":{{"qty":{{"type":"integer"}}}},"required":["qty"]}}}}"#,
+            ),
+            &ctx,
+        )?;
+        let collect = exec.execute(0, ctx)?.try_collect::<Vec<_>>();
+        let (result, ()) = tokio::join!(collect, async {
+            next_attempt(&mut attempts)
+                .await
+                .reply
+                .send(Ok(LlmResponse {
+                    outputs: vec![Some(r#"{"qty":10}"#.into()), Some("[]".into())],
+                    usage: None,
+                }))
+                .unwrap();
+        });
+        if on_error != "raise" {
+            let batches = result?;
+            let batch = batches.iter().find(|batch| batch.num_rows() == 2).unwrap();
+            let value = batch.column(2).as_struct();
+            assert!(value.is_valid(0));
+            assert!(value.is_null(1));
+            assert!(
+                batches
+                    .iter()
+                    .find(|batch| batch.num_rows() == 1)
+                    .unwrap()
+                    .column(2)
+                    .is_null(0)
+            );
+        } else {
+            assert!(
+                matches!(result, Err(DataFusionError::Execution(message)) if message.contains("expected an object"))
+            );
+        }
+        assert_eq!(metric(&exec, "failed_rows"), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_vision_failures_use_slice_row_indices() -> Result<()> {
+    let env = RuntimeEnv::default();
+    let store = Arc::new(InMemory::new());
+    let url = url::Url::parse("memory://structured-vision").unwrap();
+    store
+        .put(
+            &Path::from("present"),
+            bytes::Bytes::from_static(b"image").into(),
+        )
+        .await?;
+    env.register_object_store(&url, store);
+    let resolver = ObjectStoreMediaResolver::new(Arc::clone(&env.object_store_registry));
+
+    let (registry, mut attempts) = script(1)?;
+    let ctx = task_context(&registry);
+    let present = "memory://structured-vision/present";
+    let mut media = ListBuilder::new(StringBuilder::new());
+    media.append_value([Some("not a URI"), Some(present)]);
+    for _ in 0..2 {
+        media.append_value([Some(present); 2]);
+    }
+    media.append_null();
+    let batch = RecordBatch::try_from_iter([
+        (
+            "text",
+            Arc::new(StringArray::from(vec![
+                "bad media",
+                "bad JSON",
+                "valid",
+                "skipped",
+            ])) as arrow::array::ArrayRef,
+        ),
+        ("media", Arc::new(media.finish())),
+    ])?;
+    let schema = batch.schema();
+    let input = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?;
+    let exec = LlmExec::try_new_task_with_registry(
+        input,
+        Arc::new(Column::new("text", 0)),
+        Some(
+            MediaPlan::new(Arc::new(Column::new("media", 1)))
+                .with_resolver(Arc::new(resolver)),
+        ),
+        TaskKind::Vision,
+        "vision".into(),
+        r#"{"provider":"script","batch_size":4,"on_error":"envelope",
+            "response_schema":{"type":"object","properties":{
+                "visible":{"type":"boolean"}
+            },"required":["visible"]}}"#,
+        "answer".into(),
+        &registry,
+    )?;
+    let collect = exec.execute(0, ctx)?.try_collect::<Vec<_>>();
+    let (batches, ()) = tokio::join!(collect, async {
+        let attempt = next_attempt(&mut attempts).await;
+        assert_eq!(attempt.prompts, ["bad JSON", "valid"]);
+        assert!(
+            attempt
+                .media
+                .iter()
+                .all(|slot| slot.as_ref().unwrap().len() == 2)
+        );
+        attempt
+            .reply
+            .send(Ok(LlmResponse {
+                outputs: vec![
+                    Some("invalid JSON".into()),
+                    Some(r#"{"visible":true}"#.into()),
+                ],
+                usage: None,
+            }))
+            .unwrap();
+    });
+    let batches = batches?;
+    let populated = batches.iter().find(|batch| batch.num_rows() == 3).unwrap();
+    let envelope = populated.column(2).as_struct();
+    assert_eq!(
+        envelope
+            .column(1)
+            .as_string::<i32>()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some("PERMANENT_HTTP"), Some("SCHEMA_MISMATCH"), None],
+    );
+    let value = envelope.column(0).as_struct();
+    assert!(value.is_null(0) && value.is_null(1));
+    assert!(value.is_valid(2) && value.column(0).as_boolean().value(2));
+    let skipped = batches.iter().find(|batch| batch.num_rows() == 1).unwrap();
+    assert!(
+        skipped
+            .column(2)
+            .as_struct()
+            .columns()
+            .iter()
+            .all(|child| child.is_null(0))
+    );
+    assert_eq!(metric(&exec, "failed_rows"), 2);
+    assert_no_attempt(&mut attempts);
+    Ok(())
 }
 
 async fn next_attempt(attempts: &mut mpsc::UnboundedReceiver<Attempt>) -> Attempt {
@@ -949,7 +1442,9 @@ impl log::Log for WarningCounter {
     }
 
     fn log(&self, record: &log::Record<'_>) {
-        if self.enabled(record.metadata()) {
+        if self.enabled(record.metadata())
+            && record.args().to_string().contains("permanent test failure")
+        {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }

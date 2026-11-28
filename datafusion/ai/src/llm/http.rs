@@ -179,19 +179,32 @@ fn build_body(
             "extra_body contains a sensitive credential key",
         ));
     }
+    if let Some(schema) = &options.response_schema {
+        if body.contains_key("response_format") {
+            return Err(permanent(
+                None,
+                "response_schema conflicts with extra_body.response_format",
+            ));
+        }
+        let format = super::schema::openai_response_format(schema)
+            .map_err(|error| permanent(None, &error.to_string()))?;
+        body.insert("response_format".into(), format);
+    }
 
     let mut messages = Vec::new();
     if let Some(system) = &options.system_message {
         messages.push(json!({"role": "system", "content": system}));
     }
-    let content = if let Some(media) = media {
-        let mime = media.mime.as_deref().unwrap_or("application/octet-stream");
-        json!([
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {
-                "url": format!("data:{mime};base64,{}", base64(&media.bytes)),
-            }},
-        ])
+    let content = if let Some(images) = media {
+        let mut blocks = Vec::with_capacity(1 + images.len());
+        blocks.push(json!({"type": "text", "text": prompt}));
+        blocks.extend(images.iter().map(|image| {
+            let mime = image.mime.as_deref().unwrap_or("application/octet-stream");
+            json!({"type": "image_url", "image_url": {
+                "url": format!("data:{mime};base64,{}", base64(&image.bytes)),
+            }})
+        }));
+        Value::Array(blocks)
     } else {
         json!(prompt)
     };

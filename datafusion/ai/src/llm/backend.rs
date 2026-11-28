@@ -25,8 +25,9 @@ pub struct LlmRequest {
     pub model: String,
     /// Prompts in input row order.
     pub prompts: Vec<String>,
-    /// Resolved media in prompt order, or `None` for each text-only prompt.
-    pub media: Vec<Option<ResolvedMedia>>,
+    /// One media slot per prompt. Vision slots contain images in input order.
+    /// Text-only prompts have a `None` slot.
+    pub media: Vec<Option<Vec<ResolvedMedia>>>,
     /// Validated query and generation options.
     pub options: Arc<LlmOptions>,
 }
@@ -207,7 +208,8 @@ pub trait LlmBackend: Debug + Send + Sync {
     }
 }
 
-/// The built-in deterministic backend. It performs no network requests.
+/// The built-in deterministic backend. Completions echo the prompt for both
+/// text and vision inputs, independent of the supplied images.
 #[derive(Debug, Default)]
 pub struct MockLlmBackend;
 
@@ -238,10 +240,10 @@ impl LlmBackend for MockLlmBackend {
         if cancel.is_cancelled() {
             return Err(LlmBackendError::Cancelled);
         }
-        let outputs = request
-            .prompts
-            .iter()
-            .map(|prompt| Some(format!("mock[{}]: {prompt}", request.model)))
+        let LlmRequest { model, prompts, .. } = request;
+        let outputs = prompts
+            .into_iter()
+            .map(|prompt| Some(format!("mock[{model}]: {prompt}")))
             .collect();
         Ok(LlmResponse {
             outputs,

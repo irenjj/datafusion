@@ -171,6 +171,47 @@ Python 3 and the OpenSSL CLI generate an ephemeral CA and server certificate. Th
 cargo test --locked --profile ci -p datafusion-ai --features http --test http -- --ignored custom_ca_controls_trust
 ```
 
+## AI structured output
+
+Pass `response_schema` in the constant options for `llm()` or `vlm()` to get a typed Arrow struct.
+
+```sql
+SELECT llm(
+  text,
+  'model',
+  '{"response_schema":{"type":"object","properties":{"label":{"type":"string","enum":["yes","no"]},"score":{"type":"number"}},"required":["label"]},"on_error":"envelope"}'
+) AS result FROM input;
+```
+
+Property declaration order determines the Arrow field order and is preserved when workers decode canonical options. Objects must have non-empty `properties`. Arrays use one `items` schema. Strings, booleans, signed 64-bit integers and finite numbers map to Arrow `Utf8`, `Boolean`, `Int64` and `Float64`. Missing optional properties and explicit nulls in nullable fields become Arrow nulls. Undeclared properties are rejected. The schema has a maximum depth of 16 and at most 1024 properties across all objects.
+
+The HTTP backend sets a strict `response_format` with every object closed and every property listed as required. Optional properties use a nullable type in the request. Setting `extra_body.response_format` together with `response_schema` is a planning error.
+
+A malformed or mismatched response produces a non-retryable `SCHEMA_MISMATCH` for its row. With `on_error: "envelope"`, the successful value stays a typed struct and its error fields are null.
+
+```bash
+cargo test --locked --profile ci -p datafusion-ai --lib response_schema
+cargo nextest run --locked --cargo-profile ci -p datafusion-ai --test runtime -E 'test(structured_) | test(worker_decode_preserves_schema_order)'
+cargo nextest run --locked --cargo-profile ci -p datafusion-ai --features http --test http
+cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm structured_chat_sql
+```
+
+## AI vision with multiple images
+
+`vlm()` accepts a string URI, a `df.media_ref` v1 value, or a `List`, `LargeList`, or `FixedSizeList` with either element type. The HTTP backend sends text first and then images in list order.
+
+Set `max_media_items` to cap images per row (default 16, maximum 64), `max_row_media_bytes` to cap total image bytes per row (default 32 MiB, maximum 128 MiB), and `max_media_bytes` to cap bytes per image (default 8 MiB, maximum 32 MiB). The resolver receives the smaller of the per-image cap and the row's remaining budget. A budget failure stops reads for that row.
+
+A NULL prompt or NULL list skips resolution and inference. With `on_error: "envelope"`, all four envelope fields are NULL. Empty lists, NULL elements, invalid URIs, and budget violations are permanent row errors handled by `on_error`.
+
+Custom `LlmBackend` implementations receive one `LlmRequest::media` slot per prompt. Each vision slot is now `Some(Vec<ResolvedMedia>)` in input order, with one image for a scalar reference. Text-only prompts still use `None`.
+
+```bash
+cargo nextest run --locked --cargo-profile ci -p datafusion-ai --features http vision
+cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm vision
+cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm parquet_sql_isolates_multi_image_and_schema_errors
+```
+
 ## Evidence
 
 Start from a clean checkout with Bash 5, Git, GNU coreutils and `jq` on PATH. Use the local two-node `df-ci` pool for routine verification and store evidence outside the checkout. Use a separate lane name per command and a fresh output directory for a rerun.
