@@ -11,6 +11,7 @@ use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     Result, Statistics, internal_err, plan_datafusion_err, plan_err,
 };
+use datafusion_execution::config::SessionConfig;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode};
@@ -27,10 +28,12 @@ use datafusion_physical_plan::{
 };
 use datafusion_session::Session;
 
-use super::logical::{LlmNode, llm_field};
+use super::logical::{LlmNode, validate_media_field};
 use super::stream::{Dispatch, LlmMetrics, LlmStream};
-use super::{LlmOptions, LlmProviderRegistry};
-use crate::{CheckpointOutputColumn, CheckpointableTarget};
+use super::{LlmOptions, LlmProviderRegistry, OnError, TaskKind};
+use crate::{
+    CheckpointOutputColumn, CheckpointableTarget, MediaResolver, ObjectStoreMediaResolver,
+};
 
 /// Plans an [`LlmNode`] with the coordinator session's registry, or the built-in
 /// mock registry when the session has no registry extension.
@@ -64,9 +67,24 @@ pub fn plan_llm(
         .config()
         .get_extension::<LlmProviderRegistry>()
         .unwrap_or_default();
-    Ok(Some(Arc::new(LlmExec::try_new_with_registry(
+    let media = node
+        .media_expr()
+        .map(|expr| {
+            create_physical_expr(
+                expr,
+                logical_input.schema(),
+                session.execution_props(),
+                planning_context,
+            )
+            .map(MediaPlan::new)
+        })
+        .transpose()?;
+    let media = bind_session_media(media, node.task_kind(), session.config())?;
+    Ok(Some(Arc::new(LlmExec::try_new_task_with_registry(
         Arc::clone(input),
         prompt,
+        media,
+        node.task_kind(),
         node.model().to_owned(),
         node.options_json(),
         node.output_col().to_owned(),
@@ -74,11 +92,74 @@ pub fn plan_llm(
     )?)))
 }
 
+/// The physical media expression and resolver for vision inference.
+#[derive(Clone)]
+pub struct MediaPlan {
+    pub(super) expr: Arc<dyn PhysicalExpr>,
+    pub(super) resolver: Option<Arc<dyn MediaResolver>>,
+}
+
+impl fmt::Debug for MediaPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MediaPlan").finish_non_exhaustive()
+    }
+}
+
+impl MediaPlan {
+    /// Bind the media expression to the input schema. The task-context constructor
+    /// binds the resolver from the session configuration.
+    pub fn new(expr: Arc<dyn PhysicalExpr>) -> Self {
+        Self {
+            expr,
+            resolver: None,
+        }
+    }
+
+    /// Attach an explicit resolver when building a plan with a provider registry.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn MediaResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Returns the media expression bound to the input schema.
+    pub fn expr(&self) -> &Arc<dyn PhysicalExpr> {
+        &self.expr
+    }
+}
+
+fn bind_session_media(
+    media: Option<MediaPlan>,
+    kind: TaskKind,
+    config: &SessionConfig,
+) -> Result<Option<MediaPlan>> {
+    if kind != TaskKind::Vision {
+        return Ok(media);
+    }
+    let media = media
+        .ok_or_else(|| plan_datafusion_err!("Vision requires a media expression"))?;
+    let resolver = config
+        .get_extension::<ObjectStoreMediaResolver>()
+        .map(|resolver| resolver as Arc<dyn MediaResolver>)
+        .or_else(|| {
+            config
+                .get_extension::<Arc<dyn MediaResolver>>()
+                .map(|resolver| Arc::clone(resolver.as_ref()))
+        })
+        .ok_or_else(|| {
+            plan_datafusion_err!(
+                "Vision requires a media resolver extension in SessionConfig"
+            )
+        })?;
+    Ok(Some(media.with_resolver(resolver)))
+}
+
 /// Physical plan that evaluates prompts and appends asynchronous LLM results.
 #[derive(Debug)]
 pub struct LlmExec {
     input: Arc<dyn ExecutionPlan>,
     prompt: Arc<dyn PhysicalExpr>,
+    media: Option<MediaPlan>,
     dispatch: Arc<Dispatch>,
     canonical_options_json: String,
     output_col: String,
@@ -117,6 +198,16 @@ impl LlmExec {
         &self.output_col
     }
 
+    /// Returns the task performed by this operator.
+    pub fn task_kind(&self) -> TaskKind {
+        self.dispatch.kind
+    }
+
+    /// Returns the bound media plan for vision inference.
+    pub fn media(&self) -> Option<&MediaPlan> {
+        self.media.as_ref()
+    }
+
     /// Builds an operator with a prompt bound to the input schema. Each operator
     /// has its own request limit and shares the selected provider's limit.
     ///
@@ -131,21 +222,63 @@ impl LlmExec {
         output_col: String,
         registry: &LlmProviderRegistry,
     ) -> Result<Self> {
+        Self::try_new_task_with_registry(
+            input,
+            prompt,
+            None,
+            TaskKind::Chat,
+            model,
+            options_json,
+            output_col,
+            registry,
+        )
+    }
+
+    /// Builds an operator for the given task. Vision requires a media expression and a resolver.
+    ///
+    /// # Errors
+    /// Returns a planning error for incompatible media, options, or provider settings.
+    #[expect(clippy::too_many_arguments)]
+    pub fn try_new_task_with_registry(
+        input: Arc<dyn ExecutionPlan>,
+        prompt: Arc<dyn PhysicalExpr>,
+        media: Option<MediaPlan>,
+        kind: TaskKind,
+        model: String,
+        options_json: &str,
+        output_col: String,
+        registry: &LlmProviderRegistry,
+    ) -> Result<Self> {
         if model.trim().is_empty() {
             return plan_err!("LlmExec model must be non-empty");
         }
         if output_col.trim().is_empty() {
             return plan_err!("LlmExec output column must be non-empty");
         }
+        match (kind, &media) {
+            (TaskKind::Vision, Some(media)) if media.resolver.is_some() => {
+                validate_media_field(
+                    media.expr.return_field(input.schema().as_ref())?.as_ref(),
+                )?;
+            }
+            (TaskKind::Vision, _) => {
+                return plan_err!("Vision requires a media expression and resolver");
+            }
+            (_, Some(_)) => return plan_err!("Only vision inference accepts media"),
+            (_, None) => {}
+        }
         let (options, canonical_options_json) = LlmOptions::parse(options_json)?;
+        let output_field = options.output_field(kind, &output_col)?;
         let provider = registry.resolve(options.provider.as_deref())?;
-        let dispatch = Dispatch::try_new(model, options, provider)?;
+        let dispatch = Dispatch::try_new(model, options, kind, provider)?;
         Ok(Self::new(
             input,
             prompt,
+            media,
             Arc::new(dispatch),
             canonical_options_json,
             output_col,
+            output_field,
         ))
     }
 
@@ -180,19 +313,64 @@ impl LlmExec {
         )
     }
 
+    /// Builds an operator from the worker's session extensions. For a custom
+    /// media resolver, register an `Arc<dyn MediaResolver>` as an extension value.
+    ///
+    /// # Errors
+    /// Returns a planning error for missing extensions or invalid operator settings.
+    #[expect(clippy::too_many_arguments)]
+    pub fn try_new_task_from_task_context(
+        input: Arc<dyn ExecutionPlan>,
+        prompt: Arc<dyn PhysicalExpr>,
+        media: Option<MediaPlan>,
+        kind: TaskKind,
+        model: String,
+        options_json: &str,
+        output_col: String,
+        ctx: &TaskContext,
+    ) -> Result<Self> {
+        if kind == TaskKind::Chat && media.is_none() {
+            return Self::try_new_from_task_context(
+                input,
+                prompt,
+                model,
+                options_json,
+                output_col,
+                ctx,
+            );
+        }
+        let config = ctx.session_config();
+        let media = bind_session_media(media, kind, config)?;
+        let registry = config.get_extension::<LlmProviderRegistry>().ok_or_else(|| {
+            plan_datafusion_err!("LlmExec worker decoding requires a LlmProviderRegistry extension in the task's SessionConfig")
+        })?;
+        Self::try_new_task_with_registry(
+            input,
+            prompt,
+            media,
+            kind,
+            model,
+            options_json,
+            output_col,
+            &registry,
+        )
+    }
+
     fn new(
         input: Arc<dyn ExecutionPlan>,
         prompt: Arc<dyn PhysicalExpr>,
+        media: Option<MediaPlan>,
         dispatch: Arc<Dispatch>,
         canonical_options_json: String,
         output_col: String,
+        output_field: FieldRef,
     ) -> Self {
         let schema = input.schema();
         let fields = schema
             .fields()
             .iter()
             .cloned()
-            .chain(std::iter::once(llm_field(&output_col)))
+            .chain(std::iter::once(output_field))
             .collect::<Vec<_>>();
         let output_schema =
             Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
@@ -208,6 +386,7 @@ impl LlmExec {
         Self {
             input,
             prompt,
+            media,
             dispatch,
             canonical_options_json,
             output_col,
@@ -226,7 +405,7 @@ impl CheckpointableTarget for LlmExec {
         vec![CheckpointOutputColumn {
             index: self.passthrough_column_count(),
             name: self.output_col.clone(),
-            is_error_envelope: false,
+            is_error_envelope: self.dispatch.options.on_error == OnError::Envelope,
         }]
     }
 
@@ -270,7 +449,10 @@ impl ExecutionPlan for LlmExec {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
-        apply_expression_roots([&self.prompt], f)
+        apply_expression_roots(
+            std::iter::once(&self.prompt).chain(self.media.iter().map(MediaPlan::expr)),
+            f,
+        )
     }
 
     fn replace_children(
@@ -286,12 +468,23 @@ impl ExecutionPlan for LlmExec {
             &self.input.schema(),
             &input.schema(),
         )?;
+        let media = self
+            .media
+            .clone()
+            .map(|mut media| {
+                media.expr =
+                    rebind_prompt(media.expr, &self.input.schema(), &input.schema())?;
+                Ok::<_, datafusion_common::DataFusionError>(media)
+            })
+            .transpose()?;
         Ok(Arc::new(Self::new(
             input,
             prompt,
+            media,
             Arc::clone(&self.dispatch),
             self.canonical_options_json.clone(),
             self.output_col.clone(),
+            Arc::clone(self.schema().fields().last().unwrap()),
         )))
     }
 
@@ -352,6 +545,7 @@ impl ExecutionPlan for LlmExec {
             self.schema(),
             input,
             Arc::clone(&self.prompt),
+            self.media.clone(),
             Arc::clone(&self.dispatch),
             LlmMetrics::new(&self.metrics, partition),
         )))

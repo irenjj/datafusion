@@ -8,15 +8,19 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use datafusion_common::{Result, plan_datafusion_err, plan_err};
 use reqwest::header::{AUTHORIZATION, HeaderValue, RETRY_AFTER};
-use reqwest::{Client, Response, StatusCode, Url};
+use reqwest::{Certificate, Client, Response, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::options::is_sensitive_key;
 use super::{
-    CancellationToken, LlmBackend, LlmBackendError, LlmRequest, LlmResponse, LlmUsage,
+    CancellationToken, LlmBackend, LlmBackendError, LlmEmbeddingResponse, LlmRequest,
+    LlmResponse, LlmUsage, OnError, TaskKind,
 };
+use crate::sanitize::{sanitized_detail, single_line};
+
+const MAX_EMBEDDING_BATCH: usize = 32;
 
 /// Runtime configuration for an OpenAI-compatible HTTP endpoint.
 pub struct OpenAiHttpConfig {
@@ -27,6 +31,8 @@ pub struct OpenAiHttpConfig {
     /// Environment variable read once at construction. Mutually exclusive with
     /// [Self::api_key].
     pub api_key_env: Option<String>,
+    /// Additional PEM-encoded CA certificates to trust for this endpoint.
+    pub ca_cert_pem: Option<Vec<u8>>,
 }
 
 impl fmt::Debug for OpenAiHttpConfig {
@@ -35,10 +41,10 @@ impl fmt::Debug for OpenAiHttpConfig {
     }
 }
 
-/// A backend for OpenAI-compatible HTTP chat completions.
+/// A backend for OpenAI-compatible chat completions and text embeddings.
 ///
 /// Register it in the [`LlmProviderRegistry`](super::LlmProviderRegistry) and select
-/// that provider in the options for `llm()`.
+/// that provider in the options for `llm()`, `vlm()`, or `embed()`.
 pub struct OpenAiHttpBackend {
     transport: Transport,
 }
@@ -60,6 +66,7 @@ impl OpenAiHttpBackend {
     ///     base_url: "http://localhost:8000/v1".into(),
     ///     api_key: None,
     ///     api_key_env: None,
+    ///     ca_cert_pem: None,
     /// })?;
     /// LlmProviderRegistry::default().register("local", Arc::new(backend))?;
     /// # Ok::<(), datafusion_common::DataFusionError>(())
@@ -77,6 +84,18 @@ impl LlmBackend for OpenAiHttpBackend {
         Some(1)
     }
 
+    fn default_batch_size_for(&self, kind: TaskKind) -> usize {
+        self.max_batch_size_for(kind).unwrap_or(1)
+    }
+
+    fn max_batch_size_for(&self, kind: TaskKind) -> Option<usize> {
+        if kind == TaskKind::Embed {
+            Some(MAX_EMBEDDING_BATCH)
+        } else {
+            self.max_batch_size()
+        }
+    }
+
     async fn generate(
         &self,
         request: LlmRequest,
@@ -85,12 +104,54 @@ impl LlmBackend for OpenAiHttpBackend {
         if cancel.is_cancelled() {
             return Err(LlmBackendError::Cancelled);
         }
+        let legacy_chat = request.options.on_error != OnError::Envelope
+            && request.media.iter().all(Option::is_none);
         let body = build_body(request)?;
-        let reply: ChatResponse = self
+        let response = self
             .transport
             .post_json(&["chat", "completions"], &body, &cancel)
+            .await
+            .and_then(ChatResponse::into_response);
+        match response {
+            Err(LlmBackendError::InvalidResponse { status, message }) if legacy_chat => {
+                Err(LlmBackendError::Permanent { status, message })
+            }
+            other => other,
+        }
+    }
+
+    async fn embed(
+        &self,
+        request: LlmRequest,
+        cancel: CancellationToken,
+    ) -> std::result::Result<LlmEmbeddingResponse, LlmBackendError> {
+        if cancel.is_cancelled() {
+            return Err(LlmBackendError::Cancelled);
+        }
+        let count = request.prompts.len();
+        if !(1..=MAX_EMBEDDING_BATCH).contains(&count) {
+            return Err(permanent(
+                None,
+                "embeddings require between 1 and 32 prompts per request",
+            ));
+        }
+        if request.media.len() != count || request.media.iter().any(Option::is_some) {
+            return Err(permanent(
+                None,
+                "embeddings require one text input per prompt",
+            ));
+        }
+        let dimension = request.options.embedding_dimension().map_err(|error| {
+            LlmBackendError::SchemaMismatch {
+                message: error.to_string(),
+            }
+        })? as usize;
+        let body = json!({"model": request.model, "input": request.prompts});
+        let response: EmbeddingResponse = self
+            .transport
+            .post_json(&["embeddings"], &body, &cancel)
             .await?;
-        reply.into_response()
+        response.into_response(count, dimension)
     }
 }
 
@@ -101,6 +162,12 @@ fn build_body(
         return Err(permanent(
             None,
             "chat completions require exactly one prompt per request",
+        ));
+    };
+    let [media] = request.media.as_slice() else {
+        return Err(permanent(
+            None,
+            "chat completions require one media slot per prompt",
         ));
     };
     let options = &request.options;
@@ -116,7 +183,18 @@ fn build_body(
     if let Some(system) = &options.system_message {
         messages.push(json!({"role": "system", "content": system}));
     }
-    messages.push(json!({"role": "user", "content": prompt}));
+    let content = if let Some(media) = media {
+        let mime = media.mime.as_deref().unwrap_or("application/octet-stream");
+        json!([
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {
+                "url": format!("data:{mime};base64,{}", base64(&media.bytes)),
+            }},
+        ])
+    } else {
+        json!(prompt)
+    };
+    messages.push(json!({"role": "user", "content": content}));
     body.insert("messages".into(), Value::Array(messages));
     body.insert("model".into(), Value::String(request.model));
     body.insert("stream".into(), Value::Bool(false));
@@ -132,6 +210,32 @@ fn build_body(
         }
     }
     Ok(body)
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or_default();
+        let third = chunk.get(2).copied().unwrap_or_default();
+        let symbols = [
+            first >> 2,
+            ((first & 0b11) << 4) | (second >> 4),
+            ((second & 0b1111) << 2) | (third >> 6),
+            third & 0b111111,
+        ];
+        for (position, symbol) in symbols.into_iter().enumerate() {
+            let character = if position <= chunk.len() {
+                ALPHABET[usize::from(symbol)]
+            } else {
+                b'='
+            };
+            encoded.push(char::from(character));
+        }
+    }
+    encoded
 }
 
 fn contains_credential_key(object: &Map<String, Value>) -> bool {
@@ -159,12 +263,16 @@ impl ChatResponse {
         let mut choices = self.choices.into_iter();
         let choice = choices
             .next()
-            .ok_or_else(|| permanent(None, "chat completions response has no choices"))?;
+            .ok_or_else(|| LlmBackendError::InvalidResponse {
+                status: None,
+                message: "chat completions response has no choices".into(),
+            })?;
         if choices.len() != 0 {
-            return Err(permanent(
-                None,
-                "chat completions response must contain exactly one choice",
-            ));
+            return Err(LlmBackendError::InvalidResponse {
+                status: None,
+                message: "chat completions response must contain exactly one choice"
+                    .into(),
+            });
         }
         Ok(LlmResponse {
             outputs: vec![choice.message.content],
@@ -173,6 +281,58 @@ impl ChatResponse {
                 output_tokens: usage.completion_tokens,
             }),
         })
+    }
+}
+
+#[derive(Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<Embedding>,
+    usage: Option<EmbeddingUsage>,
+}
+
+#[derive(Deserialize)]
+struct Embedding {
+    index: usize,
+    embedding: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+}
+
+impl EmbeddingResponse {
+    fn into_response(
+        mut self,
+        count: usize,
+        dimension: usize,
+    ) -> std::result::Result<LlmEmbeddingResponse, LlmBackendError> {
+        self.data.sort_unstable_by_key(|item| item.index);
+        let outputs = self
+            .data
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                if index != item.index {
+                    return Err(LlmBackendError::SchemaMismatch {
+                        message:
+                            "embeddings response has duplicate or out-of-range indices"
+                                .into(),
+                    });
+                }
+                Ok(item.embedding)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let response = LlmEmbeddingResponse {
+            outputs,
+            usage: self.usage.map(|usage| LlmUsage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: 0,
+            }),
+        };
+        response.validate(count, dimension)?;
+        Ok(response)
     }
 }
 
@@ -220,12 +380,30 @@ impl Transport {
         let authorization = key.as_deref().map(bearer_header).transpose()?;
 
         // A redirect can send credentials or inference data to a different endpoint.
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .use_rustls_tls()
             .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .build()
-            .map_err(|_| plan_datafusion_err!("Could not build the llm HTTP client"))?;
+            .retry(reqwest::retry::never());
+        let invalid_ca = || plan_datafusion_err!("Invalid llm HTTP ca_cert_pem");
+        if let Some(pem) = &config.ca_cert_pem {
+            // The Rustls build of reqwest accepts empty PEM bundles.
+            if Certificate::from_pem_bundle(pem)
+                .map_err(|_| invalid_ca())?
+                .is_empty()
+            {
+                return Err(invalid_ca());
+            }
+            builder = builder.add_root_certificate(
+                Certificate::from_pem(pem).map_err(|_| invalid_ca())?,
+            );
+        }
+        let client = builder.build().map_err(|_| {
+            if config.ca_cert_pem.is_some() {
+                invalid_ca()
+            } else {
+                plan_datafusion_err!("Could not build the llm HTTP client")
+            }
+        })?;
         Ok(Self {
             client,
             base,
@@ -233,7 +411,7 @@ impl Transport {
         })
     }
 
-    async fn post_json<B: Serialize, R: DeserializeOwned>(
+    pub(super) async fn post_json<B: Serialize, R: DeserializeOwned>(
         &self,
         path: &[&str],
         body: &B,
@@ -260,8 +438,9 @@ impl Transport {
                     return Err(response_error(response, self.authorization.as_ref(), path).await);
                 }
                 let bytes = response.bytes().await.map_err(|error| transport_error(&error, path))?;
-                serde_json::from_slice(&bytes).map_err(|_| {
-                    permanent(Some(status.as_u16()), &format!("invalid {} response", path.join(" ")))
+                serde_json::from_slice(&bytes).map_err(|_| LlmBackendError::InvalidResponse {
+                    status: Some(status.as_u16()),
+                    message: format!("invalid {} response", path.join(" ")),
                 })
             } => result,
         }
@@ -386,10 +565,7 @@ async fn read_error_detail(
     let message = body["error"]["message"]
         .as_str()
         .or_else(|| body["message"].as_str())?;
-    let mut detail = single_line(message);
-    if detail.contains("://") {
-        return None;
-    }
+    let mut detail = sanitized_detail(message)?;
     if let Some(authorization) = authorization {
         let key = std::str::from_utf8(authorization.as_bytes())
             .ok()?
@@ -408,17 +584,6 @@ async fn read_error_detail(
     detail.truncate(detail.floor_char_boundary(MAX_ERROR_DETAIL_BYTES));
     let detail = detail.trim_end();
     (!detail.is_empty()).then(|| detail.to_owned())
-}
-
-fn single_line(value: &str) -> String {
-    value
-        .split(|ch: char| {
-            ch.is_control() || ch.is_whitespace()
-                || matches!(ch, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
-        })
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn retry_after(value: &str, now: SystemTime) -> Option<Duration> {
@@ -455,6 +620,47 @@ fn permanent(status: Option<u16>, message: &str) -> LlmBackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_matches_rfc4648_and_round_trips_all_bytes() {
+        for (text, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(text.as_bytes()), expected);
+        }
+        let bytes = (0..=u8::MAX).collect::<Vec<_>>();
+        let encoded = base64(&bytes);
+        let mut decoded = Vec::new();
+        let (chunks, remainder) = encoded.as_bytes().as_chunks::<4>();
+        assert!(remainder.is_empty());
+        for chunk in chunks {
+            let mut bits = 0u32;
+            let mut padding = 0;
+            for &symbol in chunk {
+                let value = match symbol {
+                    b'A'..=b'Z' => symbol - b'A',
+                    b'a'..=b'z' => symbol - b'a' + 26,
+                    b'0'..=b'9' => symbol - b'0' + 52,
+                    b'+' => 62,
+                    b'/' => 63,
+                    b'=' => {
+                        padding += 1;
+                        0
+                    }
+                    _ => panic!("unexpected base64 symbol"),
+                };
+                bits = (bits << 6) | u32::from(value);
+            }
+            decoded.extend_from_slice(&bits.to_be_bytes()[1..4 - padding]);
+        }
+        assert_eq!(decoded, bytes);
+    }
 
     #[test]
     fn parses_retry_after_seconds_and_http_dates() {

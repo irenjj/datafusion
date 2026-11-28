@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use tokio::sync::Semaphore;
 
+use super::TaskKind;
 use super::options::{LlmOptions, validate_inflight_limit};
+use crate::{ErrorCode, ResolvedMedia};
 use datafusion_common::{Result, plan_datafusion_err, plan_err};
 
 pub use tokio_util::sync::CancellationToken;
@@ -23,6 +25,8 @@ pub struct LlmRequest {
     pub model: String,
     /// Prompts in input row order.
     pub prompts: Vec<String>,
+    /// Resolved media in prompt order, or `None` for each text-only prompt.
+    pub media: Vec<Option<ResolvedMedia>>,
     /// Validated query and generation options.
     pub options: Arc<LlmOptions>,
 }
@@ -43,6 +47,45 @@ pub struct LlmResponse {
     pub outputs: Vec<Option<String>>,
     /// Usage, when the provider reports it.
     pub usage: Option<LlmUsage>,
+}
+
+/// Embeddings returned in the same order as the prompts.
+#[derive(Debug)]
+pub struct LlmEmbeddingResponse {
+    /// One vector of the requested dimension per prompt.
+    pub outputs: Vec<Vec<f32>>,
+    /// Usage, when the provider reports it.
+    pub usage: Option<LlmUsage>,
+}
+
+impl LlmEmbeddingResponse {
+    pub(super) fn validate(
+        &self,
+        prompts: usize,
+        dimension: usize,
+    ) -> std::result::Result<(), LlmBackendError> {
+        if self.outputs.len() != prompts {
+            return Err(LlmBackendError::SchemaMismatch {
+                message: format!(
+                    "backend returned {} embeddings for {prompts} prompts",
+                    self.outputs.len()
+                ),
+            });
+        }
+        if let Some(size) = self
+            .outputs
+            .iter()
+            .map(Vec::len)
+            .find(|&len| len != dimension)
+        {
+            return Err(LlmBackendError::SchemaMismatch {
+                message: format!(
+                    "backend returned an embedding of dimension {size}, expected {dimension}"
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Failure classification for a single backend attempt. Messages may be shown
@@ -70,6 +113,18 @@ pub enum LlmBackendError {
         /// Diagnostic message.
         message: String,
     },
+    /// The provider's response could not be decoded.
+    InvalidResponse {
+        /// HTTP status, if applicable.
+        status: Option<u16>,
+        /// Diagnostic message.
+        message: String,
+    },
+    /// The response did not match the expected number or shape of outputs.
+    SchemaMismatch {
+        /// Diagnostic message.
+        message: String,
+    },
     /// The attempt was cancelled.
     Cancelled,
 }
@@ -78,18 +133,34 @@ impl Display for LlmBackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RateLimited { message, .. } => write!(f, "rate limited: {message}"),
-            Self::Transient { status, message } | Self::Permanent { status, message } => {
+            Self::Transient { status, message }
+            | Self::Permanent { status, message }
+            | Self::InvalidResponse { status, message } => {
                 if let Some(status) = status {
                     write!(f, "HTTP {status}: ")?;
                 }
                 f.write_str(message)
             }
+            Self::SchemaMismatch { message } => f.write_str(message),
             Self::Cancelled => f.write_str("request cancelled"),
         }
     }
 }
 
 impl std::error::Error for LlmBackendError {}
+
+impl LlmBackendError {
+    pub(super) fn classification(&self) -> (ErrorCode, bool) {
+        match self {
+            Self::RateLimited { .. } => (ErrorCode::RateLimited, true),
+            Self::Transient { .. } => (ErrorCode::TransientHttp, true),
+            Self::Permanent { .. } => (ErrorCode::PermanentHttp, false),
+            Self::InvalidResponse { .. } => (ErrorCode::InvalidResponse, false),
+            Self::SchemaMismatch { .. } => (ErrorCode::SchemaMismatch, false),
+            Self::Cancelled => (ErrorCode::Cancelled, false),
+        }
+    }
+}
 
 /// An asynchronous inference provider. The executor may drop the generation
 /// future during cancellation or timeout. Backends that spawn independent work
@@ -106,12 +177,34 @@ pub trait LlmBackend: Debug + Send + Sync {
         None
     }
 
-    /// Runs one attempt. The executor owns the timeout and retry policy.
+    /// Preferred batch size for a specific task when SQL does not specify one.
+    fn default_batch_size_for(&self, _kind: TaskKind) -> usize {
+        self.default_batch_size()
+    }
+
+    /// Maximum batch size for a specific task, if bounded.
+    fn max_batch_size_for(&self, _kind: TaskKind) -> Option<usize> {
+        self.max_batch_size()
+    }
+
+    /// Runs one completion attempt. The executor owns the timeout and retry policy.
     async fn generate(
         &self,
         request: LlmRequest,
         cancel: CancellationToken,
     ) -> std::result::Result<LlmResponse, LlmBackendError>;
+
+    /// Runs one embedding attempt. Text-only backends may use the default error.
+    async fn embed(
+        &self,
+        _request: LlmRequest,
+        _cancel: CancellationToken,
+    ) -> std::result::Result<LlmEmbeddingResponse, LlmBackendError> {
+        Err(LlmBackendError::Permanent {
+            status: None,
+            message: "provider does not support embeddings".into(),
+        })
+    }
 }
 
 /// The built-in deterministic backend. It performs no network requests.
@@ -122,6 +215,19 @@ pub struct MockLlmBackend;
 impl LlmBackend for MockLlmBackend {
     fn default_batch_size(&self) -> usize {
         1024
+    }
+
+    fn default_batch_size_for(&self, kind: TaskKind) -> usize {
+        self.max_batch_size_for(kind)
+            .unwrap_or_else(|| self.default_batch_size())
+    }
+
+    fn max_batch_size_for(&self, kind: TaskKind) -> Option<usize> {
+        match kind {
+            TaskKind::Chat => None,
+            TaskKind::Embed => Some(32),
+            TaskKind::Vision => Some(1),
+        }
     }
 
     async fn generate(
@@ -138,6 +244,30 @@ impl LlmBackend for MockLlmBackend {
             .map(|prompt| Some(format!("mock[{}]: {prompt}", request.model)))
             .collect();
         Ok(LlmResponse {
+            outputs,
+            usage: None,
+        })
+    }
+
+    async fn embed(
+        &self,
+        request: LlmRequest,
+        cancel: CancellationToken,
+    ) -> std::result::Result<LlmEmbeddingResponse, LlmBackendError> {
+        if cancel.is_cancelled() {
+            return Err(LlmBackendError::Cancelled);
+        }
+        let dimension = request.options.embedding_dimension().map_err(|error| {
+            LlmBackendError::SchemaMismatch {
+                message: error.to_string(),
+            }
+        })? as usize;
+        let outputs = request
+            .prompts
+            .iter()
+            .map(|prompt| vec![prompt.len() as f32; dimension])
+            .collect();
+        Ok(LlmEmbeddingResponse {
             outputs,
             usage: None,
         })

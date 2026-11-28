@@ -13,10 +13,14 @@ mod checkpoint;
 #[cfg(feature = "runtime")]
 pub mod llm;
 mod media;
+#[cfg(feature = "runtime")]
+mod sanitize;
 
 pub use checkpoint::{
     CheckpointOutputColumn, CheckpointableTarget, validate_checkpoint_target,
 };
+#[cfg(feature = "runtime")]
+pub use media::ObjectStoreMediaResolver;
 pub use media::{MediaByteRange, MediaResolver, ResolvedMedia};
 
 /// Stable wire codes for inference failures.

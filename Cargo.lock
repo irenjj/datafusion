@@ -2142,6 +2142,7 @@ dependencies = [
  "futures",
  "httpdate",
  "log",
+ "object_store",
  "parking_lot 0.13.0",
  "proptest",
  "reqwest 0.12.28",
@@ -2149,6 +2150,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]

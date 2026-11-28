@@ -17,7 +17,8 @@ tests() { cargo nextest run --locked --cargo-profile ci -p "$@"; }
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | ai-contract     | `lint datafusion-ai --no-default-features` and `tests datafusion-ai --no-default-features` (includes `--test contract`)                                                                                                                                    | `PROPTEST_CASES=4096 PROPTEST_RNG_SEED=2026 cargo test --locked -p datafusion-ai --no-default-features --test contract`. Mutate envelope or schema validation when it changes.                  |
 | ai-runtime      | `lint datafusion-ai` and `tests datafusion-ai` with default `runtime`. Nextest runs the LLM unit tests and the `contract` and `runtime` targets.                                                                                                           | `cargo test --locked --profile ci -p datafusion-ai --test runtime` replays worker decode, checkpoint, concurrency, retry and cancellation cases.                                                |
-| ai-http         | `lint datafusion-ai --features http` and `tests datafusion-ai --features http`. Loopback tests cover transport and registry execution.                                                                                                                     | `cargo nextest run --locked --cargo-profile ci -p datafusion-ai --features http --test http`. Check core wiring with `lint datafusion --features ai-http`.                                      |
+| ai-http         | `lint datafusion-ai --features http` and `tests datafusion-ai --features http`. Loopback tests cover chat, embedding batches and vision data URIs.                                                                                                         | `cargo nextest run --locked --cargo-profile ci -p datafusion-ai --features http --test http`. Check core wiring with `lint datafusion --features ai-http`.                                      |
+| core-ai-http    | `cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm` covers embedding and vision through SQL and generated Parquet.                                                                                                 | [Replay loopback TLS with a custom CA](#ai-custom-ca-loopback).                                                                                                                                 |
 | lake-storage    | `lint datafusion-lake` and `tests datafusion-lake`. Covers pinned Lance and Paimon scans, split replay, scalar pushdown, descriptor-only media projection and bounded resolution.                                                                          | Replay `cargo nextest run --locked --cargo-profile ci -p datafusion-lake --test readonly_scan --test split_contract` using generated local fixtures.                                            |
 | dist-checkpoint | TODO `lint datafusion-dist` and `tests datafusion-dist`. The lake tables are read-only. Checkpoint and DLQ routing belong to `datafusion-dist`.                                                                                                            | TODO restart, duplicate replay and interruption tests at the checkpoint commit boundary.                                                                                                        |
 | lake-retrieval  | `lint datafusion-lake`, `tests datafusion-lake` and `bash datafusion/lake/tests/check-dependencies.sh`. Covers indexed retrieval, weighted fusion, late reads and dependency isolation.                                                                    | `cargo nextest run --locked --cargo-profile ci -p datafusion-lake -E 'test(search::)'` replays the retrieval contract with local fixtures.                                                      |
@@ -81,6 +82,14 @@ for config in LeasedSplitQueue LeasedSplitQueueHardCap; do
     -workers auto -noGenerateSpecTE -metadir "/tmp/tlc-states-$config" \
     -config "datafusion/dist/specs/$config.cfg" datafusion/dist/specs/LeasedSplitQueue.tla
 done
+```
+
+## AI custom CA loopback
+
+Python 3 and the OpenSSL CLI generate an ephemeral CA and server certificate. The test checks that the default trust store rejects the server and that `ca_cert_pem` enables a successful request.
+
+```bash
+cargo test --locked --profile ci -p datafusion-ai --features http --test http -- --ignored custom_ca_controls_trust
 ```
 
 ## Evidence

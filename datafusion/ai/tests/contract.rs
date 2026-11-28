@@ -9,7 +9,10 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use arrow::array::{BooleanArray, RecordBatch, StringArray, StructArray};
+use arrow::array::{
+    BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, StringArray, StructArray,
+};
+use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
@@ -202,6 +205,39 @@ fn ai_error_validate_rejects_partial_error_fields() {
     .unwrap();
 
     assert!(matches!(partial.validate(), Err(DataFusionError::Plan(_))));
+}
+
+#[test]
+fn ai_error_with_fixed_size_list_values_round_trips_through_ipc() -> Result<()> {
+    let item = Arc::new(Field::new_list_field(DataType::Float32, false));
+    let field = AiErrorType::new(DataType::FixedSizeList(Arc::clone(&item), 2))
+        .field("embedding", false)?;
+    let DataType::Struct(fields) = field.data_type() else {
+        unreachable!()
+    };
+    let values = FixedSizeListArray::try_new(
+        item,
+        2,
+        Arc::new(Float32Array::from(vec![1.0, 2.0, 0.0, 0.0])),
+        Some(NullBuffer::from(vec![true, false])),
+    )?;
+    let envelopes = StructArray::try_new(
+        fields.clone(),
+        vec![
+            Arc::new(values),
+            Arc::new(StringArray::from(vec![None, Some("SCHEMA_MISMATCH")])),
+            Arc::new(StringArray::from(vec![None, Some("wrong dimension")])),
+            Arc::new(BooleanArray::from(vec![None, Some(false)])),
+        ],
+        None,
+    )?;
+    let schema = Arc::new(Schema::new(vec![field]));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(envelopes)])?;
+    let mut writer = StreamWriter::try_new(Vec::new(), &schema)?;
+    writer.write(&batch)?;
+    let reader = StreamReader::try_new(Cursor::new(writer.into_inner()?), None)?;
+    assert_eq!(reader.collect::<std::result::Result<Vec<_>, _>>()?, [batch]);
+    Ok(())
 }
 
 #[test]
