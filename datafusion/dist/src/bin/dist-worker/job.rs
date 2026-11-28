@@ -12,6 +12,7 @@ use datafusion::common::{Result, plan_datafusion_err, plan_err};
 #[cfg(feature = "ai")]
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SQLOptions;
+use datafusion::execution::object_store::ObjectStoreUrl;
 #[cfg(feature = "ai")]
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
@@ -22,8 +23,8 @@ use datafusion_ai::llm::{LlmBackend, LlmProviderRegistry, MockLlmBackend};
 #[cfg(feature = "ai-http")]
 use datafusion_ai::llm::{OpenAiHttpBackend, OpenAiHttpConfig};
 use datafusion_dist::{
-    DistCodecs, LocalWorker, ParquetSplitSink, SinkOptions, Split, StagePlan,
-    split_plan_for_distribution_with_codecs,
+    DistCodecs, LocalWorker, ParquetSplitSink, SinkOptions, Split, StageOutputReader,
+    StagePlan, split_plan_for_distribution_with_codecs,
 };
 #[cfg(feature = "ai")]
 use datafusion_dist::{DistExtensionRegistry, LlmExecCodec};
@@ -39,6 +40,8 @@ const PROVIDERS_ENV: &str = "DF_DIST_LLM_PROVIDERS";
 pub(super) struct PlanningOptions {
     pub(super) sql: String,
     pub(super) tables: Vec<String>,
+    pub(super) stage_tables: Vec<String>,
+    pub(super) stage_dlq_tables: Vec<String>,
     pub(super) sink: SinkOptions,
     pub(super) output_root: Option<String>,
 }
@@ -81,26 +84,32 @@ impl StageJob {
         let ctx = session()?;
         let mut input_stores = BTreeSet::new();
         for table in &options.tables {
-            let (name, path) = table
-                .split_once('=')
-                .filter(|(name, _)| !name.is_empty())
-                .ok_or_else(|| plan_datafusion_err!("--table expects name=path"))?;
+            let (name, path) = table_binding(table, "--table")?;
             let source = Location::parse(path)?;
-            if source.0.scheme() == "s3"
-                && input_stores.insert(source.origin().to_owned())
-            {
-                source.register(&ctx)?;
-            }
+            source.register_input(&ctx, &mut input_stores)?;
             let path = source.input_path()?;
             ctx.register_parquet(name, path, ParquetReadOptions::default())
                 .await?;
         }
-        let sql_options = SQLOptions::new()
-            .with_allow_ddl(false)
-            .with_allow_dml(false)
-            .with_allow_statements(false);
+        for (flag, tables) in [
+            ("--stage-table", &options.stage_tables),
+            ("--stage-dlq-table", &options.stage_dlq_tables),
+        ] {
+            for table in tables {
+                let (name, path) = table_binding(table, flag)?;
+                let source = Location::parse(path)?;
+                source.register_input(&ctx, &mut input_stores)?;
+                let stage = source.open_stage(&ctx).await?;
+                let provider = if flag == "--stage-dlq-table" {
+                    stage.dlq_table()
+                } else {
+                    stage.data_table()
+                };
+                ctx.register_table(name, provider)?;
+            }
+        }
         let plan = ctx
-            .sql_with_options(&options.sql, sql_options)
+            .sql_with_options(&options.sql, read_only_sql())
             .await?
             .create_physical_plan()
             .await?;
@@ -191,6 +200,33 @@ impl StageJob {
     }
 }
 
+fn table_binding<'a>(table: &'a str, flag: &str) -> Result<(&'a str, &'a str)> {
+    table
+        .split_once('=')
+        .filter(|(name, _)| !name.is_empty())
+        .ok_or_else(|| plan_datafusion_err!("{flag} expects name=path"))
+}
+
+pub(super) async fn query_stage(
+    root: &str,
+    sql: &str,
+) -> Result<datafusion::dataframe::DataFrame> {
+    let ctx = SessionContext::new();
+    let location = Location::parse(root)?;
+    location.register_input(&ctx, &mut BTreeSet::new())?;
+    let stage = location.open_stage(&ctx).await?;
+    ctx.register_table("data", stage.data_table())?;
+    ctx.register_table("dlq", stage.dlq_table())?;
+    ctx.sql_with_options(sql, read_only_sql()).await
+}
+
+fn read_only_sql() -> SQLOptions {
+    SQLOptions::new()
+        .with_allow_ddl(false)
+        .with_allow_dml(false)
+        .with_allow_statements(false)
+}
+
 #[derive(Clone)]
 struct Location(Url);
 
@@ -257,6 +293,26 @@ impl Location {
     fn register(&self, ctx: &SessionContext) -> Result<()> {
         ctx.register_object_store(&self.0, self.store()?);
         Ok(())
+    }
+
+    fn register_input(
+        &self,
+        ctx: &SessionContext,
+        input_stores: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if self.0.scheme() == "s3" && input_stores.insert(self.origin().to_owned()) {
+            self.register(ctx)?;
+        }
+        Ok(())
+    }
+
+    async fn open_stage(&self, ctx: &SessionContext) -> Result<StageOutputReader> {
+        StageOutputReader::open(
+            ctx,
+            ObjectStoreUrl::parse(self.origin())?,
+            &self.store_path()?,
+        )
+        .await
     }
 
     #[cfg(feature = "s3")]

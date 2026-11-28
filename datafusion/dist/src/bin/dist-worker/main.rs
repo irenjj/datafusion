@@ -10,10 +10,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use datafusion::arrow::json::writer::{LineDelimited, WriterBuilder};
 use datafusion::common::{Result, exec_datafusion_err, plan_datafusion_err, plan_err};
 use datafusion_dist::{
     AttemptArtifact, LeaseConfig, SinkOptions, SplitMetrics, SystemClock,
 };
+use futures::TryStreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 mod job;
@@ -22,10 +24,11 @@ mod local;
 use job::{PlanningOptions, StageJob};
 
 const USAGE: &str = "\
-dist-worker plan --sql SQL --table name=path [--table name=path ...] --out JOB [--row-key COLUMN] [--output-root PATH]
+dist-worker plan --sql SQL --out JOB [--table name=path] [--stage-table name=PATH] [--stage-dlq-table name=PATH] [--row-key COLUMN] [--output-root PATH]
 dist-worker run-split --job JOB --split-id N --attempt-id N [--output-root PATH]
 dist-worker commit-split --job JOB [--artifact FILE|-] [--output-root PATH]
 dist-worker finalize-stage --job JOB [--output-root PATH]
+dist-worker query-stage --output-root PATH --sql SQL
 dist-worker run-local --sql SQL --table name=path --output-root PATH [--row-key COLUMN] [--timeout-secs N] [--max-attempts N]";
 
 #[derive(Serialize, Deserialize)]
@@ -106,6 +109,24 @@ async fn run(command: &str, args: Result<Arguments>) -> Result<()> {
                 .finalize_stage(&job.splits)
                 .await?;
             write_json(io::stdout().lock(), &manifest)
+        }
+        "query-stage" => {
+            let root = args.required("--output-root")?;
+            let sql = args.required("--sql")?;
+            args.finish()?;
+            let mut stream = job::query_stage(&root, &sql)
+                .await?
+                .execute_stream()
+                .await?;
+            let mut writer = WriterBuilder::new()
+                .with_explicit_nulls(true)
+                .build::<_, LineDelimited>(io::stdout().lock());
+            while let Some(batch) = stream.try_next().await? {
+                writer.write(&batch)?;
+            }
+            writer.finish()?;
+            writer.into_inner().flush()?;
+            Ok(())
         }
         "run-local" => {
             let options = args.planning()?;
@@ -216,12 +237,20 @@ impl Arguments {
     }
 
     fn planning(&mut self) -> Result<PlanningOptions> {
+        let sql = self.required("--sql")?;
+        let tables = self.0.remove("--table").unwrap_or_default();
+        let stage_tables = self.0.remove("--stage-table").unwrap_or_default();
+        let stage_dlq_tables = self.0.remove("--stage-dlq-table").unwrap_or_default();
+        if tables.is_empty() && stage_tables.is_empty() && stage_dlq_tables.is_empty() {
+            return plan_err!(
+                "--table is required (or use --stage-table or --stage-dlq-table)"
+            );
+        }
         Ok(PlanningOptions {
-            sql: self.required("--sql")?,
-            tables: self
-                .0
-                .remove("--table")
-                .ok_or_else(|| plan_datafusion_err!("--table is required"))?,
+            sql,
+            tables,
+            stage_tables,
+            stage_dlq_tables,
             sink: SinkOptions {
                 row_key: self.flag("--row-key")?,
             },

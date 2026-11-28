@@ -107,6 +107,151 @@ fn run_local_and_resume_two_parquet_splits() -> Result<()> {
     Ok(())
 }
 
+fn query_stage(root: &Path, sql: &str) -> Result<Vec<Value>> {
+    let output = worker()
+        .args(["query-stage", "--output-root"])
+        .arg(root)
+        .args(["--sql", sql])
+        .output()?;
+    Ok(std::str::from_utf8(&successful(output))?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+#[test]
+fn query_stage_and_plan_next_stage_from_manifest_winners() -> Result<()> {
+    let dir = tempdir()?;
+    let input = dir.path().join("input");
+    input_files(&input)?;
+    let root = dir.path().join("upstream");
+    let output = worker()
+        .args(["run-local", "--sql", "SELECT id FROM t", "--table"])
+        .arg(format!("t={}", input.display()))
+        .arg("--output-root")
+        .arg(&root)
+        .output()?;
+    let manifest: Value = serde_json::from_slice(&successful(output))?;
+    let stage_dir = root
+        .join("stages")
+        .join(manifest["plan_fingerprint"].as_str().unwrap());
+    let first = stage_dir.join(manifest["splits"][0]["data_rel_path"].as_str().unwrap());
+    let stale = stage_dir.join("attempts/split-0000000000000000-attempt-0001");
+    fs::create_dir(&stale)?;
+    fs::copy(&first, stale.join("data.parquet"))?;
+    fs::copy(&first, stale.join("dlq.parquet"))?;
+
+    assert_eq!(
+        query_stage(&root, "SELECT COUNT(*) AS n FROM data")?,
+        [json!({"n": 2})]
+    );
+    assert_eq!(
+        query_stage(&stage_dir, "SELECT COUNT(*) AS n FROM dlq")?,
+        [json!({"n": 0})]
+    );
+    let forbidden = dir.path().join("forbidden.parquet");
+    let copy_attempt = worker()
+        .args(["query-stage", "--output-root"])
+        .arg(&root)
+        .args([
+            "--sql",
+            &format!("COPY (SELECT id FROM data) TO '{}'", forbidden.display()),
+        ])
+        .output()?;
+    assert!(!copy_attempt.status.success());
+    assert!(copy_attempt.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&copy_attempt.stderr).contains("DML not supported: COPY")
+    );
+    assert!(!forbidden.exists());
+
+    let job_path = dir.path().join("stage2-job.json");
+    let second_root = dir.path().join("downstream");
+    successful(
+        worker()
+            .args([
+                "plan",
+                "--sql",
+                "SELECT id * 10 AS id FROM prior",
+                "--stage-table",
+            ])
+            .arg(format!("prior={}", root.display()))
+            .arg("--out")
+            .arg(&job_path)
+            .arg("--output-root")
+            .arg(&second_root)
+            .output()?,
+    );
+    let job: Value = serde_json::from_slice(&fs::read(&job_path)?)?;
+    let pending = job["pending_splits"].as_array().unwrap();
+    assert_eq!(pending.len(), 2);
+    let receipt_path = dir.path().join("receipt.json");
+    for split in pending {
+        let result = worker()
+            .args(["run-split", "--job"])
+            .arg(&job_path)
+            .args([
+                "--split-id",
+                &split["split_id"].to_string(),
+                "--attempt-id",
+                &split["attempt_id"].to_string(),
+            ])
+            .output()?;
+        fs::write(&receipt_path, successful(result))?;
+        successful(
+            worker()
+                .args(["commit-split", "--job"])
+                .arg(&job_path)
+                .arg("--artifact")
+                .arg(&receipt_path)
+                .output()?,
+        );
+    }
+    successful(
+        worker()
+            .args(["finalize-stage", "--job"])
+            .arg(&job_path)
+            .output()?,
+    );
+    assert_eq!(
+        query_stage(&second_root, "SELECT id FROM data ORDER BY id")?,
+        [json!({"id": 70}), json!({"id": 110})]
+    );
+
+    let dlq_job = dir.path().join("dlq-job.json");
+    successful(
+        worker()
+            .args([
+                "plan",
+                "--sql",
+                "SELECT id FROM failures",
+                "--stage-dlq-table",
+            ])
+            .arg(format!("failures={}", stage_dir.display()))
+            .arg("--out")
+            .arg(&dlq_job)
+            .output()?,
+    );
+    let job: Value = serde_json::from_slice(&fs::read(dlq_job)?)?;
+    assert_eq!(job["splits"], json!([]));
+
+    #[cfg(unix)]
+    {
+        let outside = dir.path().join("outside.parquet");
+        fs::rename(&first, &outside)?;
+        std::os::unix::fs::symlink(&outside, &first)?;
+        let output = worker()
+            .args(["query-stage", "--output-root"])
+            .arg(&root)
+            .args(["--sql", "SELECT id FROM data"])
+            .output()?;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("without symlinks"));
+    }
+    Ok(())
+}
+
 #[test]
 fn stateless_worker_receipts_and_partial_resume() -> Result<()> {
     let counters = [
