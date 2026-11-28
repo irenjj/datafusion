@@ -9,15 +9,11 @@ use datafusion::common::Result;
 use datafusion_proto::generated::datafusion_common::arrow_type::ArrowTypeEnum;
 use datafusion_proto::protobuf;
 use prost::{Message, encoding::bytes};
+use protobuf::physical_plan_node::PhysicalPlanType;
 use sha2::{Digest, Sha256};
 
 pub(crate) fn plan_fingerprint(plan: &[u8], schema: &Schema) -> Result<String> {
-    let schema = protobuf::Schema::try_from(schema)?;
-    let wire_schema = OrderedSchema {
-        columns: schema.columns.into_iter().map(encode_field).collect(),
-        metadata: schema.metadata.into_iter().collect(),
-    }
-    .encode_to_vec();
+    let wire_schema = encode_schema(protobuf::Schema::try_from(schema)?);
     let mut hash = Sha256::new();
     hash.update(b"df.dist.plan.v1\0");
     hash.update((plan.len() as u64).to_le_bytes());
@@ -25,6 +21,63 @@ pub(crate) fn plan_fingerprint(plan: &[u8], schema: &Schema) -> Result<String> {
     hash.update((wire_schema.len() as u64).to_le_bytes());
     hash.update(wire_schema);
     Ok(hex::encode(hash.finalize()))
+}
+
+// Plan fingerprints include the wire bytes. Preserve protobuf field tags while
+// ordering the schema metadata maps in Parquet scans and projections.
+pub(crate) fn encode_plan(plan: protobuf::PhysicalPlanNode) -> Vec<u8> {
+    let mut node = Vec::new();
+    let tag = match plan.physical_plan_type {
+        Some(PhysicalPlanType::ParquetScan(mut scan)) => {
+            if let Some(mut conf) = scan.base_conf.take() {
+                let mut base = Vec::new();
+                if let Some(schema) = conf.schema.take() {
+                    bytes::encode(2, &encode_schema(schema), &mut base);
+                }
+                conf.encode_raw(&mut base);
+                bytes::encode(1, &base, &mut node);
+            }
+            scan.encode_raw(&mut node);
+            1
+        }
+        Some(PhysicalPlanType::Projection(mut projection)) => {
+            encode_input(projection.input.take(), &mut node);
+            let schema = projection.schema.take();
+            projection.encode_raw(&mut node);
+            if let Some(schema) = schema {
+                bytes::encode(4, &encode_schema(schema), &mut node);
+            }
+            4
+        }
+        Some(PhysicalPlanType::CoalesceBatches(mut coalesce)) => {
+            encode_input(coalesce.input.take(), &mut node);
+            coalesce.encode_raw(&mut node);
+            11
+        }
+        Some(PhysicalPlanType::Filter(mut filter)) => {
+            encode_input(filter.input.take(), &mut node);
+            filter.encode_raw(&mut node);
+            12
+        }
+        Some(PhysicalPlanType::Extension(mut extension)) => {
+            let inputs = std::mem::take(&mut extension.inputs);
+            extension.encode_raw(&mut node);
+            for input in inputs {
+                bytes::encode(2, &encode_plan(input), &mut node);
+            }
+            18
+        }
+        _ => return plan.encode_to_vec(),
+    };
+    let mut buf = Vec::new();
+    bytes::encode(tag, &node, &mut buf);
+    buf
+}
+
+fn encode_input(input: Option<Box<protobuf::PhysicalPlanNode>>, buf: &mut Vec<u8>) {
+    if let Some(input) = input {
+        bytes::encode(1, &encode_plan(*input), buf);
+    }
 }
 
 pub(crate) fn split_fingerprint(plan_fingerprint: &str, file: &[u8]) -> String {
@@ -58,6 +111,14 @@ struct OrderedField {
     children: Vec<Vec<u8>>,
     #[prost(btree_map = "string, string", tag = "5")]
     metadata: BTreeMap<String, String>,
+}
+
+fn encode_schema(schema: protobuf::Schema) -> Vec<u8> {
+    OrderedSchema {
+        columns: schema.columns.into_iter().map(encode_field).collect(),
+        metadata: schema.metadata.into_iter().collect(),
+    }
+    .encode_to_vec()
 }
 
 fn encode_field(field: protobuf::Field) -> Vec<u8> {
