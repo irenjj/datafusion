@@ -8,6 +8,7 @@
 mod ai;
 mod codec;
 mod fingerprint;
+mod manifest_table;
 mod plan;
 mod runner;
 mod scheduler;
@@ -19,6 +20,7 @@ pub use codec::{
     DistExtensionRegistry, DistPhysicalCodec, ExtensionOperatorPolicy,
     NamedPhysicalExtensionCodec,
 };
+pub use manifest_table::StageOutputReader;
 pub use plan::{
     DistCodecs, FileExtensionCodec, FileExtensionCodecRegistry, PreparedStage,
     ProviderUsage, Split, SplitMetrics, SplitOutput, StagePlan, bind_split_to_plan,

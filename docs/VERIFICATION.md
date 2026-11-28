@@ -21,7 +21,7 @@ tests() { cargo nextest run --locked --cargo-profile ci -p "$@"; }
 | core-ai-http    | `cargo nextest run --locked --cargo-profile ci -p datafusion --features ai-http --test llm` covers embedding and vision through SQL and generated Parquet.                                                                                                 | [Replay loopback TLS with a custom CA](#ai-custom-ca-loopback).                                                                                                                                 |
 | lake-storage    | `lint datafusion-lake` and `tests datafusion-lake`. Covers pinned Lance and Paimon scans, split replay, scalar pushdown, descriptor-only media projection and bounded resolution.                                                                          | Replay `cargo nextest run --locked --cargo-profile ci -p datafusion-lake --test readonly_scan --test split_contract` using generated local fixtures.                                            |
 | dist-checkpoint | `lint datafusion-dist --features ai` and `tests datafusion-dist --features ai`. The first durable writer wins. Covers immutable artifacts, `df.ai_error` routing and restart from partial checkpoints.                                                     | Run `tests datafusion-dist --all-features` for the combined feature build.                                                                                                                      |
-| dist-worker     | `lint datafusion-dist`, `tests datafusion-dist` and `python3 -m unittest discover -s datafusion/dist/python -v`. Covers local execution, stateless subcommands and Ray scheduling through an injected executor.                                            | [Run the Parquet worker protocol](#distributed-parquet-worker).                                                                                                                                 |
+| dist-worker     | `lint datafusion-dist`, `tests datafusion-dist` and `python3 -m unittest discover -s datafusion/dist/python -v`. Covers stateless execution, manifest reads, stage chaining, Ray scheduling and the offline SDK.                                           | [Run the Parquet worker protocol](#distributed-parquet-worker).                                                                                                                                 |
 | lake-retrieval  | `lint datafusion-lake`, `tests datafusion-lake` and `bash datafusion/lake/tests/check-dependencies.sh`. Covers indexed retrieval, weighted fusion, late reads and dependency isolation.                                                                    | `cargo nextest run --locked --cargo-profile ci -p datafusion-lake -E 'test(search::)'` replays the retrieval contract with local fixtures.                                                      |
 | dist-plan       | `lint datafusion-dist` and `tests datafusion-dist` (target `dist`). Covers map-only admission, zero-input file scan extensions, versioned operator and file codecs, split fingerprints and metric isolation.                                               | `DIST_FUZZ_CASES=36 DIST_FUZZ_SEED=2026 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --test dist fuzz`. Use `DIST_FUZZ_REPLAY=dataset_seed,case_seed` for one failing case. |
 | dist-ai         | `lint datafusion-dist --features ai` and `tests datafusion-dist --features ai`. Covers `LlmExec` transport, worker provider registration, speculation policy and metrics across attempts.                                                                  | `cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai --test dist ai_codec`.                                                                                          |
@@ -125,6 +125,33 @@ For a shared worker binary, pass its local path or command name. With `--worker 
 
 `plan` writes the complete inventory and a `pending_splits` list of split and first-attempt IDs. Use the `pending_splits` list when resuming. The driver checks attempt IDs before publication. Each accepted receipt names immutable files and carries byte counts, row counts and hashes. The sink streams the full candidate files to verify their hashes during commit and also reads an existing winner before accepting it. It validates the marker identity and file presence during resume and finalization. `COMMITTED.json` selects the first durable winner per split. Later attempts accept that winner after verification, even if their output differs. `STAGE_MANIFEST.json` lists those winners in split ID order. Read the Parquet files named by the manifest.
 
+Use `--stage-table name=PATH` or `--stage-dlq-table name=PATH` in `plan` to bind an upstream stage. The job keeps the existing map-only plan requirements. `query-stage` registers the two relations as `data` and `dlq` and streams one JSON object per row to stdout. Use a job output root with one finalized stage or its explicit `stages/<plan_fingerprint>/` directory. A job root with multiple finalized stages requires an explicit stage directory.
+
+```bash
+dist-worker query-stage --output-root /shared/out --sql 'SELECT count(*) AS rows FROM data'
+dist-worker query-stage --output-root /shared/out --sql 'SELECT count(*) AS rows FROM dlq'
+dist-worker plan --sql 'SELECT id + 1 AS id FROM upstream' \
+  --stage-table upstream=/shared/out --out downstream.json --output-root /shared/downstream
+```
+
+Rust callers can register the providers returned by `StageOutputReader::data_table()` and `StageOutputReader::dlq_table()` in the session used to open the reader. The manifest paths must match the winning attempt names and the readers check every winning file's presence and every data file's byte count. The Parquet footers provide the schema, including for zero-row data files. When the manifest names zero DLQ files, `dlq` uses the data schema and returns zero rows. `COUNT(*)` works for either DLQ schema. A manifest with zero splits has no data footer and the Rust reader returns a schema inference error. SQL filters run above the provider scan. The scan supports projection and limit. Keep the published files immutable for the duration of the query.
+
+Add `datafusion/dist/python` to `PYTHONPATH` to use the SDK. `run_stage()` launches the Ray driver with the current Python interpreter and worker environment. It returns the metrics and winner paths from finalization. `StageResult.load()` accepts the same root as `query-stage`, and `StageResult.from_manifest()` accepts a specific manifest file or S3 object. Install `boto3` to load an S3 manifest. The result exposes only the selected paths, with absolute local paths or S3 URIs in split ID order. Storage engines open those paths directly.
+
+```python
+from stage_sdk import StageResult, run_stage
+
+result = run_stage(
+    sql="SELECT id FROM input",
+    tables={"input": "/shared/input"},
+    output_root="/shared/out",
+    worker="dist-worker",
+    ray_address="auto",
+)
+assert StageResult.load("/shared/out").data_uris() == result.data_uris()
+print(result.output_rows, result.dlq_uris())
+```
+
 Worker receipts carry `input_tokens`, `output_tokens`, `llm_requests` and `llm_retries` under `metrics`. Token counts use the usage reported by the provider for successful responses. A response without usage contributes zero tokens. Requests count backend attempts, including retries. The manifest keeps the counters under each winning split's `metrics` and sums them at the top level. Older receipts and checkpoints default missing usage counters to zero.
 
 `llm_usage_by_provider` records `input_tokens`, `output_tokens` and `requests` by resolved provider name in split metrics and in the stage manifest. The stage map merges winning splits. Older checkpoints without the map still contribute their aggregate counters. In a stage resumed from those checkpoints, provider totals cover the splits that recorded provider attribution. Provider names use ASCII letters, digits, underscores, periods or hyphens.
@@ -133,6 +160,7 @@ Worker receipts carry `input_tokens`, `output_tokens`, `llm_requests` and `llm_r
 
 ```bash
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --bin dist-worker
+cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai -E 'test(manifest_table::) + test(query_stage_and_plan_next_stage)'
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai --test worker multimodal_parquet_outputs
 cargo nextest run --locked --cargo-profile ci -p datafusion-dist --features ai-http --test worker openai_ca_cert
 cargo tree --locked -p datafusion-dist --features ai
