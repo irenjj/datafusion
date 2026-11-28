@@ -388,6 +388,7 @@ mod ai {
     use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::TaskContext;
+    use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_plan::{
         DisplayAs, DisplayFormatType, PlanProperties, SendableRecordBatchStream, collect,
@@ -396,6 +397,7 @@ mod ai {
     use datafusion_ai::{AiErrorType, CheckpointOutputColumn, CheckpointableTarget};
 
     use super::*;
+    use crate::{DlqReplay, StageOutputReader};
 
     #[derive(Debug)]
     struct EnvelopeExec {
@@ -676,6 +678,123 @@ mod ai {
                 .is_err()
         );
         fixture.sink.commit_split(&split, artifact).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_ambiguous_multicell_dlq_without_root_row_count() -> Result<()>
+    {
+        let batch = example_batch(vec![Some(99), Some(10), Some(2)], true)?;
+        let fixture = Fixture::new(
+            batch.schema(),
+            &SinkOptions {
+                row_key: Some("id".into()),
+            },
+        )?;
+        let split = fixture.split(0, 0);
+        let artifact = fixture.sink.write_attempt(&split, &[batch]).await?;
+        fixture.sink.commit_split(&split, artifact).await?;
+        fixture.sink.finalize_stage(&[split]).await?;
+        let ctx = SessionContext::new();
+        let url = ObjectStoreUrl::parse("s3://base")?;
+        ctx.register_object_store(url.as_ref(), Arc::clone(&fixture.store));
+        let base =
+            StageOutputReader::open(&ctx, url.clone(), &Path::from("output")).await?;
+        let result =
+            DlqReplay::open(&ctx, base, url, Path::from("merged"), "id", b"replay").await;
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("requires a split row count")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_race_keeps_one_valid_inventory_and_its_incremental_usage()
+    -> Result<()> {
+        let ctx = SessionContext::new();
+        let keys = vec![Some(99), Some(10), Some(2)];
+        let base_batch = example_batch(keys.clone(), true)?;
+        let retry_batch = example_batch(keys, false)?.slice(1, 2);
+        let root = Path::from("output");
+        let open = async |bucket: &str, batch: &RecordBatch, tokens| -> Result<_> {
+            let fixture = Fixture::new(
+                batch.schema(),
+                &SinkOptions {
+                    row_key: Some("id".into()),
+                },
+            )?;
+            let split = fixture.split(0, 0);
+            let artifact = fixture
+                .sink
+                .write_attempt(&split, std::slice::from_ref(batch))
+                .await?;
+            fixture
+                .sink
+                .commit_split_with_metrics(
+                    &split,
+                    artifact,
+                    SplitMetrics {
+                        output_rows: batch.num_rows(),
+                        input_tokens: tokens,
+                        output_tokens: tokens + 1,
+                        llm_requests: 1,
+                        llm_usage_by_provider: BTreeMap::from([(
+                            "mock".into(),
+                            ProviderUsage {
+                                input_tokens: tokens,
+                                output_tokens: tokens + 1,
+                                requests: 1,
+                            },
+                        )]),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            fixture.sink.finalize_stage(&[split]).await?;
+            let url = ObjectStoreUrl::parse(format!("s3://{bucket}"))?;
+            ctx.register_object_store(url.as_ref(), Arc::clone(&fixture.store));
+            let stage = StageOutputReader::open(&ctx, url.clone(), &root).await?;
+            Ok((fixture, url, stage))
+        };
+        let (_base, base_url, base) = open("base", &base_batch, 900).await?;
+        let (_alpha, _, alpha) = open("alpha", &retry_batch, 11).await?;
+        let (_beta, _, beta) = open("beta", &retry_batch, 23).await?;
+        let replay =
+            DlqReplay::open(&ctx, base, base_url, Path::from("merged"), "id", b"replay")
+                .await?;
+        let (first, second) =
+            tokio::join!(replay.reserve_attempt(), replay.reserve_attempt());
+        let (first, second) = (first?, second?);
+        assert_ne!(first, second);
+        let (left, right) = tokio::join!(
+            replay.merge(&ctx, first, Some(alpha)),
+            replay.merge(&ctx, second, Some(beta)),
+        );
+        let winner = left?;
+        assert_eq!(winner.manifest, right?.manifest);
+        let tokens = winner.manifest.input_tokens;
+        assert!([11, 23].contains(&tokens));
+        assert_eq!(winner.manifest.output_tokens, tokens + 1);
+        assert_eq!(winner.manifest.llm_requests, 1);
+        assert_eq!(
+            winner.manifest.llm_usage_by_provider["mock"].input_tokens,
+            tokens
+        );
+        assert_eq!(
+            (
+                winner.prev_data_rows,
+                winner.new_data_rows,
+                winner.remaining_dlq_rows
+            ),
+            (1, 2, 0)
+        );
+        assert!(winner.manifest.splits.iter().all(|split| {
+            split.winning_attempt_id == if tokens == 11 { first } else { second }
+        }));
         Ok(())
     }
 }

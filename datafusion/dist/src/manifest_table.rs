@@ -62,6 +62,10 @@ mod tests;
 pub struct StageOutputReader {
     data: Arc<dyn TableProvider>,
     dlq: Arc<dyn TableProvider>,
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) store_url: ObjectStoreUrl,
+    pub(crate) stage_root: Path,
+    pub(crate) manifest: StageManifest,
 }
 
 impl StageOutputReader {
@@ -137,7 +141,11 @@ impl StageOutputReader {
         };
         Ok(Self {
             data: Arc::new(WinnerTable::new(store_url.clone(), data_schema, data)),
-            dlq: Arc::new(WinnerTable::new(store_url, dlq_schema, dlq)),
+            dlq: Arc::new(WinnerTable::new(store_url.clone(), dlq_schema, dlq)),
+            store,
+            store_url,
+            stage_root,
+            manifest,
         })
     }
 
@@ -264,7 +272,10 @@ pub(crate) async fn check_local_file(path: &FsPath) -> Result<()> {
     Ok(())
 }
 
-fn validate_manifest(manifest: &StageManifest, stage_root: &Path) -> Result<()> {
+pub(crate) fn validate_manifest(
+    manifest: &StageManifest,
+    stage_root: &Path,
+) -> Result<()> {
     if manifest.schema != MANIFEST_SCHEMA {
         return exec_err!("Unsupported stage manifest schema");
     }

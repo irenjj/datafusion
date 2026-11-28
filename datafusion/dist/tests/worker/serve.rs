@@ -165,6 +165,21 @@ fn serve_commits_two_splits_from_one_loaded_job() -> Result<()> {
     ids.sort_unstable();
     assert_eq!(ids, [8, 12]);
     runner.finish(true)?;
+    let replay_root = dir.path().join("merged");
+    let replay = coordinator.success(&json!({
+        "command": "replay_dlq",
+        "options": {
+            "base_output_root": root, "output_root": replay_root,
+            "sql": "SELECT id FROM absent", "row_key": "id"
+        }
+    }))?;
+    assert_eq!(replay["prev_data_rows"], 2);
+    assert_eq!(replay["llm_requests"], 0);
+    assert_eq!(
+        coordinator.success(&ping)?["protocol"],
+        "df-worker-serve-v1"
+    );
+    assert!(replay_root.join("STAGE_MANIFEST.json").is_file());
     coordinator.success(&json!({"command":"shutdown"}))?;
     coordinator.finish(false)
 }

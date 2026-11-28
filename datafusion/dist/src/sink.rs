@@ -35,8 +35,9 @@ use routing::Routing;
 pub(crate) const CHECKPOINT_SCHEMA: &str = "df-checkpoint-v1";
 pub(crate) const MANIFEST_SCHEMA: &str = "df-stage-manifest-v1";
 pub(crate) const MANIFEST_FILE: &str = "STAGE_MANIFEST.json";
-const DATA_FILE: &str = "data.parquet";
-const DLQ_FILE: &str = "dlq.parquet";
+pub(crate) const DATA_FILE: &str = "data.parquet";
+pub(crate) const DLQ_FILE: &str = "dlq.parquet";
+pub(crate) const DLQ_HASH_METADATA: &str = "df.dist.dlq_sha256";
 
 /// Options for routing a stage's output to Parquet.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -80,9 +81,9 @@ pub(crate) struct ArtifactFiles {
     pub(crate) data_bytes: u64,
     pub(crate) output_rows: u64,
     pub(crate) dlq_rel_path: Option<String>,
-    dlq_sha256: Option<String>,
+    pub(crate) dlq_sha256: Option<String>,
     pub(crate) dlq_rows: u64,
-    dlq_by_code: BTreeMap<String, u64>,
+    pub(crate) dlq_by_code: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -97,7 +98,7 @@ pub(crate) struct SplitCheckpoint {
     #[serde(flatten)]
     pub(crate) files: ArtifactFiles,
     #[serde(default)]
-    metrics: SplitMetrics,
+    pub(crate) metrics: SplitMetrics,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -319,7 +320,7 @@ impl ParquetSplitSink {
         self.validate_checkpoint(split, &candidate)?;
         self.verify_contents(&candidate.files).await?;
         let path = self.checkpoint_path(split);
-        if self.create(&path, json_bytes(&candidate)?).await? {
+        if put_create(self.store.as_ref(), &path, json_bytes(&candidate)?).await? {
             return Ok(());
         }
 
@@ -367,7 +368,7 @@ impl ParquetSplitSink {
         validate_inventory(splits)?;
         let manifest = self.collect_manifest(splits).await?;
         let path = self.stage_root.clone().join(MANIFEST_FILE);
-        if !self.create(&path, json_bytes(&manifest)?).await?
+        if !put_create(self.store.as_ref(), &path, json_bytes(&manifest)?).await?
             && self.read_json::<StageManifest>(&path).await?.as_ref() != Some(&manifest)
         {
             return exec_err!("Conflicting manifest for stage {}", self.plan_fingerprint);
@@ -376,21 +377,9 @@ impl ParquetSplitSink {
     }
 
     async fn collect_manifest(&self, splits: &[Split]) -> Result<StageManifest> {
-        let mut manifest = StageManifest {
-            schema: MANIFEST_SCHEMA.into(),
-            plan_fingerprint: self.plan_fingerprint.clone(),
-            splits: Vec::with_capacity(splits.len()),
-            output_rows: 0,
-            dlq_rows: 0,
-            dlq_by_code: BTreeMap::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            llm_requests: 0,
-            llm_retries: 0,
-            llm_usage_by_provider: BTreeMap::new(),
-        };
         let mut sorted: Vec<_> = splits.iter().collect();
         sorted.sort_unstable_by_key(|split| split.split_id);
+        let mut checkpoints = Vec::with_capacity(sorted.len());
         for split in sorted {
             let checkpoint = self.read_checkpoint(split).await?.ok_or_else(|| {
                 exec_datafusion_err!("Split {} is not committed", split.split_id)
@@ -406,61 +395,9 @@ impl ParquetSplitSink {
                 },
                 None => checkpoint,
             };
-            add_rows(&mut manifest.output_rows, checkpoint.files.output_rows)?;
-            add_rows(&mut manifest.dlq_rows, checkpoint.files.dlq_rows)?;
-            for (code, rows) in &checkpoint.files.dlq_by_code {
-                add_rows(manifest.dlq_by_code.entry(code.clone()).or_default(), *rows)?;
-            }
-            for (name, total, value) in [
-                (
-                    "input_tokens",
-                    &mut manifest.input_tokens,
-                    checkpoint.metrics.input_tokens,
-                ),
-                (
-                    "output_tokens",
-                    &mut manifest.output_tokens,
-                    checkpoint.metrics.output_tokens,
-                ),
-                (
-                    "llm_requests",
-                    &mut manifest.llm_requests,
-                    checkpoint.metrics.llm_requests,
-                ),
-                (
-                    "llm_retries",
-                    &mut manifest.llm_retries,
-                    checkpoint.metrics.llm_retries,
-                ),
-            ] {
-                *total = total
-                    .checked_add(value)
-                    .ok_or_else(|| exec_datafusion_err!("Stage {name} count overflow"))?;
-            }
-            for (provider, usage) in &checkpoint.metrics.llm_usage_by_provider {
-                let total = manifest
-                    .llm_usage_by_provider
-                    .entry(provider.clone())
-                    .or_default();
-                for (name, total, value) in [
-                    ("input_tokens", &mut total.input_tokens, usage.input_tokens),
-                    (
-                        "output_tokens",
-                        &mut total.output_tokens,
-                        usage.output_tokens,
-                    ),
-                    ("requests", &mut total.requests, usage.requests),
-                ] {
-                    *total = total.checked_add(value).ok_or_else(|| {
-                        exec_datafusion_err!(
-                            "Stage provider '{provider}' {name} count overflow"
-                        )
-                    })?;
-                }
-            }
-            manifest.splits.push(checkpoint);
+            checkpoints.push(checkpoint);
         }
-        Ok(manifest)
+        StageManifest::from_checkpoints(&self.plan_fingerprint, checkpoints)
     }
 
     async fn advance_attempt_ids(&self, pending: &mut [Split]) -> Result<()> {
@@ -547,21 +484,9 @@ impl ParquetSplitSink {
         if self.store.head(&path).await?.size != files.data_bytes {
             return exec_err!("Checkpoint data size mismatch at {path}");
         }
-        self.verify_sha256(&path, &files.data_sha256).await?;
+        verify_sha256(self.store.as_ref(), &path, &files.data_sha256).await?;
         if let (Some(path), Some(sha256)) = (&files.dlq_rel_path, &files.dlq_sha256) {
-            self.verify_sha256(&self.stage_path(path), sha256).await?;
-        }
-        Ok(())
-    }
-
-    async fn verify_sha256(&self, path: &Path, expected: &str) -> Result<()> {
-        let mut content = self.store.get(path).await?.into_stream();
-        let mut sha256 = Sha256::new();
-        while let Some(bytes) = content.try_next().await? {
-            sha256.update(bytes);
-        }
-        if hex::encode(sha256.finalize()) != expected {
-            return exec_err!("Artifact checksum does not match at {path}");
+            verify_sha256(self.store.as_ref(), &self.stage_path(path), sha256).await?;
         }
         Ok(())
     }
@@ -572,32 +497,11 @@ impl ParquetSplitSink {
         bytes: Vec<u8>,
         sha256: &str,
     ) -> Result<()> {
-        if !self.create(path, bytes).await? {
-            self.verify_sha256(path, sha256).await?;
-        }
-        Ok(())
-    }
-
-    async fn create(&self, path: &Path, bytes: impl Into<PutPayload>) -> Result<bool> {
-        match self
-            .store
-            .put_opts(path, bytes.into(), PutMode::Create.into())
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(StoreError::AlreadyExists { .. }) => Ok(false),
-            Err(error) => Err(error.into()),
-        }
+        write_immutable(self.store.as_ref(), path, bytes, sha256).await
     }
 
     async fn read_json<T: DeserializeOwned>(&self, path: &Path) -> Result<Option<T>> {
-        match self.store.get(path).await {
-            Ok(result) => serde_json::from_slice(&result.bytes().await?)
-                .map(Some)
-                .map_err(|error| exec_datafusion_err!("Invalid JSON at {path}: {error}")),
-            Err(StoreError::NotFound { .. }) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        read_json(self.store.as_ref(), path).await
     }
 
     fn checkpoint_path(&self, split: &Split) -> Path {
@@ -610,6 +514,139 @@ impl ParquetSplitSink {
 
     fn stage_path(&self, relative_path: &str) -> Path {
         stage_path(&self.stage_root, relative_path)
+    }
+}
+
+impl StageManifest {
+    pub(crate) fn from_checkpoints(
+        plan_fingerprint: &str,
+        splits: Vec<SplitCheckpoint>,
+    ) -> Result<Self> {
+        let mut manifest = StageManifest {
+            schema: MANIFEST_SCHEMA.into(),
+            plan_fingerprint: plan_fingerprint.to_owned(),
+            splits: vec![],
+            output_rows: 0,
+            dlq_rows: 0,
+            dlq_by_code: BTreeMap::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            llm_requests: 0,
+            llm_retries: 0,
+            llm_usage_by_provider: BTreeMap::new(),
+        };
+        for checkpoint in &splits {
+            add_rows(&mut manifest.output_rows, checkpoint.files.output_rows)?;
+            add_rows(&mut manifest.dlq_rows, checkpoint.files.dlq_rows)?;
+            for (code, rows) in &checkpoint.files.dlq_by_code {
+                add_rows(manifest.dlq_by_code.entry(code.clone()).or_default(), *rows)?;
+            }
+            for (name, total, value) in [
+                (
+                    "input_tokens",
+                    &mut manifest.input_tokens,
+                    checkpoint.metrics.input_tokens,
+                ),
+                (
+                    "output_tokens",
+                    &mut manifest.output_tokens,
+                    checkpoint.metrics.output_tokens,
+                ),
+                (
+                    "llm_requests",
+                    &mut manifest.llm_requests,
+                    checkpoint.metrics.llm_requests,
+                ),
+                (
+                    "llm_retries",
+                    &mut manifest.llm_retries,
+                    checkpoint.metrics.llm_retries,
+                ),
+            ] {
+                *total = total
+                    .checked_add(value)
+                    .ok_or_else(|| exec_datafusion_err!("Stage {name} count overflow"))?;
+            }
+            for (provider, usage) in &checkpoint.metrics.llm_usage_by_provider {
+                let total = manifest
+                    .llm_usage_by_provider
+                    .entry(provider.clone())
+                    .or_default();
+                for (name, total, value) in [
+                    ("input_tokens", &mut total.input_tokens, usage.input_tokens),
+                    (
+                        "output_tokens",
+                        &mut total.output_tokens,
+                        usage.output_tokens,
+                    ),
+                    ("requests", &mut total.requests, usage.requests),
+                ] {
+                    *total = total.checked_add(value).ok_or_else(|| {
+                        exec_datafusion_err!(
+                            "Stage provider '{provider}' {name} count overflow"
+                        )
+                    })?;
+                }
+            }
+        }
+        manifest.splits = splits;
+        Ok(manifest)
+    }
+}
+
+pub(crate) async fn put_create(
+    store: &dyn ObjectStore,
+    path: &Path,
+    bytes: impl Into<PutPayload>,
+) -> Result<bool> {
+    match store
+        .put_opts(path, bytes.into(), PutMode::Create.into())
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(StoreError::AlreadyExists { .. }) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) async fn write_immutable(
+    store: &dyn ObjectStore,
+    path: &Path,
+    bytes: impl Into<PutPayload>,
+    sha256: &str,
+) -> Result<()> {
+    if !put_create(store, path, bytes).await? {
+        verify_sha256(store, path, sha256).await?;
+    }
+    Ok(())
+}
+
+async fn verify_sha256(
+    store: &dyn ObjectStore,
+    path: &Path,
+    expected: &str,
+) -> Result<()> {
+    let mut content = store.get(path).await?.into_stream();
+    let mut sha256 = Sha256::new();
+    while let Some(bytes) = content.try_next().await? {
+        sha256.update(bytes);
+    }
+    if hex::encode(sha256.finalize()) != expected {
+        return exec_err!("Artifact checksum does not match at {path}");
+    }
+    Ok(())
+}
+
+pub(crate) async fn read_json<T: DeserializeOwned>(
+    store: &dyn ObjectStore,
+    path: &Path,
+) -> Result<Option<T>> {
+    match store.get(path).await {
+        Ok(result) => serde_json::from_slice(&result.bytes().await?)
+            .map(Some)
+            .map_err(|error| exec_datafusion_err!("Invalid JSON at {path}: {error}")),
+        Err(StoreError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -668,7 +705,7 @@ fn attempt_dir(split_id: u64, attempt_id: u32) -> String {
     format!("split-{split_id:016x}-attempt-{attempt_id:04x}")
 }
 
-fn attempt_path(split_id: u64, attempt_id: u32, filename: &str) -> String {
+pub(crate) fn attempt_path(split_id: u64, attempt_id: u32, filename: &str) -> String {
     format!("attempts/{}/{filename}", attempt_dir(split_id, attempt_id))
 }
 
@@ -690,7 +727,7 @@ fn count_rows(batches: &[RecordBatch]) -> u64 {
     batches.iter().map(|batch| batch.num_rows() as u64).sum()
 }
 
-fn checksum(bytes: &[u8]) -> String {
+pub(crate) fn checksum(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -701,7 +738,7 @@ pub(crate) fn is_sha256(text: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>> {
+pub(crate) fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(json_error)
 }
 
@@ -709,7 +746,7 @@ fn json_error(error: serde_json::Error) -> DataFusionError {
     DataFusionError::External(Box::new(error))
 }
 
-fn encode_parquet(
+pub(crate) fn encode_parquet(
     schema: &SchemaRef,
     batches: &[RecordBatch],
     dlq_sha256: Option<&str>,
@@ -717,7 +754,7 @@ fn encode_parquet(
     let mut writer = ArrowWriter::try_new(Vec::new(), Arc::clone(schema), None)?;
     if let Some(sha256) = dlq_sha256 {
         writer.append_key_value_metadata(KeyValue::new(
-            "df.dist.dlq_sha256".into(),
+            DLQ_HASH_METADATA.into(),
             sha256.to_owned(),
         ));
     }

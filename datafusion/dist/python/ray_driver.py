@@ -266,7 +266,7 @@ class WorkerCli:
 
     def __init__(self, executable, sql, tables, job_path, output_root, row_key=None,
                  *, local_executable=None, payload=None, stage_tables=(),
-                 stage_dlq_tables=(), lance_tables=()):
+                 stage_dlq_tables=(), lance_tables=(), prepared=False):
         self.executable = executable
         self.local_executable = local_executable or executable
         self.sql = sql
@@ -278,17 +278,19 @@ class WorkerCli:
         self.output_root = output_root
         self.row_key = row_key
         self.payload = payload or {}
+        self._prepared = prepared
 
     def plan(self):
-        args = ["plan", "--sql", self.sql, "--out", str(self.job_path),
-                "--output-root", self.output_root]
-        for flag, tables in zip(_TABLE_FLAGS, (
-                self.tables, self.stage_tables, self.stage_dlq_tables, self.lance_tables)):
-            for table in tables:
-                args.extend((flag, table))
-        if self.row_key is not None:
-            args.extend(("--row-key", self.row_key))
-        _invoke(self.local_executable, args, payload=self.payload)
+        if not self._prepared:
+            args = ["plan", "--sql", self.sql, "--out", str(self.job_path),
+                    "--output-root", self.output_root]
+            for flag, tables in zip(_TABLE_FLAGS, (
+                    self.tables, self.stage_tables, self.stage_dlq_tables, self.lance_tables)):
+                for table in tables:
+                    args.extend((flag, table))
+            if self.row_key is not None:
+                args.extend(("--row-key", self.row_key))
+            _invoke(self.local_executable, args, payload=self.payload)
         return json.loads(self.job_path.read_bytes())
 
     def commit(self, receipt):
@@ -446,7 +448,7 @@ def _validate_scheduler(execution_mode, pool_size, max_global_inflight, splits_p
         raise ValueError("--max-splits-per-minute is too large")
 
 
-def _table_bindings(*groups):
+def _table_bindings(*groups, required=True):
     names = set()
     for flag, group in zip(_TABLE_FLAGS, groups):
         if group is None:
@@ -471,7 +473,7 @@ def _table_bindings(*groups):
                 raise ValueError(f"Duplicate table name in {flag}")
             names.add(name)
             yield flag, binding
-    if not names:
+    if required and not names:
         raise ValueError("Supply at least one --table, --stage-table, --stage-dlq-table or --lance-table")
 
 
@@ -515,6 +517,52 @@ def _inherited_payload():
     return {name: os.environ[name] for name in names if name in os.environ}
 
 
+def _replay_args(args):
+    options = ["--base-output-root", args.base_output_root, "--output-root", args.output_root,
+               "--sql", args.sql, "--row-key", args.row_key, "--batch-size", str(args.batch_size)]
+    for flag, tables in (("--table", args.table), ("--stage-table", args.stage_table)):
+        for table in tables:
+            options.extend((flag, table))
+    return options
+
+
+def _run_stage(stack, args, payload, limiter):
+    directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="dist-coordinator-"))
+    job_path = args.job or str(Path(directory) / "stage-job.json")
+    replay = _replay_args(args) if args.base_output_root is not None else None
+    worker = WorkerCli(args.worker, args.sql, args.table, job_path, args.output_root,
+                       args.row_key, payload=payload, prepared=replay is not None,
+                       stage_tables=args.stage_table, stage_dlq_tables=args.stage_dlq_table,
+                       lance_tables=args.lance_table)
+    if replay is not None:
+        worker.local_executable = _worker_executable(args.worker, directory, payload)
+        if args.execution_mode == "local":
+            return _invoke(worker.local_executable, ["replay-dlq", *replay,
+                                                     "--timeout-secs", str(args.timeout),
+                                                     "--max-attempts", str(args.max_attempts)],
+                           payload=payload)
+        prepared = _invoke(worker.local_executable, ["plan-replay-dlq", *replay, "--out", job_path],
+                           payload=payload)
+        if "result" in prepared:
+            return prepared["result"]
+        attempt_id = prepared["attempt_id"]
+    if args.execution_mode == "actor":
+        coordinator, executor, concurrency = _actor_job(stack, worker, args)
+    else:
+        coordinator, concurrency = worker, args.concurrency
+        executor = RayExecutor(worker, args.timeout, args.ray_address,
+                               confirm_stop=args.max_global_inflight is not None)
+    if replay is None:
+        worker.local_executable = _worker_executable(args.worker, directory, payload)
+    manifest = drive(coordinator, lambda: executor, timeout=args.timeout, concurrency=concurrency,
+                     max_attempts=args.max_attempts, rate_limiter=limiter)
+    if replay is not None:
+        return _invoke(worker.local_executable,
+                       ["finalize-replay-dlq", *replay, "--attempt-id", str(attempt_id)],
+                       payload=payload)
+    return manifest
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -523,8 +571,10 @@ def main():
     parser.add_argument("--sql", required=True)
     for flag in _TABLE_FLAGS:
         parser.add_argument(flag, action="append", default=[])
-    parser.add_argument("--job", required=True)
+    parser.add_argument("--job")
     parser.add_argument("--output-root", required=True)
+    parser.add_argument("--base-output-root", help="Replay the failed keys from this finalized stage")
+    parser.add_argument("--batch-size", type=int, default=8192, help="Maximum replay source rows per split")
     parser.add_argument("--row-key")
     parser.add_argument("--ray-address")
     source = parser.add_mutually_exclusive_group()
@@ -533,7 +583,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--max-attempts", type=int, default=3)
-    parser.add_argument("--execution-mode", choices=("actor", "task"), default="actor")
+    parser.add_argument("--execution-mode", choices=("local", "actor", "task"), default="actor")
     parser.add_argument("--pool-size", type=int, help="Maximum actor count (defaults to --concurrency)")
     parser.add_argument("--max-global-inflight", type=int, help="Maximum active split attempts per job")
     parser.add_argument("--max-splits-per-minute", "--splits-per-minute", type=int,
@@ -544,9 +594,20 @@ def main():
         try:
             _validate_ray_address(args.ray_address)
             _validate_dispatch(args.timeout, args.concurrency, args.max_attempts)
-            _validate_scheduler(args.execution_mode, args.pool_size, args.max_global_inflight,
-                                args.max_splits_per_minute)
-            list(_table_bindings(args.table, args.stage_table, args.stage_dlq_table, args.lance_table))
+            if args.base_output_root is None:
+                if not args.job:
+                    raise ValueError("--job is required when planning a stage")
+                list(_table_bindings(args.table, args.stage_table, args.stage_dlq_table, args.lance_table))
+                _validate_scheduler(args.execution_mode, args.pool_size, args.max_global_inflight,
+                                    args.max_splits_per_minute)
+            else:
+                if not args.row_key or args.batch_size < 1:
+                    raise ValueError("Replay requires --row-key and a positive --batch-size")
+                if args.stage_dlq_table or args.lance_table or len(args.table) + len(args.stage_table) > 1:
+                    raise ValueError("Replay accepts one --table or --stage-table source")
+                list(_table_bindings(args.table, args.stage_table, required=False))
+                if args.pool_size is not None:
+                    _positive_int(args.pool_size, "--pool-size")
             limiter = None
             if args.max_global_inflight is not None or args.max_splits_per_minute is not None:
                 from rate_limiter import GlobalRateLimiter
@@ -558,28 +619,10 @@ def main():
                 payload = _read_secrets_file(args.secrets_file)
             else:
                 payload = _inherited_payload()
-            worker = WorkerCli(args.worker, args.sql, args.table, args.job,
-                               args.output_root, args.row_key, payload=payload,
-                               stage_tables=args.stage_table, stage_dlq_tables=args.stage_dlq_table,
-                               lance_tables=args.lance_table)
-            directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="dist-coordinator-"))
-            if args.execution_mode == "actor":
-                coordinator, executor, concurrency = _actor_job(stack, worker, args)
-            else:
-                coordinator, concurrency = worker, args.concurrency
-                executor = RayExecutor(
-                    worker, args.timeout, args.ray_address,
-                    confirm_stop=args.max_global_inflight is not None,
-                )
-            worker.local_executable = _worker_executable(args.worker, directory, payload)
-            manifest = drive(
-                coordinator, lambda: executor,
-                timeout=args.timeout, concurrency=concurrency,
-                max_attempts=args.max_attempts, rate_limiter=limiter,
-            )
+            manifest = _run_stage(stack, args, payload, limiter)
         except ValueError as error:
             parser.error(_redact(str(error), {**_inherited_payload(), **payload}))
-        except (OSError, RuntimeError) as error:
+        except (OSError, RuntimeError, ImportError) as error:
             parser.exit(1, f"{_redact(str(error), {**_inherited_payload(), **payload})}\n")
     print(json.dumps(manifest))
 

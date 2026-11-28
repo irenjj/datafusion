@@ -229,6 +229,48 @@ async fn lake_worker_backfills_only_winners_without_rewriting_data_or_blobs() ->
 }
 
 #[tokio::test]
+async fn lake_replay_output_cannot_be_used_for_backfill() -> Result<()> {
+    let dir = tempdir()?;
+    let dataset = dir.path().join("source.lance");
+    fixture(&dataset, &dir.path().join("external.blob")).await?;
+    let base = dir.path().join("base");
+    let replayed = dir.path().join("replayed");
+    let sql = "SELECT id, id * 7 AS score FROM source";
+    let manifest = run_local(&dataset, &base, sql, &["--row-key", "id"])?;
+    let splits = manifest["splits"].as_array().unwrap();
+    assert_eq!(splits.len(), 2);
+    assert!(
+        splits
+            .iter()
+            .all(|split| split.get("lake_source").is_some())
+    );
+
+    let output = worker()
+        .args(["replay-dlq", "--base-output-root"])
+        .arg(&base)
+        .arg("--output-root")
+        .arg(&replayed)
+        .args(["--sql", sql, "--row-key", "id"])
+        .output()?;
+    let summary: Value = serde_json::from_slice(&successful(output))?;
+    let splits = summary["splits"].as_array().unwrap();
+    assert_eq!(splits.len(), 2);
+    assert!(
+        splits
+            .iter()
+            .all(|split| split.get("lake_source").is_none())
+    );
+    assert_eq!(summary["output_rows"], IDS.len());
+    let select = "SELECT id, score FROM data ORDER BY id";
+    assert_eq!(query_stage(&replayed, select)?, query_stage(&base, select)?);
+    assert_failure(
+        &backfill(&dataset, &replayed)?,
+        "requires Lake split provenance",
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn lake_backfill_validates_coverage_and_keeps_only_new_columns() -> Result<()> {
     let dir = tempdir()?;
     let dataset = dir.path().join("source.lance");

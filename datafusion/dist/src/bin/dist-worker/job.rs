@@ -9,12 +9,15 @@ use std::path::absolute;
 use std::sync::Arc;
 
 use datafusion::common::{Result, plan_datafusion_err, plan_err};
+use datafusion::datasource::physical_plan::ParquetSource;
+use datafusion::datasource::source::DataSourceExec;
 #[cfg(any(feature = "ai", feature = "lake"))]
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SQLOptions;
 use datafusion::execution::object_store::ObjectStoreUrl;
 #[cfg(any(feature = "ai", feature = "lake"))]
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 #[cfg(feature = "ai")]
 use datafusion_ai::ObjectStoreMediaResolver;
@@ -88,6 +91,14 @@ impl From<&Split> for PendingSplit {
 
 impl StageJob {
     pub(super) async fn plan(options: PlanningOptions) -> Result<Self> {
+        Self::plan_with_stores(options, BTreeSet::new(), None).await
+    }
+
+    pub(super) async fn plan_with_stores(
+        options: PlanningOptions,
+        mut input_stores: BTreeSet<String>,
+        replay_input: Option<&Location>,
+    ) -> Result<Self> {
         let output_root = options
             .output_root
             .as_deref()
@@ -98,7 +109,9 @@ impl StageJob {
         #[cfg(not(feature = "lake"))]
         let lake = false;
         let ctx = session(lake)?;
-        let mut input_stores = BTreeSet::new();
+        for origin in &input_stores {
+            Location::parse(origin)?.register(&ctx)?;
+        }
         for table in &options.tables {
             let (name, path) = table_binding(table, "--table")?;
             let source = Location::parse(path)?;
@@ -141,6 +154,9 @@ impl StageJob {
             .await?
             .create_physical_plan()
             .await?;
+        if let Some(input) = replay_input {
+            input.validate_replay_scan(plan.as_ref())?;
+        }
         options.sink.validate_plan(plan.as_ref())?;
         let (stage, mut splits) =
             split_plan_for_distribution_with_codecs(plan, 0, &codecs()?)?;
@@ -254,7 +270,10 @@ impl StageJob {
     }
 }
 
-fn table_binding<'a>(table: &'a str, flag: &str) -> Result<(&'a str, &'a str)> {
+pub(super) fn table_binding<'a>(
+    table: &'a str,
+    flag: &str,
+) -> Result<(&'a str, &'a str)> {
     table
         .split_once('=')
         .filter(|(name, path)| !name.trim().is_empty() && !path.trim().is_empty())
@@ -300,10 +319,10 @@ fn read_only_sql() -> SQLOptions {
 }
 
 #[derive(Clone)]
-struct Location(Url);
+pub(super) struct Location(Url);
 
 impl Location {
-    fn parse(value: &str) -> Result<Self> {
+    pub(super) fn parse(value: &str) -> Result<Self> {
         if value.is_empty() {
             return plan_err!("An object store path cannot be empty");
         }
@@ -344,7 +363,7 @@ impl Location {
         &self.0[..Position::BeforePath]
     }
 
-    fn input_path(&self) -> Result<String> {
+    pub(super) fn input_path(&self) -> Result<String> {
         if self.0.scheme() == "file" {
             let path = self
                 .0
@@ -358,7 +377,7 @@ impl Location {
         }
     }
 
-    fn store_path(&self) -> Result<StorePath> {
+    pub(super) fn store_path(&self) -> Result<StorePath> {
         Ok(StorePath::from_url_path(self.0.path())?)
     }
 
@@ -367,7 +386,7 @@ impl Location {
         Ok(())
     }
 
-    fn register_input(
+    pub(super) fn register_input(
         &self,
         ctx: &SessionContext,
         input_stores: &mut BTreeSet<String>,
@@ -378,13 +397,81 @@ impl Location {
         Ok(())
     }
 
-    async fn open_stage(&self, ctx: &SessionContext) -> Result<StageOutputReader> {
-        StageOutputReader::open(
-            ctx,
-            ObjectStoreUrl::parse(self.origin())?,
-            &self.store_path()?,
-        )
-        .await
+    pub(super) fn store_url(&self) -> Result<ObjectStoreUrl> {
+        ObjectStoreUrl::parse(self.origin())
+    }
+
+    pub(super) async fn open_stage(
+        &self,
+        ctx: &SessionContext,
+    ) -> Result<StageOutputReader> {
+        StageOutputReader::open(ctx, self.store_url()?, &self.store_path()?).await
+    }
+
+    pub(super) fn resolve_local(self) -> Result<Self> {
+        if self.0.scheme() != "file" {
+            return Ok(self);
+        }
+        let path = self.0.to_file_path().expect("validated file URL");
+        for parent in path.ancestors() {
+            match std::fs::symlink_metadata(parent) {
+                Ok(_) => {
+                    let resolved = parent
+                        .canonicalize()?
+                        .join(path.strip_prefix(parent).unwrap());
+                    let url = Url::from_file_path(resolved)
+                        .map_err(|()| plan_datafusion_err!("Invalid local file path"))?;
+                    return Ok(Self(url));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        plan_err!("Cannot resolve local file path")
+    }
+
+    pub(super) fn overlaps(&self, other: &Self) -> Result<bool> {
+        let lhs = self.store_path()?;
+        let rhs = other.store_path()?;
+        Ok(self.origin() == other.origin()
+            && (lhs.prefix_matches(&rhs) || rhs.prefix_matches(&lhs)))
+    }
+
+    pub(super) fn child_directory(&self, path: &StorePath) -> Result<Self> {
+        let root = self.store_path()?;
+        let parts = path.prefix_match(&root).ok_or_else(|| {
+            plan_datafusion_err!("Replay workspace is outside its output root")
+        })?;
+        let mut url = self.0.clone();
+        url.path_segments_mut()
+            .expect("validated hierarchical URL")
+            .pop_if_empty()
+            .extend(parts.map(|part| part.as_ref().to_owned()))
+            .push("");
+        Ok(Self(url))
+    }
+
+    fn validate_replay_scan(&self, mut plan: &dyn ExecutionPlan) -> Result<()> {
+        while let &[child] = plan.children().as_slice() {
+            plan = child.as_ref();
+        }
+        let Some((scan, _)) = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(DataSourceExec::downcast_to_file_source::<ParquetSource>)
+        else {
+            return plan_err!("Replay SQL must scan the filtered source table");
+        };
+        let prefix = self.store_path()?;
+        if scan.object_store_url != self.store_url()?
+            || scan
+                .file_groups
+                .iter()
+                .flat_map(|group| group.files())
+                .any(|file| !file.object_meta.location.prefix_matches(&prefix))
+        {
+            return plan_err!("Replay SQL must scan only the filtered source table");
+        }
+        Ok(())
     }
 
     #[cfg(feature = "s3")]

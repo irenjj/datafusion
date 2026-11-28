@@ -93,6 +93,47 @@ class DriverTests(unittest.TestCase):
             drive(FakeWorker([4, 4]), executor)
         executor.assert_not_called()
 
+    def test_replay_shortcut_finishes_before_ray_initialization(self):
+        argv = ["ray_driver.py", "--base-output-root", "base", "--output-root", "out",
+                "--row-key", "id", "--sql", "SELECT id FROM t", "--execution-mode", "actor"]
+        summary = {"output_rows": 8, "llm_requests": 0}
+        with (patch.object(sys, "argv", argv),
+              patch("ray_driver._invoke", return_value={"result": summary}) as invoke,
+              patch("ray_driver._actor_job") as actor_job,
+              redirect_stdout(StringIO()) as stdout):
+            main()
+        actor_job.assert_not_called()
+        self.assertEqual(invoke.call_args.args[1][0], "plan-replay-dlq")
+        self.assertEqual(json.loads(stdout.getvalue()), summary)
+
+    def test_replay_task_finalizes_prepared_retry_job_before_publishing(self):
+        argv = ["ray_driver.py", "--base-output-root", "base", "--output-root", "out",
+                "--row-key", "id", "--sql", "SELECT id FROM t", "--table", "t=source",
+                "--execution-mode", "task"]
+        calls = []
+        summary = {"new_data_rows": 1}
+
+        def invoke(_, args, **kwargs):
+            calls.append(args[0])
+            if args[0] == "plan-replay-dlq":
+                Path(args[args.index("--out") + 1]).write_text(json.dumps({
+                    "pending_splits": [{"split_id": 0, "attempt_id": 2}],
+                }))
+                return {"attempt_id": 7}
+            if args[0] == "commit-split":
+                self.assertEqual(kwargs["receipt"], {"artifact": {"split_id": 0, "attempt_id": 2}})
+            if args[0] == "finalize-replay-dlq":
+                self.assertEqual(args[-2:], ["--attempt-id", "7"])
+                return summary
+
+        executor = ScriptedExecutor([(0, [(0, 2)])])
+        with (patch.object(sys, "argv", argv), patch("ray_driver._invoke", side_effect=invoke),
+              patch("ray_driver.RayExecutor", return_value=executor),
+              redirect_stdout(StringIO()) as stdout):
+            main()
+        self.assertEqual(calls, ["plan-replay-dlq", "commit-split", "finalize-stage", "finalize-replay-dlq"])
+        self.assertEqual(json.loads(stdout.getvalue()), summary)
+
     def test_timeout_retries_and_discards_late_result(self):
         worker = FakeWorker([0, 1])
         executor = ScriptedExecutor([
