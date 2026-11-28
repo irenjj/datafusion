@@ -124,6 +124,45 @@ fn request(options: LlmOptions) -> LlmRequest {
 }
 
 #[tokio::test]
+async fn embeddings_send_dimensions_only_when_enabled() {
+    let legacy = json!({"model": "test-model", "input": ["prompt"]}).to_string();
+    for (options, dimensions) in [
+        (r#"{"dimension":2}"#, false),
+        (r#"{"dimension":2,"send_dimensions":false}"#, false),
+        (r#"{"dimension":2,"send_dimensions":true}"#, true),
+    ] {
+        let (listener, backend) = bind(None).await;
+        let request = request(serde_json::from_str(options).unwrap());
+        let serve = async {
+            let (capture, mut socket) = read_request(&listener).await;
+            assert_eq!(
+                capture.request_line,
+                "POST /provider/v1/embeddings HTTP/1.1"
+            );
+            if dimensions {
+                assert_eq!(
+                    capture.body,
+                    json!({"model": "test-model", "input": ["prompt"], "dimensions": 2})
+                );
+            } else {
+                assert_eq!(capture.raw_body, legacy.as_bytes());
+            }
+            let body = r#"{"data":[{"index":0,"embedding":[0.25,0.5]}]}"#;
+            socket
+                .write_all(reply("200 OK", "", body).as_bytes())
+                .await
+                .unwrap();
+        };
+        let (result, ()) = timeout(TEST_TIMEOUT, async {
+            tokio::join!(backend.embed(request, CancellationToken::new()), serve)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap().outputs, [vec![0.25, 0.5]]);
+    }
+}
+
+#[tokio::test]
 async fn embeddings_reorder_a_full_batch_and_reject_schema_mismatches() {
     let prompts: Vec<_> = (0..32).map(|index| format!("prompt {index}")).collect();
     let data: Vec<_> = (0..32)
@@ -403,31 +442,85 @@ async fn posts_normalized_response_schema() {
     .unwrap();
     let (result, capture) = exchange(options, Some(KEY), &success(), false).await;
     assert!(result.is_ok());
-    let mut expected = basic_body("prompt");
-    expected["response_format"] = json!({
-        "type":"json_schema",
-        "json_schema":{
-            "name":"df_response",
-            "strict":true,
-            "schema":{
-                "type":"object",
-                "additionalProperties":false,
-                "required":["records"],
-                "properties":{
-                    "records":{"type":["array","null"],"items":{
-                        "type":"object",
-                        "additionalProperties":false,
-                        "required":["score","token"],
-                        "properties":{
-                            "score":{"type":"number"},
-                            "token":{"type":["string","null"],"enum":["a","b",null]}
-                        }
-                    }}
+    let expected = json!({
+        "response_format": {
+            "type":"json_schema",
+            "json_schema":{
+                "name":"df_response",
+                "strict":true,
+                "schema":{
+                    "properties":{
+                        "records":{"items":{
+                            "properties":{
+                                "score":{"type":"number"},
+                                "token":{"enum":["a","b",null],"type":["string","null"]}
+                            },
+                            "required":["score","token"],
+                            "additionalProperties":false,
+                            "type":"object"
+                        },"type":["array","null"]}
+                    },
+                    "required":["records"],
+                    "additionalProperties":false,
+                    "type":"object"
                 }
             }
-        }
+        },
+        "messages": [{"role":"user","content":"prompt"}],
+        "model": "test-model",
+        "stream": false,
+        "n": 1
     });
     capture.assert_request(Some(KEY), &expected);
+    assert_eq!(capture.raw_body, expected.to_string().as_bytes());
+}
+
+#[tokio::test]
+async fn schema_fallback_modes_send_deterministic_system_messages() {
+    let schemas = [
+        r#"{"type":"object","required":["z","a"],"properties":{"z":{"type":"integer"},"a":{"type":"boolean"},"note":{"type":"string"}}}"#,
+        r#"{"properties":{"note":{"type":"string"},"a":{"type":"boolean"},"z":{"type":"integer"}},"required":["a","z"],"type":"object"}"#,
+    ];
+    let instructions = concat!(
+        "Return a single JSON object matching this JSON Schema:\n",
+        r#"{"additionalProperties":false,"properties":{"a":{"type":"boolean"},"note":{"type":["string","null"]},"z":{"type":"integer"}},"required":["a","z"],"type":"object"}"#,
+    );
+    for mode in ["json_object", "prompt_only"] {
+        for original in [None, Some(" Keep the original spacing.\n")] {
+            let system = match original {
+                Some(original) => format!("{original}\n\n{instructions}"),
+                None => instructions.to_owned(),
+            };
+            let mut bodies = Vec::new();
+            for schema in schemas {
+                let original = json!(original);
+                let options = serde_json::from_str(&format!(
+                    r#"{{"schema_mode":"{mode}","system_message":{original},"response_schema":{schema}}}"#
+                ))
+                .unwrap();
+                let (result, capture) =
+                    exchange(options, Some(KEY), &success(), false).await;
+                assert!(result.is_ok());
+                assert_eq!(
+                    capture.body["messages"],
+                    json!([
+                        {"role":"system","content":system},
+                        {"role":"user","content":"prompt"}
+                    ])
+                );
+                if mode == "json_object" {
+                    assert_eq!(
+                        capture.body["response_format"],
+                        json!({"type":"json_object"})
+                    );
+                } else {
+                    assert!(capture.body.get("response_format").is_none());
+                }
+                bodies.push(capture.raw_body);
+            }
+            assert_eq!(bodies[0], bodies[1]);
+        }
+    }
 }
 
 #[tokio::test]

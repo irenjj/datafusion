@@ -7,6 +7,7 @@
 mod backend;
 #[cfg(feature = "http")]
 mod http;
+mod image;
 mod logical;
 mod options;
 mod physical;
@@ -20,7 +21,7 @@ pub use backend::{
 #[cfg(feature = "http")]
 pub use http::{OpenAiHttpBackend, OpenAiHttpConfig};
 pub use logical::LlmNode;
-pub use options::{LlmOptions, OnError};
+pub use options::{ImageResizeFallback, LlmOptions, OnError, SchemaMode};
 pub use physical::{LlmExec, MediaPlan, plan_llm};
 
 use std::sync::Arc;

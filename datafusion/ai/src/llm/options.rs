@@ -39,6 +39,30 @@ pub enum OnError {
     Envelope,
 }
 
+/// Controls how the HTTP backend asks a provider to honor a response schema.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaMode {
+    /// Use the provider's strict JSON Schema response format.
+    #[default]
+    Strict,
+    /// Request a JSON object and include the schema in the system message.
+    JsonObject,
+    /// Include the schema in the system message alone.
+    PromptOnly,
+}
+
+/// Determines how vision handles recognized image formats it cannot resize.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageResizeFallback {
+    /// Send the original image bytes to the provider.
+    #[default]
+    Passthrough,
+    /// Report an error for the row using `on_error`.
+    Error,
+}
+
 /// SQL execution controls and provider generation options.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,12 +82,19 @@ pub struct LlmOptions {
     pub on_error: OnError,
     /// Output dimension required for `embed()`.
     pub dimension: Option<u32>,
+    /// Include the requested embedding dimension in the HTTP body. Defaults to false.
+    pub send_dimensions: Option<bool>,
     /// Maximum bytes to read per media reference. Defaults to 8 MiB.
     pub max_media_bytes: Option<u64>,
     /// Maximum images per vision row, between 1 and 64. Defaults to 16.
     pub max_media_items: Option<u32>,
     /// Maximum total image bytes per vision row. Defaults to 32 MiB and caps at 128 MiB.
     pub max_row_media_bytes: Option<u64>,
+    /// Maximum edge in pixels when downsampling PNGs for `vlm()`. Between 16 and 8192.
+    pub image_max_edge: Option<u32>,
+    /// Fallback for formats that cannot be resized. Requires `image_max_edge` when set.
+    #[serde(default)]
+    pub image_resize_fallback: ImageResizeFallback,
     /// Reuse identical calls in a SELECT for non-volatile prompts. Defaults to true.
     pub deduplicate: Option<bool>,
     /// Optional system message.
@@ -78,6 +109,12 @@ pub struct LlmOptions {
     pub stop: Option<Vec<String>>,
     /// A JSON Schema object for typed `llm()` and `vlm()` completion values.
     pub response_schema: Option<Value>,
+    /// Provider response format for structured output. Defaults to [`SchemaMode::Strict`].
+    #[serde(default)]
+    pub schema_mode: SchemaMode,
+    /// Additional requests per row whose completion fails schema validation (0 to 3).
+    /// Defaults to zero.
+    pub schema_retries: Option<u32>,
     /// Provider-specific body fields. Credential keys are forbidden at any depth.
     pub extra_body: Option<Map<String, Value>>,
 }
@@ -113,6 +150,7 @@ impl LlmOptions {
             Some(schema) => schema.canonical_options(value.as_object().unwrap()),
             None => value.to_string(),
         };
+        let has_image_resize_fallback = value.get("image_resize_fallback").is_some();
         let options: Self =
             serde_json::from_value(value).map_err(|error| invalid_options(&error))?;
         if options
@@ -159,6 +197,15 @@ impl LlmOptions {
             );
         }
         if options
+            .image_max_edge
+            .is_some_and(|edge| !(16..=8192).contains(&edge))
+        {
+            return invalid_value("image_max_edge", "between 16 and 8192");
+        }
+        if has_image_resize_fallback && options.image_max_edge.is_none() {
+            return plan_err!("image_resize_fallback requires image_max_edge");
+        }
+        if options
             .temperature
             .is_some_and(|t| !t.is_finite() || t < 0.0)
         {
@@ -173,6 +220,18 @@ impl LlmOptions {
             .is_some_and(|stop| stop.is_empty() || stop.iter().any(String::is_empty))
         {
             return invalid_value("stop", "a non-empty list of non-empty strings");
+        }
+        if options.schema_mode != SchemaMode::Strict && schema.is_none() {
+            return plan_err!(
+                "schema_mode requires response_schema for non-strict modes"
+            );
+        }
+        let schema_retries = options.schema_retries.unwrap_or_default();
+        if schema_retries > 3 {
+            return invalid_value("schema_retries", "between 0 and 3");
+        }
+        if schema_retries != 0 && schema.is_none() {
+            return plan_err!("nonzero schema_retries requires response_schema");
         }
         if schema.is_some()
             && options
@@ -215,6 +274,12 @@ impl LlmOptions {
         name: &str,
         schema: Option<&ResponseSchema>,
     ) -> Result<FieldRef> {
+        if kind != TaskKind::Embed && self.send_dimensions.is_some() {
+            return plan_err!("send_dimensions is only supported by embed()");
+        }
+        if self.image_max_edge.is_some() && kind != TaskKind::Vision {
+            return plan_err!("image_max_edge is only supported by vlm()");
+        }
         let data_type = match (kind, schema) {
             (TaskKind::Embed, Some(_)) => {
                 return plan_err!("embed() does not support response_schema");
@@ -352,6 +417,70 @@ impl<'de> Visitor<'de> for OptionsVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"count":{"type":"integer"}}}"#;
+
+    #[test]
+    fn schema_mode_requires_schema_except_for_strict() -> Result<()> {
+        assert_eq!(LlmOptions::parse("{}")?.0.schema_mode, SchemaMode::Strict);
+        assert!(LlmOptions::parse(r#"{"schema_mode":"strict"}"#).is_ok());
+        for (name, mode) in [
+            ("strict", SchemaMode::Strict),
+            ("json_object", SchemaMode::JsonObject),
+            ("prompt_only", SchemaMode::PromptOnly),
+        ] {
+            let options =
+                format!(r#"{{"schema_mode":"{name}","response_schema":{SCHEMA}}}"#);
+            assert_eq!(LlmOptions::parse(&options)?.0.schema_mode, mode);
+        }
+        for name in ["json_object", "prompt_only", "invalid"] {
+            let options = format!(r#"{{"schema_mode":"{name}"}}"#);
+            assert!(matches!(
+                LlmOptions::parse(&options),
+                Err(DataFusionError::Plan(_))
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schema_retries_are_bounded_and_require_schema_when_nonzero() -> Result<()> {
+        assert_eq!(LlmOptions::parse("{}")?.0.schema_retries, None);
+        assert!(LlmOptions::parse(r#"{"schema_retries":0}"#).is_ok());
+        for retries in [0, 3] {
+            let options =
+                format!(r#"{{"schema_retries":{retries},"response_schema":{SCHEMA}}}"#);
+            assert_eq!(LlmOptions::parse(&options)?.0.schema_retries, Some(retries));
+        }
+        for options in [
+            r#"{"schema_retries":1}"#.to_owned(),
+            format!(r#"{{"schema_retries":4,"response_schema":{SCHEMA}}}"#),
+        ] {
+            assert!(matches!(
+                LlmOptions::parse(&options),
+                Err(DataFusionError::Plan(message)) if message.contains("schema_retries")
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn send_dimensions_is_embed_only() -> Result<()> {
+        for value in [true, false] {
+            let json = format!(r#"{{"dimension":2,"send_dimensions":{value}}}"#);
+            let (options, canonical, _) = LlmOptions::parse(&json)?;
+            assert_eq!(options.send_dimensions, Some(value));
+            assert_eq!(canonical, json);
+            options.output_field(TaskKind::Embed, "answer", None)?;
+            for kind in [TaskKind::Chat, TaskKind::Vision] {
+                assert!(matches!(
+                    options.output_field(kind, "answer", None),
+                    Err(DataFusionError::Plan(message)) if message.contains("send_dimensions")
+                ));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn rejects_invalid_options() {

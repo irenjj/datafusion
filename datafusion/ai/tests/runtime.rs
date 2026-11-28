@@ -234,6 +234,26 @@ fn worker_decode_preserves_schema_order_and_canonical_bytes() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn worker_decode_round_trips_schema_retry_options() -> Result<()> {
+    let ctx = task_context(&LlmProviderRegistry::default());
+    let input = input(&[Some("prompt")])?;
+    for mode in ["strict", "json_object", "prompt_only"] {
+        let options = format!(
+            r#"{{"system_message":"Original\n message","schema_retries":2,"response_schema":{{"type":"object","properties":{{"z":{{"type":"integer"}},"a":{{"type":"boolean"}}}}}},"schema_mode":"{mode}"}}"#,
+        );
+        let expected = format!(
+            r#"{{"response_schema":{{"properties":{{"z":{{"type":"integer"}},"a":{{"type":"boolean"}}}},"type":"object"}},"schema_mode":"{mode}","schema_retries":2,"system_message":"Original\n message"}}"#,
+        );
+        let first = decode(Arc::clone(&input), &options, &ctx)?;
+        let second = decode(Arc::clone(&input), first.options_json(), &ctx)?;
+        assert_eq!(first.options_json(), expected);
+        assert_eq!(second.options_json().as_bytes(), expected.as_bytes());
+        assert_eq!(first.schema(), second.schema());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn decoded_operators_preserve_rows_and_own_independent_metrics() -> Result<()> {
     let registry = LlmProviderRegistry::default();
@@ -723,6 +743,146 @@ async fn vision_envelopes_keep_struct_references_and_failures_aligned() -> Resul
 }
 
 #[tokio::test]
+async fn vision_resize_isolates_mixed_formats_and_honors_fallback() -> Result<()> {
+    static PNG: &[u8] = include_bytes!("fixtures/vision.png");
+    static JPEG: &[u8] = include_bytes!("fixtures/vision.jpeg");
+
+    #[derive(Debug)]
+    struct Resolver;
+
+    #[async_trait]
+    impl MediaResolver for Resolver {
+        async fn resolve(
+            &self,
+            media: &MediaRef,
+            _: Option<u64>,
+        ) -> Result<ResolvedMedia> {
+            let (bytes, mime) = match media.uri.as_str() {
+                "memory://test/png" => (PNG, "application/octet-stream"),
+                "memory://test/jpeg" => (JPEG, "image/pjpeg"),
+                "memory://test/broken" => (&PNG[..32], "image/png"),
+                uri => panic!("unexpected input media {uri}"),
+            };
+            Ok(ResolvedMedia {
+                bytes: bytes::Bytes::from_static(bytes),
+                mime: Some(mime.into()),
+                etag: None,
+            })
+        }
+    }
+
+    for (options, strict) in [
+        (
+            r#"{"provider":"script","batch_size":3,"on_error":"envelope","image_max_edge":33}"#,
+            false,
+        ),
+        (
+            r#"{"provider":"script","batch_size":3,"on_error":"envelope","image_max_edge":16,"image_resize_fallback":"error"}"#,
+            true,
+        ),
+    ] {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "text",
+                Arc::new(StringArray::from(vec!["png", "jpeg", "broken"]))
+                    as arrow::array::ArrayRef,
+            ),
+            (
+                "media",
+                Arc::new(StringArray::from(vec![
+                    "memory://test/png",
+                    "memory://test/jpeg",
+                    "memory://test/broken",
+                ])),
+            ),
+        ])?;
+        let schema = batch.schema();
+        let input = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?;
+        let (registry, mut attempts) = script(1)?;
+        let ctx = Arc::new(
+            TaskContext::default().with_session_config(
+                SessionConfig::new()
+                    .with_extension(Arc::new(registry))
+                    .with_extension(Arc::new(
+                        Arc::new(Resolver) as Arc<dyn MediaResolver>
+                    )),
+            ),
+        );
+        let exec = LlmExec::try_new_task_from_task_context(
+            input,
+            Arc::new(Column::new("text", 0)),
+            Some(MediaPlan::new(Arc::new(Column::new("media", 1)))),
+            TaskKind::Vision,
+            "vision".into(),
+            options,
+            "answer".into(),
+            &ctx,
+        )?;
+        let collect = exec.execute(0, ctx)?.try_collect::<Vec<_>>();
+        let (batches, ()) = tokio::join!(collect, async {
+            let attempt = next_attempt(&mut attempts).await;
+            let png = &attempt.media[0].as_ref().unwrap()[0];
+            if strict {
+                assert_eq!(attempt.prompts, ["png"]);
+                assert_eq!(png.mime.as_deref(), Some("image/png"));
+                assert_eq!(&png.bytes[16..24], &[0, 0, 0, 16, 0, 0, 0, 8]);
+            } else {
+                assert_eq!(attempt.prompts, ["png", "jpeg"]);
+                assert_eq!(png.bytes.as_ptr(), PNG.as_ptr());
+                assert_eq!(png.mime.as_deref(), Some("application/octet-stream"));
+                let jpeg = &attempt.media[1].as_ref().unwrap()[0];
+                assert_eq!(jpeg.bytes.as_ptr(), JPEG.as_ptr());
+                assert_eq!(jpeg.mime.as_deref(), Some("image/pjpeg"));
+            }
+            attempt.succeed();
+        });
+        let batches = batches?;
+        let envelope = batches
+            .iter()
+            .find(|batch| batch.num_rows() == 3)
+            .unwrap()
+            .column(2)
+            .as_struct();
+        assert_eq!(
+            envelope
+                .column(0)
+                .as_string::<i32>()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some("answer:png"), (!strict).then_some("answer:jpeg"), None,]
+        );
+        assert_eq!(
+            envelope
+                .column(1)
+                .as_string::<i32>()
+                .iter()
+                .collect::<Vec<_>>(),
+            [
+                None,
+                strict.then_some("PERMANENT_HTTP"),
+                Some("PERMANENT_HTTP"),
+            ]
+        );
+        assert_eq!(
+            envelope.column(3).as_boolean().iter().collect::<Vec<_>>(),
+            [None, strict.then_some(false), Some(false),]
+        );
+        let messages = envelope.column(2).as_string::<i32>();
+        assert!(messages.value(2).contains("PNG IHDR"));
+        if strict {
+            assert!(messages.value(1).contains("unsupported for JPEG"));
+        }
+        for message in messages.iter().flatten() {
+            assert!(message.starts_with("media: "));
+            assert!(!message.contains(['\n', '\r']) && !message.contains("://"));
+        }
+        assert_eq!(submitted(&exec), if strict { 1 } else { 2 });
+        assert_no_attempt(&mut attempts);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn vision_list_errors_are_row_local_and_byte_budget_stops_reads() -> Result<()> {
     #[derive(Debug, Default)]
     struct Resolver(Mutex<Vec<(String, Option<u64>)>>);
@@ -907,6 +1067,18 @@ struct Attempt {
 }
 
 impl Attempt {
+    fn reply_with(self, outputs: &[Option<&str>], usage: Option<LlmUsage>) {
+        self.reply
+            .send(Ok(LlmResponse {
+                outputs: outputs
+                    .iter()
+                    .map(|output| output.map(str::to_owned))
+                    .collect(),
+                usage,
+            }))
+            .unwrap();
+    }
+
     fn succeed(self) {
         self.succeed_with_usage(None);
     }
@@ -1044,6 +1216,174 @@ async fn structured_batch_isolates_a_malformed_middle_row() -> Result<()> {
 }
 
 #[tokio::test]
+async fn schema_retries_isolate_rows_and_count_all_provider_usage() -> Result<()> {
+    let (registry, mut attempts) = script(1)?;
+    let ctx = task_context(&registry);
+    let exec = decode(
+        input(&[
+            Some("first"),
+            Some("recover"),
+            Some("third"),
+            Some("exhaust"),
+        ])?,
+        r#"{"provider":"script","batch_size":4,"on_error":"envelope",
+            "schema_mode":"json_object","schema_retries":2,
+            "response_schema":{"type":"object","properties":{
+                "count":{"type":"integer"}
+            },"required":["count"]}}"#,
+        &ctx,
+    )?;
+    let collect = exec.execute(0, ctx)?.try_collect::<Vec<_>>();
+    let (batches, ()) = tokio::join!(collect, async {
+        let initial = next_attempt(&mut attempts).await;
+        assert_eq!(initial.prompts, ["first", "recover", "third", "exhaust"]);
+        initial.reply_with(
+            &[
+                Some(r#"{"count":1}"#),
+                Some(r#"{"count":"2"}"#),
+                Some(r#"{"count":3}"#),
+                Some("{"),
+            ],
+            Some(LlmUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+            }),
+        );
+        let mut recovered = 0;
+        let mut exhausted = 0;
+        for _ in 0..3 {
+            let retry = next_attempt(&mut attempts).await;
+            assert_eq!(retry.prompts.len(), 1);
+            match retry.prompts[0].as_str() {
+                "recover" => {
+                    recovered += 1;
+                    retry.reply_with(
+                        &[Some("```json\n{\"count\":2}\n```")],
+                        Some(LlmUsage {
+                            input_tokens: 2,
+                            output_tokens: 3,
+                        }),
+                    );
+                }
+                "exhaust" => {
+                    exhausted += 1;
+                    let output = if exhausted == 1 {
+                        "{}"
+                    } else {
+                        r#"{"count":false}"#
+                    };
+                    retry.reply_with(
+                        &[Some(output)],
+                        Some(LlmUsage {
+                            input_tokens: 1,
+                            output_tokens: 2,
+                        }),
+                    );
+                }
+                prompt => panic!("unexpected retry for {prompt}"),
+            }
+        }
+        assert_eq!((recovered, exhausted), (1, 2));
+    });
+    let batches = batches?;
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(
+        batch
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .values(),
+        &[0, 1, 2, 3]
+    );
+    batch
+        .schema()
+        .field(2)
+        .try_extension_type::<AiErrorType>()?;
+    let envelope = batch.column(2).as_struct();
+    let values = envelope.column(0).as_struct();
+    assert!(values.is_null(3));
+    assert_eq!(
+        values
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int64Type>()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some(1), Some(2), Some(3), None]
+    );
+    assert_eq!(
+        envelope
+            .column(1)
+            .as_string::<i32>()
+            .iter()
+            .collect::<Vec<_>>(),
+        [None, None, None, Some("SCHEMA_MISMATCH")]
+    );
+    assert_eq!(
+        envelope.column(3).as_boolean().iter().collect::<Vec<_>>(),
+        [None, None, None, Some(false)]
+    );
+    for (name, expected) in [
+        ("llm_requests", 4),
+        ("llm_retries", 3),
+        ("submitted_prompts", 4),
+        ("failed_rows", 1),
+        ("input_tokens", 14),
+        ("output_tokens", 27),
+        ("llm_requests::script", 4),
+        ("input_tokens::script", 14),
+        ("output_tokens::script", 27),
+    ] {
+        assert_eq!(metric(&exec, name), expected, "{name}");
+    }
+    assert_no_attempt(&mut attempts);
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_retry_observes_stream_and_backend_cancellation() -> Result<()> {
+    for drop_stream in [true, false] {
+        let (registry, mut attempts) = script(1)?;
+        let ctx = task_context(&registry);
+        let exec = decode(
+            input(&[Some("a")])?,
+            r#"{"provider":"script","on_error":"envelope","schema_retries":3,
+                "response_schema":{"type":"object","properties":{
+                    "count":{"type":"integer"}
+                },"required":["count"]}}"#,
+            &ctx,
+        )?;
+        let mut stream = exec.execute(0, ctx)?;
+        assert!(poll!(stream.next()).is_pending());
+        next_attempt(&mut attempts)
+            .await
+            .reply_with(&[Some("{}")], None);
+        let mut retry = next_attempt(&mut attempts).await;
+        assert_eq!(retry.prompts, ["a"]);
+        assert_eq!(registry.available_permits("script"), Some(0));
+        assert!(!retry.cancel.is_cancelled());
+        if drop_stream {
+            drop(stream);
+            assert!(retry.cancel.is_cancelled());
+            timeout(TEST_TIMEOUT, retry.reply.closed()).await.unwrap();
+        } else {
+            retry.reply.send(Err(LlmBackendError::Cancelled)).unwrap();
+            let batch = timeout(TEST_TIMEOUT, stream.next())
+                .await
+                .unwrap()
+                .unwrap()?;
+            let envelope = batch.column(2).as_struct();
+            assert_eq!(envelope.column(1).as_string::<i32>().value(0), "CANCELLED");
+        }
+        assert_eq!(registry.available_permits("script"), Some(1));
+        assert_eq!(metric(&exec, "cancelled_requests"), 1);
+        assert_eq!(metric(&exec, "llm_requests"), 2);
+        assert_eq!(metric(&exec, "llm_retries"), 1);
+        assert_no_attempt(&mut attempts);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn structured_types_are_checked_without_coercion() -> Result<()> {
     let outputs = [
         (Some(r#"{"id":"123"}"#), "64-bit integer"),
@@ -1166,6 +1506,12 @@ async fn structured_vision_failures_use_slice_row_indices() -> Result<()> {
             bytes::Bytes::from_static(b"image").into(),
         )
         .await?;
+    store
+        .put(
+            &Path::from("retry"),
+            bytes::Bytes::from_static(b"retry image").into(),
+        )
+        .await?;
     env.register_object_store(&url, store);
     let resolver = ObjectStoreMediaResolver::new(Arc::clone(&env.object_store_registry));
 
@@ -1174,6 +1520,7 @@ async fn structured_vision_failures_use_slice_row_indices() -> Result<()> {
     let present = "memory://structured-vision/present";
     let mut media = ListBuilder::new(StringBuilder::new());
     media.append_value([Some("not a URI"), Some(present)]);
+    media.append_value([Some("memory://structured-vision/retry"), Some(present)]);
     for _ in 0..2 {
         media.append_value([Some(present); 2]);
     }
@@ -1183,6 +1530,7 @@ async fn structured_vision_failures_use_slice_row_indices() -> Result<()> {
             "text",
             Arc::new(StringArray::from(vec![
                 "bad media",
+                "repairable JSON",
                 "bad JSON",
                 "valid",
                 "skipped",
@@ -1201,7 +1549,7 @@ async fn structured_vision_failures_use_slice_row_indices() -> Result<()> {
         ),
         TaskKind::Vision,
         "vision".into(),
-        r#"{"provider":"script","batch_size":4,"on_error":"envelope",
+        r#"{"provider":"script","batch_size":5,"on_error":"envelope","schema_retries":1,
             "response_schema":{"type":"object","properties":{
                 "visible":{"type":"boolean"}
             },"required":["visible"]}}"#,
@@ -1211,26 +1559,43 @@ async fn structured_vision_failures_use_slice_row_indices() -> Result<()> {
     let collect = exec.execute(0, ctx)?.try_collect::<Vec<_>>();
     let (batches, ()) = tokio::join!(collect, async {
         let attempt = next_attempt(&mut attempts).await;
-        assert_eq!(attempt.prompts, ["bad JSON", "valid"]);
+        assert_eq!(attempt.prompts, ["repairable JSON", "bad JSON", "valid"]);
         assert!(
             attempt
                 .media
                 .iter()
                 .all(|slot| slot.as_ref().unwrap().len() == 2)
         );
-        attempt
-            .reply
-            .send(Ok(LlmResponse {
-                outputs: vec![
-                    Some("invalid JSON".into()),
-                    Some(r#"{"visible":true}"#.into()),
-                ],
-                usage: None,
-            }))
-            .unwrap();
+        attempt.reply_with(
+            &[
+                Some("invalid JSON"),
+                Some("{}"),
+                Some(r#"{"visible":true}"#),
+            ],
+            None,
+        );
+        for _ in 0..2 {
+            let retry = next_attempt(&mut attempts).await;
+            assert_eq!(retry.prompts.len(), 1);
+            let images = retry.media[0].as_ref().unwrap();
+            assert_eq!(images.len(), 2);
+            assert_eq!(images[1].bytes.as_ref(), b"image");
+            let output = match retry.prompts[0].as_str() {
+                "repairable JSON" => {
+                    assert_eq!(images[0].bytes.as_ref(), b"retry image");
+                    r#"{"visible":false}"#
+                }
+                "bad JSON" => {
+                    assert_eq!(images[0].bytes.as_ref(), b"image");
+                    "{}"
+                }
+                prompt => panic!("unexpected retry for {prompt}"),
+            };
+            retry.reply_with(&[Some(output)], None);
+        }
     });
     let batches = batches?;
-    let populated = batches.iter().find(|batch| batch.num_rows() == 3).unwrap();
+    let populated = batches.iter().find(|batch| batch.num_rows() == 4).unwrap();
     let envelope = populated.column(2).as_struct();
     assert_eq!(
         envelope
@@ -1238,11 +1603,12 @@ async fn structured_vision_failures_use_slice_row_indices() -> Result<()> {
             .as_string::<i32>()
             .iter()
             .collect::<Vec<_>>(),
-        [Some("PERMANENT_HTTP"), Some("SCHEMA_MISMATCH"), None],
+        [Some("PERMANENT_HTTP"), None, Some("SCHEMA_MISMATCH"), None],
     );
     let value = envelope.column(0).as_struct();
-    assert!(value.is_null(0) && value.is_null(1));
-    assert!(value.is_valid(2) && value.column(0).as_boolean().value(2));
+    assert!(value.is_null(0) && value.is_null(2));
+    assert!(value.is_valid(1) && !value.column(0).as_boolean().value(1));
+    assert!(value.is_valid(3) && value.column(0).as_boolean().value(3));
     let skipped = batches.iter().find(|batch| batch.num_rows() == 1).unwrap();
     assert!(
         skipped

@@ -8,6 +8,9 @@ mod sql;
 /// Run all tests that are found in the `dataframe` directory
 mod dataframe;
 
+#[cfg(feature = "ai")]
+mod ai_assembly;
+
 /// Run all tests that are found in the `datasource` directory
 mod datasource;
 

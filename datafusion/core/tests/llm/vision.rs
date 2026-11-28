@@ -189,6 +189,54 @@ async fn vision_validates_list_budget_options_at_planning() -> Result<()> {
 }
 
 #[tokio::test]
+async fn vision_validates_image_resize_options_at_planning() -> Result<()> {
+    let (ctx, resolver) = vision_context();
+    for (sql, message) in [
+        (
+            r#"SELECT llm('prompt', 'm', '{"image_max_edge":16}')"#,
+            "image_max_edge is only supported by vlm()",
+        ),
+        (
+            r#"SELECT embed('prompt', 'm', '{"dimension":4,"image_max_edge":16}')"#,
+            "image_max_edge is only supported by vlm()",
+        ),
+    ] {
+        harness::assert_plan_error(&ctx, sql, &[message]).await;
+    }
+
+    for (options, message) in [
+        (
+            r#"{"image_max_edge":15}"#,
+            "image_max_edge must be between 16 and 8192",
+        ),
+        (
+            r#"{"image_max_edge":8193}"#,
+            "image_max_edge must be between 16 and 8192",
+        ),
+        (
+            r#"{"image_resize_fallback":"passthrough"}"#,
+            "image_resize_fallback requires image_max_edge",
+        ),
+        (
+            r#"{"image_max_edge":16,"image_resize_fallback":"ignore"}"#,
+            "unknown variant",
+        ),
+    ] {
+        let sql = format!("SELECT vlm('prompt', '{IMAGE_A}', 'm', '{options}')");
+        harness::assert_plan_error(&ctx, &sql, &[message]).await;
+    }
+
+    for (edge, fallback) in [(16, "error"), (8192, "passthrough")] {
+        let sql = format!(
+            r#"SELECT vlm('prompt', '{IMAGE_A}', 'm', '{{"image_max_edge":{edge},"image_resize_fallback":"{fallback}"}}')"#
+        );
+        ctx.sql(&sql).await?.create_physical_plan().await?;
+    }
+    assert_eq!(resolver.0.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn vision_list_nulls_limits_and_unused_output_never_resolve_media() -> Result<()> {
     let (ctx, resolver) = vision_context();
     let mut lists = ListBuilder::new(StringBuilder::new());
@@ -570,6 +618,196 @@ async fn parquet_sql_isolates_multi_image_and_schema_errors() -> Result<()> {
                 Some("vision d-last"),
                 None
             ),
+        ]
+    );
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "ai-http",
+    feature = "parquet",
+    feature = "encoding_expressions"
+))]
+#[tokio::test]
+async fn parquet_sql_vision_downsamples_images_and_retries_schema_rows() -> Result<()> {
+    use std::fs::File;
+    use std::time::Duration;
+
+    use datafusion::arrow::datatypes::Int64Type;
+    use datafusion::datasource::listing::ListingTableUrl;
+    use datafusion::execution::runtime_env::RuntimeEnv;
+    use datafusion::functions::encoding::expr_fn::decode;
+    use datafusion::llm::{OpenAiHttpBackend, OpenAiHttpConfig};
+    use datafusion::parquet::arrow::ArrowWriter;
+    use datafusion::prelude::ParquetReadOptions;
+    use datafusion_ai::{AiErrorType, ObjectStoreMediaResolver};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    const PNG: &[u8] = include_bytes!("fixtures/downsample-96x48.png");
+    const JPEG: &[u8] = include_bytes!("../../../ai/tests/fixtures/vision.jpeg");
+
+    let directory = tempfile::tempdir()?;
+    let save_image = |name, bytes| -> Result<ListingTableUrl> {
+        let path = directory.path().join(name);
+        std::fs::write(&path, bytes)?;
+        ListingTableUrl::parse(path.to_str().unwrap())
+    };
+    let png = save_image("large.png", PNG)?;
+    let jpeg = save_image("original.jpg", JPEG)?;
+    let prompts = ["a-png", "b-bad-uri", "c-recover", "d-exhaust", "e-jpeg"];
+    let mut images = ListBuilder::new(StringBuilder::new());
+    images.append_value([Some(png.as_str())]);
+    images.append_value([Some("not a URI")]);
+    images.append_value([Some(png.as_str()), Some(jpeg.as_str())]);
+    images.append_value([Some(png.as_str())]);
+    images.append_value([Some(jpeg.as_str())]);
+    let batch = RecordBatch::try_from_iter([
+        (
+            "prompt",
+            Arc::new(StringArray::from(prompts.to_vec())) as ArrayRef,
+        ),
+        ("images", Arc::new(images.finish())),
+    ])?;
+    let path = directory.path().join("t.parquet");
+    let mut writer = ArrowWriter::try_new(File::create(&path)?, batch.schema(), None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let key = "loopback-vision-resize-schema-test-key";
+    let backend = OpenAiHttpBackend::try_new(OpenAiHttpConfig {
+        base_url: format!("http://{}/v1", listener.local_addr()?),
+        api_key: Some(key.into()),
+        api_key_env: None,
+        ca_cert_pem: None,
+    })?;
+    let runtime = Arc::new(RuntimeEnv::default());
+    let resolver =
+        ObjectStoreMediaResolver::new(Arc::clone(&runtime.object_store_registry));
+    let ctx = SessionContext::new_with_config_rt(
+        SessionConfig::new()
+            .with_target_partitions(1)
+            .with_extension(Arc::new(resolver)),
+        runtime,
+    );
+    ctx.state()
+        .llm_provider_registry()
+        .register("http", Arc::new(backend))?;
+    ctx.register_parquet("t", path.to_str().unwrap(), ParquetReadOptions::default())
+        .await?;
+
+    let serve = async {
+        let mut attempts = [0; 5];
+        for _ in 0..6 {
+            let (endpoint, body, socket) = super::read_http_request(&listener, key).await;
+            assert_eq!(endpoint, "/v1/chat/completions");
+            assert_eq!(body["response_format"], json!({"type":"json_object"}));
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0]["role"], "system");
+            assert!(
+                messages[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("JSON Schema")
+            );
+            assert_eq!(messages[1]["role"], "user");
+            let content = messages[1]["content"].as_array().unwrap();
+            assert_eq!(content[0]["type"], "text");
+            let prompt = content[0]["text"].as_str().unwrap();
+            let row = prompts
+                .iter()
+                .position(|candidate| *candidate == prompt)
+                .unwrap();
+            attempts[row] += 1;
+            let mime_types: &[_] = match prompt {
+                "a-png" | "d-exhaust" => &["data:image/png"],
+                "c-recover" => &["data:image/png", "data:image/jpeg"],
+                "e-jpeg" => &["data:image/jpeg"],
+                _ => panic!("unexpected inference request for {prompt}"),
+            };
+            assert_eq!(content.len(), 1 + mime_types.len());
+            for (image, mime_type) in content[1..].iter().zip(mime_types) {
+                assert_eq!(image["type"], "image_url");
+                let url = image["image_url"]["url"].as_str().unwrap();
+                let (prefix, encoded) = url.split_once(";base64,").unwrap();
+                assert_eq!(prefix, *mime_type);
+                let decoded = ctx
+                    .read_empty()?
+                    .select(vec![decode(lit(encoded), lit("base64"))])?
+                    .collect()
+                    .await?;
+                let bytes = decoded[0].column(0).as_binary::<i32>().value(0);
+                if prefix == "data:image/png" {
+                    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"));
+                    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+                    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+                    assert_eq!((width, height), (64, 32));
+                } else {
+                    assert_eq!(bytes, JPEG);
+                }
+            }
+            let answer = match prompt {
+                "a-png" => r#"{"count":1}"#,
+                "c-recover" if attempts[row] == 2 => "```json\n{\"count\":3}\n```",
+                "c-recover" | "d-exhaust" => r#"{"count":"invalid"}"#,
+                "e-jpeg" => r#"{"count":5}"#,
+                _ => unreachable!(),
+            };
+            let response = json!({"choices":[{"message":{"content":answer}}]});
+            super::write_http_response(socket, &response.to_string()).await;
+        }
+        assert_eq!(attempts, [1, 0, 2, 2, 1]);
+        Ok(())
+    };
+    let query = harness::run(
+        &ctx,
+        r#"SELECT vlm(prompt, images, 'm', '{
+            "provider":"http", "on_error":"envelope", "max_retries":0,
+            "response_schema":{"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]},
+            "schema_mode":"json_object", "schema_retries":1,
+            "image_max_edge":64, "image_resize_fallback":"passthrough"
+        }') AS answer FROM t ORDER BY prompt"#,
+    );
+    let ((plan, batches), ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::try_join!(query, serve)
+    })
+    .await
+    .expect("SQL and loopback server must finish")?;
+    assert_eq!(harness::metric(plan.as_ref(), "llm_requests"), 6);
+    assert_eq!(harness::metric(plan.as_ref(), "llm_retries"), 2);
+    plan.schema().field(0).try_extension_type::<AiErrorType>()?;
+
+    let rows: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            let envelope = batch.column(0).as_struct();
+            let value = envelope.column(0).as_struct();
+            assert_eq!(
+                value.fields()[0].as_ref(),
+                &Field::new("count", DataType::Int64, false)
+            );
+            let count = value.column(0).as_primitive::<Int64Type>();
+            let error = envelope.column(1).as_string::<i32>();
+            let retryable = envelope.column(3).as_boolean();
+            (0..batch.num_rows()).map(move |row| {
+                (
+                    value.is_valid(row).then(|| count.value(row)),
+                    error.is_valid(row).then(|| error.value(row)),
+                    retryable.is_valid(row).then(|| retryable.value(row)),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (Some(1), None, None),
+            (None, Some("PERMANENT_HTTP"), Some(false)),
+            (Some(3), None, None),
+            (None, Some("SCHEMA_MISMATCH"), Some(false)),
+            (Some(5), None, None),
         ]
     );
     Ok(())
