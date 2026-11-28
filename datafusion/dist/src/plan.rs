@@ -110,6 +110,21 @@ pub struct SplitMetrics {
     pub output_rows: usize,
     /// Prompt submissions reported by all operators.
     pub submitted_prompts: usize,
+    /// Input tokens reported by inference providers.
+    #[serde(default)]
+    pub input_tokens: usize,
+    /// Output tokens reported by inference providers.
+    #[serde(default)]
+    pub output_tokens: usize,
+    /// Inference request attempts, including retries.
+    #[serde(default)]
+    pub llm_requests: usize,
+    /// Inference request attempts after the initial attempt.
+    #[serde(default)]
+    pub llm_retries: usize,
+    /// Inference counters keyed by the resolved provider name.
+    #[serde(default)]
+    pub llm_usage_by_provider: BTreeMap<String, ProviderUsage>,
     /// Parquet row groups eliminated by statistics.
     pub row_groups_pruned_statistics: usize,
     /// Parquet row groups matched by statistics.
@@ -127,6 +142,20 @@ pub struct SplitOutput {
     pub batches: Vec<RecordBatch>,
     /// Counters for this attempt.
     pub metrics: SplitMetrics,
+}
+
+/// Token and request totals for one inference provider.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUsage {
+    /// Input tokens reported by the provider.
+    #[serde(default)]
+    pub input_tokens: usize,
+    /// Output tokens reported by the provider.
+    #[serde(default)]
+    pub output_tokens: usize,
+    /// Inference request attempts, including retries.
+    #[serde(default)]
+    pub requests: usize,
 }
 
 /// Serializes one concrete type stored in [`PartitionedFile::extensions`].

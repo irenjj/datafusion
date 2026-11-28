@@ -13,8 +13,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion_ai::llm::{
-    CancellationToken, LlmBackend, LlmBackendError, LlmExec, LlmProviderRegistry,
-    LlmRequest, LlmResponse, MediaPlan, MockLlmBackend, OnError, TaskKind,
+    CancellationToken, LlmBackend, LlmBackendError, LlmEmbeddingResponse, LlmExec,
+    LlmProviderRegistry, LlmRequest, LlmResponse, LlmUsage, MediaPlan, MockLlmBackend,
+    OnError, TaskKind,
 };
 use datafusion_ai::{
     AiErrorType, CheckpointOutputColumn, CheckpointableTarget, MediaRef, MediaRefType,
@@ -35,20 +36,29 @@ use tokio::time::{Instant, advance, timeout};
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn input(prompts: &[Option<&str>]) -> Result<Arc<dyn ExecutionPlan>> {
+    partitioned_input(&[prompts])
+}
+
+fn partitioned_input(partitions: &[&[Option<&str>]]) -> Result<Arc<dyn ExecutionPlan>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("text", DataType::Utf8, true),
     ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int32Array::from_iter_values(
-                0..i32::try_from(prompts.len()).unwrap(),
-            )),
-            Arc::new(StringArray::from(prompts.to_vec())),
-        ],
-    )?;
-    Ok(TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?)
+    let partitions = partitions
+        .iter()
+        .map(|prompts| {
+            Ok(vec![RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(
+                        0..i32::try_from(prompts.len()).unwrap(),
+                    )),
+                    Arc::new(StringArray::from(prompts.to_vec())),
+                ],
+            )?])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TestMemoryExec::try_new_exec(&partitions, schema, None)?)
 }
 
 fn task_context(registry: &LlmProviderRegistry) -> Arc<TaskContext> {
@@ -333,19 +343,152 @@ fn vision_worker_decode_requires_a_media_resolver() -> Result<()> {
 }
 
 #[tokio::test]
+async fn usage_metrics_follow_explicit_and_default_provider_names() -> Result<()> {
+    #[derive(Debug)]
+    struct ReportingBackend(LlmUsage);
+
+    #[async_trait]
+    impl LlmBackend for ReportingBackend {
+        async fn generate(
+            &self,
+            request: LlmRequest,
+            cancel: CancellationToken,
+        ) -> Reply {
+            let mut response = MockLlmBackend.generate(request, cancel).await?;
+            response.usage = Some(self.0);
+            Ok(response)
+        }
+
+        async fn embed(
+            &self,
+            request: LlmRequest,
+            cancel: CancellationToken,
+        ) -> std::result::Result<LlmEmbeddingResponse, LlmBackendError> {
+            let mut response = MockLlmBackend.embed(request, cancel).await?;
+            response.usage = Some(self.0);
+            Ok(response)
+        }
+    }
+
+    let registry = LlmProviderRegistry::empty_with_default("gpt-gateway");
+    for (name, input_tokens, output_tokens) in
+        [("qwen-openai", 11, 7), ("gpt-gateway", 19, 0)]
+    {
+        registry.register(
+            name,
+            Arc::new(ReportingBackend(LlmUsage {
+                input_tokens,
+                output_tokens,
+            })),
+        )?;
+    }
+    let ctx = task_context(&registry);
+    let chat = Arc::new(decode(
+        input(&[Some("prompt")])?,
+        r#"{"provider":"qwen-openai"}"#,
+        &ctx,
+    )?);
+    let embedding = LlmExec::try_new_task_from_task_context(
+        Arc::clone(&chat) as Arc<dyn ExecutionPlan>,
+        Arc::new(Column::new("text", 1)),
+        None,
+        TaskKind::Embed,
+        "embedding-model".into(),
+        r#"{"dimension":2}"#,
+        "embedding".into(),
+        &ctx,
+    )?;
+    embedding.execute(0, ctx)?.try_collect::<Vec<_>>().await?;
+    for (name, chat_usage, embed_usage) in [
+        ("input_tokens", 11, 19),
+        ("output_tokens", 7, 0),
+        ("llm_requests", 1, 1),
+    ] {
+        let qwen = format!("{name}::qwen-openai");
+        let gpt = format!("{name}::gpt-gateway");
+        let usage = |exec: &LlmExec, name: &str| {
+            exec.metrics()
+                .unwrap()
+                .sum_by_name(name)
+                .unwrap()
+                .as_usize()
+        };
+        assert_eq!(usage(&chat, &qwen), chat_usage);
+        assert_eq!(usage(&embedding, &gpt), embed_usage);
+        assert_eq!(
+            metric(&chat, name) + metric(&embedding, name),
+            chat_usage + embed_usage
+        );
+        assert_eq!(metric(&chat, &gpt), 0);
+        assert_eq!(metric(&embedding, &qwen), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn provider_names_reserve_metric_delimiter() -> Result<()> {
+    let registry = LlmProviderRegistry::default();
+    registry.register("test.mock_ai-2", Arc::new(MockLlmBackend))?;
+    for name in ["qwen::openai", "qwen/openai", "qwen openai", "qwen💡"] {
+        for error in [
+            registry
+                .register(name, Arc::new(MockLlmBackend))
+                .unwrap_err(),
+            registry
+                .register_with_limit(name, Arc::new(MockLlmBackend), 1)
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(error, DataFusionError::Plan(message) if message.contains("provider name"))
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn embedding_envelope_is_checkpointable_and_round_trips_fixed_size_lists()
 -> Result<()> {
     use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
     use std::io::Cursor;
 
-    let ctx = task_context(&LlmProviderRegistry::default());
+    #[derive(Debug)]
+    struct EmbeddingBackend;
+
+    #[async_trait]
+    impl LlmBackend for EmbeddingBackend {
+        async fn generate(&self, _: LlmRequest, _: CancellationToken) -> Reply {
+            unreachable!("embedding execution uses embed")
+        }
+
+        async fn embed(
+            &self,
+            request: LlmRequest,
+            cancel: CancellationToken,
+        ) -> std::result::Result<LlmEmbeddingResponse, LlmBackendError> {
+            assert_eq!(request.prompts.len(), 2);
+            let mut response = MockLlmBackend.embed(request, cancel).await?;
+            response.usage = Some(LlmUsage {
+                input_tokens: 19,
+                output_tokens: 0,
+            });
+            Ok(response)
+        }
+    }
+
+    let registry = LlmProviderRegistry::default();
+    registry.register("embedding-test", Arc::new(EmbeddingBackend))?;
+    let ctx = task_context(&registry);
     let exec = LlmExec::try_new_task_from_task_context(
-        input(&[Some("prompt")])?,
+        partitioned_input(&[
+            &[Some("prompt"), Some("another")],
+            &[Some("third"), Some("fourth")],
+        ])?,
         Arc::new(Column::new("text", 1)),
         None,
         TaskKind::Embed,
         "model".into(),
-        r#"{"dimension":2,"on_error":"envelope"}"#,
+        r#"{"provider":"embedding-test","dimension":2,"batch_size":2,"on_error":"envelope"}"#,
         "answer".into(),
         &ctx,
     )?;
@@ -356,10 +499,27 @@ async fn embedding_envelope_is_checkpointable_and_round_trips_fixed_size_lists()
     assert!(exec.ai_output_columns()[0].is_error_envelope);
     schema.field(2).try_extension_type::<AiErrorType>()?;
     let batch = exec
-        .execute(0, ctx)?
+        .execute(0, Arc::clone(&ctx))?
         .try_collect::<Vec<_>>()
         .await?
         .remove(0);
+    assert_eq!(submitted(&exec), 2);
+    assert_eq!(metric(&exec, "input_tokens"), 19);
+    assert_eq!(metric(&exec, "output_tokens"), 0);
+    assert_eq!(metric(&exec, "llm_requests"), 1);
+    assert_eq!(metric(&exec, "llm_retries"), 0);
+    exec.execute(1, ctx)?.try_collect::<Vec<_>>().await?;
+    let metrics = exec.metrics().unwrap();
+    for partition in 0..2 {
+        let partition = metrics.for_partition(partition);
+        assert_eq!(
+            partition.sum_by_name("input_tokens").unwrap().as_usize(),
+            19
+        );
+        assert_eq!(partition.sum_by_name("llm_requests").unwrap().as_usize(), 1);
+    }
+    assert_eq!(metric(&exec, "input_tokens"), 38);
+    assert_eq!(metric(&exec, "llm_requests"), 2);
     let envelope = batch
         .column(2)
         .as_any()
@@ -557,17 +717,16 @@ struct Attempt {
 
 impl Attempt {
     fn succeed(self) {
+        self.succeed_with_usage(None);
+    }
+
+    fn succeed_with_usage(self, usage: Option<LlmUsage>) {
         let outputs = self
             .prompts
             .into_iter()
             .map(|prompt| Some(format!("answer:{prompt}")))
             .collect();
-        self.reply
-            .send(Ok(LlmResponse {
-                outputs,
-                usage: None,
-            }))
-            .unwrap();
+        self.reply.send(Ok(LlmResponse { outputs, usage })).unwrap();
     }
 }
 
@@ -762,12 +921,19 @@ async fn retry_backoff_keeps_permits_and_charges_each_prompt_once() -> Result<()
         attempt = next_attempt(&mut attempts).await;
         assert!(backoff_start.elapsed() <= Duration::from_millis(delay_ms + 1));
     }
-    attempt.succeed();
+    attempt.succeed_with_usage(Some(LlmUsage {
+        input_tokens: 11,
+        output_tokens: 7,
+    }));
     let batches = stream.try_collect::<Vec<_>>().await?;
     assert_eq!(rows(&batches), [(0, Some("a"), Some("answer:a"))]);
     assert_eq!(submitted(&exec), 1);
     assert_eq!(metric(&exec, "backend_attempts"), 3);
     assert_eq!(metric(&exec, "retries"), 2);
+    assert_eq!(metric(&exec, "llm_requests"), 3);
+    assert_eq!(metric(&exec, "llm_retries"), 2);
+    assert_eq!(metric(&exec, "input_tokens"), 11);
+    assert_eq!(metric(&exec, "output_tokens"), 7);
     assert_eq!(registry.available_permits("script"), Some(1));
     Ok(())
 }

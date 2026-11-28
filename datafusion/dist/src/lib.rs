@@ -20,8 +20,8 @@ pub use codec::{
     NamedPhysicalExtensionCodec,
 };
 pub use plan::{
-    DistCodecs, FileExtensionCodec, FileExtensionCodecRegistry, PreparedStage, Split,
-    SplitMetrics, SplitOutput, StagePlan, bind_split_to_plan,
+    DistCodecs, FileExtensionCodec, FileExtensionCodecRegistry, PreparedStage,
+    ProviderUsage, Split, SplitMetrics, SplitOutput, StagePlan, bind_split_to_plan,
     bind_split_to_plan_with_codecs, bind_split_to_plan_with_extensions,
     bind_split_to_template, bind_split_to_template_with_extensions,
     decode_stage_template, decode_stage_template_with_codecs,

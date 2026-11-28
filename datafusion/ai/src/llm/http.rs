@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::borrow::Cow;
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
@@ -28,8 +29,8 @@ pub struct OpenAiHttpConfig {
     pub base_url: String,
     /// Bearer token. Mutually exclusive with [Self::api_key_env].
     pub api_key: Option<String>,
-    /// Environment variable read once at construction. Mutually exclusive with
-    /// [Self::api_key].
+    /// Environment variable validated at construction and read for each request.
+    /// Mutually exclusive with [Self::api_key].
     pub api_key_env: Option<String>,
     /// Additional PEM-encoded CA certificates to trust for this endpoint.
     pub ca_cert_pem: Option<Vec<u8>>,
@@ -357,27 +358,30 @@ struct ChatUsage {
 struct Transport {
     client: Client,
     base: Url,
-    authorization: Option<HeaderValue>,
+    authorization: Option<Authorization>,
+}
+
+enum Authorization {
+    Static(HeaderValue),
+    Env(String),
 }
 
 impl Transport {
     fn try_new(config: OpenAiHttpConfig) -> Result<Self> {
         let base = parse_base_url(&config.base_url)?;
-        let key = match (config.api_key, config.api_key_env) {
+        let authorization = match (config.api_key, config.api_key_env) {
             (Some(_), Some(_)) => {
                 return plan_err!(
                     "Set only one of api_key and api_key_env for the llm HTTP backend"
                 );
             }
-            (Some(key), None) => Some(key),
-            (None, Some(env)) => Some(std::env::var(env).map_err(|_| {
-                plan_datafusion_err!(
-                    "Could not read the configured llm HTTP API key environment variable"
-                )
-            })?),
+            (Some(key), None) => Some(Authorization::Static(bearer_header(&key)?)),
+            (None, Some(env)) => {
+                env_bearer_header(&env)?;
+                Some(Authorization::Env(env))
+            }
             (None, None) => None,
         };
-        let authorization = key.as_deref().map(bearer_header).transpose()?;
 
         // A redirect can send credentials or inference data to a different endpoint.
         let mut builder = Client::builder()
@@ -429,13 +433,22 @@ impl Transport {
                     .extend(path.iter().copied());
 
                 let mut request = self.client.post(endpoint).json(body);
-                if let Some(authorization) = &self.authorization {
+                let authorization = match &self.authorization {
+                    Some(Authorization::Static(header)) => Some(Cow::Borrowed(header)),
+                    Some(Authorization::Env(env)) => Some(Cow::Owned(
+                        env_bearer_header(env).map_err(|_| {
+                            permanent(None, "Invalid or missing llm HTTP API key environment variable")
+                        })?,
+                    )),
+                    None => None,
+                };
+                if let Some(authorization) = authorization.as_deref() {
                     request = request.header(AUTHORIZATION, authorization.clone());
                 }
                 let response = request.send().await.map_err(|error| transport_error(&error, path))?;
                 let status = response.status();
                 if !status.is_success() {
-                    return Err(response_error(response, self.authorization.as_ref(), path).await);
+                    return Err(response_error(response, authorization.as_deref(), path).await);
                 }
                 let bytes = response.bytes().await.map_err(|error| transport_error(&error, path))?;
                 serde_json::from_slice(&bytes).map_err(|_| LlmBackendError::InvalidResponse {
@@ -490,6 +503,15 @@ fn bearer_header(key: &str) -> Result<HeaderValue> {
         .map_err(|_| plan_datafusion_err!("Invalid llm HTTP API key header value"))?;
     value.set_sensitive(true);
     Ok(value)
+}
+
+fn env_bearer_header(name: &str) -> Result<HeaderValue> {
+    let key = std::env::var(name).map_err(|_| {
+        plan_datafusion_err!(
+            "Could not read the configured llm HTTP API key environment variable"
+        )
+    })?;
+    bearer_header(&key)
 }
 
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;

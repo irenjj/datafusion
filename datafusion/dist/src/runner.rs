@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use datafusion::common::{Result, exec_err};
+use datafusion::common::{Result, exec_datafusion_err, exec_err};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
@@ -13,8 +13,9 @@ use futures::TryStreamExt;
 
 use crate::codec::DistExtensionRegistry;
 use crate::plan::{
-    DistCodecs, FileExtensionCodecRegistry, PreparedStage, Split, SplitMetrics,
-    SplitOutput, StagePlan, bind_split_to_template, decode_stage_template_with_codecs,
+    DistCodecs, FileExtensionCodecRegistry, PreparedStage, ProviderUsage, Split,
+    SplitMetrics, SplitOutput, StagePlan, bind_split_to_template,
+    decode_stage_template_with_codecs,
 };
 use crate::scheduler::{LeaseToken, LeasedSplitQueue};
 
@@ -126,7 +127,7 @@ impl PreparedStage {
             output_rows: batches.iter().map(|batch| batch.num_rows()).sum(),
             ..Default::default()
         };
-        collect_metrics(plan.as_ref(), &mut metrics);
+        collect_metrics(plan.as_ref(), &mut metrics)?;
         Ok(SplitOutput {
             split_id: split.split_id,
             attempt_id: split.attempt_id,
@@ -136,12 +137,39 @@ impl PreparedStage {
     }
 }
 
-fn collect_metrics(plan: &dyn ExecutionPlan, output: &mut SplitMetrics) {
+fn collect_metrics(plan: &dyn ExecutionPlan, output: &mut SplitMetrics) -> Result<()> {
     if let Some(metrics) = plan.metrics() {
-        if let Some(submitted) = metrics.sum(|metric| {
-            matches!(metric.value(), MetricValue::Count { name, .. } if name == "submitted_prompts")
-        }) {
-            output.submitted_prompts += submitted.as_usize();
+        for metric in metrics.iter() {
+            let MetricValue::Count { name, count } = metric.value() else {
+                continue;
+            };
+            let total = match name.as_ref() {
+                "submitted_prompts" => &mut output.submitted_prompts,
+                "input_tokens" => &mut output.input_tokens,
+                "output_tokens" => &mut output.output_tokens,
+                "llm_requests" => &mut output.llm_requests,
+                "llm_retries" => &mut output.llm_retries,
+                _ => {
+                    let Some((kind, provider)) = name.split_once("::") else {
+                        continue;
+                    };
+                    let field: fn(&mut ProviderUsage) -> &mut usize = match kind {
+                        "input_tokens" => |usage| &mut usage.input_tokens,
+                        "output_tokens" => |usage| &mut usage.output_tokens,
+                        "llm_requests" => |usage| &mut usage.requests,
+                        _ => continue,
+                    };
+                    field(
+                        output
+                            .llm_usage_by_provider
+                            .entry(provider.into())
+                            .or_default(),
+                    )
+                }
+            };
+            *total = total
+                .checked_add(count.value())
+                .ok_or_else(|| exec_datafusion_err!("Split {name} count overflow"))?;
         }
         if plan.is::<DataSourceExec>()
             && let Some(MetricValue::PruningMetrics {
@@ -155,6 +183,7 @@ fn collect_metrics(plan: &dyn ExecutionPlan, output: &mut SplitMetrics) {
         }
     }
     for child in plan.children() {
-        collect_metrics(child.as_ref(), output);
+        collect_metrics(child.as_ref(), output)?;
     }
+    Ok(())
 }

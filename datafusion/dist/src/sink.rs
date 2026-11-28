@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 use crate::fingerprint::{plan_fingerprint, split_fingerprint};
-use crate::{Split, StagePlan};
+use crate::{ProviderUsage, Split, SplitMetrics, StagePlan};
 
 mod routing;
 #[cfg(test)]
@@ -94,19 +94,8 @@ struct SplitCheckpoint {
     winning_attempt_id: u32,
     #[serde(flatten)]
     files: ArtifactFiles,
-}
-
-impl From<AttemptArtifact> for SplitCheckpoint {
-    fn from(attempt: AttemptArtifact) -> Self {
-        Self {
-            schema: CHECKPOINT_SCHEMA.into(),
-            plan_fingerprint: attempt.plan_fingerprint,
-            split_fingerprint: attempt.split_fingerprint,
-            split_id: attempt.split_id,
-            winning_attempt_id: attempt.attempt_id,
-            files: attempt.files,
-        }
-    }
+    #[serde(default)]
+    metrics: SplitMetrics,
 }
 
 /// JSON inventory of winning Parquet files and totals for a completed stage.
@@ -125,6 +114,21 @@ pub struct StageManifest {
     pub dlq_rows: u64,
     /// Dead-letter queue row counts grouped by error code.
     pub dlq_by_code: BTreeMap<String, u64>,
+    /// Input tokens reported by providers across the winning attempts.
+    #[serde(default)]
+    pub input_tokens: usize,
+    /// Output tokens reported by providers across the winning attempts.
+    #[serde(default)]
+    pub output_tokens: usize,
+    /// Inference request attempts across the winning attempts, including retries.
+    #[serde(default)]
+    pub llm_requests: usize,
+    /// Inference retries across the winning attempts.
+    #[serde(default)]
+    pub llm_retries: usize,
+    /// Inference counters by provider across the winning attempts.
+    #[serde(default)]
+    pub llm_usage_by_provider: BTreeMap<String, ProviderUsage>,
 }
 
 /// Writes immutable Parquet attempt files and publishes one checkpoint per split.
@@ -265,11 +269,32 @@ impl ParquetSplitSink {
         split: &Split,
         attempt: AttemptArtifact,
     ) -> Result<()> {
+        self.commit_split_with_metrics(split, attempt, SplitMetrics::default())
+            .await
+    }
+
+    /// Publish a verified attempt and its execution counters in one checkpoint.
+    ///
+    /// The same first-writer and lease rules as [`Self::commit_split`] apply.
+    pub async fn commit_split_with_metrics(
+        &self,
+        split: &Split,
+        attempt: AttemptArtifact,
+        metrics: SplitMetrics,
+    ) -> Result<()> {
         self.validate_split(split)?;
         if attempt.attempt_id != split.attempt_id {
             return exec_err!("Receipt attempt does not match split {}", split.split_id);
         }
-        let candidate = SplitCheckpoint::from(attempt);
+        let candidate = SplitCheckpoint {
+            schema: CHECKPOINT_SCHEMA.into(),
+            plan_fingerprint: attempt.plan_fingerprint,
+            split_fingerprint: attempt.split_fingerprint,
+            split_id: attempt.split_id,
+            winning_attempt_id: attempt.attempt_id,
+            files: attempt.files,
+            metrics,
+        };
         self.validate_checkpoint(split, &candidate)?;
         self.verify_contents(&candidate.files).await?;
         let path = self.checkpoint_path(split);
@@ -337,6 +362,11 @@ impl ParquetSplitSink {
             output_rows: 0,
             dlq_rows: 0,
             dlq_by_code: BTreeMap::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            llm_requests: 0,
+            llm_retries: 0,
+            llm_usage_by_provider: BTreeMap::new(),
         };
         let mut sorted: Vec<_> = splits.iter().collect();
         sorted.sort_unstable_by_key(|split| split.split_id);
@@ -348,6 +378,53 @@ impl ParquetSplitSink {
             add_rows(&mut manifest.dlq_rows, checkpoint.files.dlq_rows)?;
             for (code, rows) in &checkpoint.files.dlq_by_code {
                 add_rows(manifest.dlq_by_code.entry(code.clone()).or_default(), *rows)?;
+            }
+            for (name, total, value) in [
+                (
+                    "input_tokens",
+                    &mut manifest.input_tokens,
+                    checkpoint.metrics.input_tokens,
+                ),
+                (
+                    "output_tokens",
+                    &mut manifest.output_tokens,
+                    checkpoint.metrics.output_tokens,
+                ),
+                (
+                    "llm_requests",
+                    &mut manifest.llm_requests,
+                    checkpoint.metrics.llm_requests,
+                ),
+                (
+                    "llm_retries",
+                    &mut manifest.llm_retries,
+                    checkpoint.metrics.llm_retries,
+                ),
+            ] {
+                *total = total
+                    .checked_add(value)
+                    .ok_or_else(|| exec_datafusion_err!("Stage {name} count overflow"))?;
+            }
+            for (provider, usage) in &checkpoint.metrics.llm_usage_by_provider {
+                let total = manifest
+                    .llm_usage_by_provider
+                    .entry(provider.clone())
+                    .or_default();
+                for (name, total, value) in [
+                    ("input_tokens", &mut total.input_tokens, usage.input_tokens),
+                    (
+                        "output_tokens",
+                        &mut total.output_tokens,
+                        usage.output_tokens,
+                    ),
+                    ("requests", &mut total.requests, usage.requests),
+                ] {
+                    *total = total.checked_add(value).ok_or_else(|| {
+                        exec_datafusion_err!(
+                            "Stage provider '{provider}' {name} count overflow"
+                        )
+                    })?;
+                }
             }
             manifest.splits.push(checkpoint);
         }

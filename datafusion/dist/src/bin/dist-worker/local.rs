@@ -73,7 +73,8 @@ pub(super) async fn run(
                 continue;
             }
         };
-        sink.commit_split(&split, artifact).await?;
+        sink.commit_split_with_metrics(&split, artifact, output.metrics.clone())
+            .await?;
         // The on-disk checkpoint is now authoritative. Keep only metrics in the queue.
         output.batches = vec![];
         match queue.commit(&token, output) {

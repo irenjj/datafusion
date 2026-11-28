@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::borrow::Cow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -18,11 +19,13 @@ use arrow::record_batch::RecordBatch;
 use futures::stream::{FuturesUnordered, Stream, StreamExt, once};
 use tokio::sync::{Semaphore, mpsc};
 
-use datafusion_common::{Result, exec_err, internal_err, plan_err};
+use datafusion_common::{Result, exec_datafusion_err, exec_err, internal_err, plan_err};
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::RecordBatchStream;
-use datafusion_physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
+use datafusion_physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue,
+};
 use datafusion_physical_plan::stream::{
     RecordBatchReceiverStream, RecordBatchStreamAdapter,
 };
@@ -44,6 +47,7 @@ pub(super) struct Dispatch {
     pub(super) model: String,
     pub(super) options: Arc<LlmOptions>,
     pub(super) kind: TaskKind,
+    pub(super) provider_name: String,
     dimension: Option<i32>,
     provider: RegisteredProvider,
     slots: Arc<Semaphore>,
@@ -57,6 +61,7 @@ impl Dispatch {
         options: LlmOptions,
         kind: TaskKind,
         provider: RegisteredProvider,
+        provider_name: String,
     ) -> Result<Self> {
         let batch_size = options
             .batch_size
@@ -80,6 +85,7 @@ impl Dispatch {
                 .transpose()?,
             options: Arc::new(options),
             provider,
+            provider_name,
             slots: Arc::new(Semaphore::new(inflight_limit)),
             inflight_limit,
             batch_size,
@@ -234,17 +240,52 @@ pub(super) struct LlmMetrics {
 }
 
 impl LlmMetrics {
-    pub(super) fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+    pub(super) fn new(
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
+        provider_name: &str,
+    ) -> Self {
         let counter = |name| MetricBuilder::new(metrics).counter(name, partition);
+        let alias = |name: Cow<'static, str>, count: &Count| {
+            MetricBuilder::new(metrics).with_partition(partition).build(
+                MetricValue::Count {
+                    name,
+                    count: count.clone(),
+                },
+            );
+        };
+        let with_provider = |name| {
+            let count = counter(name);
+            alias(format!("{name}::{provider_name}").into(), &count);
+            count
+        };
+        let attempts = with_provider("llm_requests");
+        alias("backend_attempts".into(), &attempts);
+        let retries = counter("llm_retries");
+        alias("retries".into(), &retries);
         Self {
             submitted: counter("submitted_prompts"),
-            attempts: counter("backend_attempts"),
-            retries: counter("retries"),
+            attempts,
+            retries,
             failed_rows: counter("failed_rows"),
             cancelled_requests: counter("cancelled_requests"),
-            input_tokens: counter("input_tokens"),
-            output_tokens: counter("output_tokens"),
+            input_tokens: with_provider("input_tokens"),
+            output_tokens: with_provider("output_tokens"),
         }
+    }
+
+    fn record_usage(&self, usage: LlmUsage) -> Result<()> {
+        for (name, counter, tokens) in [
+            ("input_tokens", &self.input_tokens, usage.input_tokens),
+            ("output_tokens", &self.output_tokens, usage.output_tokens),
+        ] {
+            let tokens = usize::try_from(tokens)
+                .ok()
+                .filter(|&tokens| counter.value().checked_add(tokens).is_some())
+                .ok_or_else(|| exec_datafusion_err!("LLM {name} counter overflow"))?;
+            counter.add(tokens);
+        }
+        Ok(())
     }
 }
 
@@ -473,12 +514,7 @@ impl Driver {
                 Ok(response) => {
                     let (mut output, usage) = response.into_array(self.value_type())?;
                     if let Some(usage) = usage {
-                        self.metrics.input_tokens.add(
-                            usize::try_from(usage.input_tokens).unwrap_or(usize::MAX),
-                        );
-                        self.metrics.output_tokens.add(
-                            usize::try_from(usage.output_tokens).unwrap_or(usize::MAX),
-                        );
+                        self.metrics.record_usage(usage)?;
                     }
                     if !media_errors.is_empty() {
                         output =

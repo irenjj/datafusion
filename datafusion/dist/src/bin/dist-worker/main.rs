@@ -93,7 +93,7 @@ async fn run(command: &str, args: Result<Arguments>) -> Result<()> {
             let split =
                 job.split(receipt.artifact.split_id, receipt.artifact.attempt_id)?;
             job.sink(root.as_deref())?
-                .commit_split(&split, receipt.artifact)
+                .commit_split_with_metrics(&split, receipt.artifact, receipt.metrics)
                 .await
         }
         "finalize-stage" => {

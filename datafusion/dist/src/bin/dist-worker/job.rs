@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+#[cfg(feature = "ai-http")]
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::absolute;
 use std::sync::Arc;
@@ -32,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use url::{ParseError, Position, Url};
 
 const SCHEMA: &str = "df-stage-job-v1";
+const PROVIDERS_ENV: &str = "DF_DIST_LLM_PROVIDERS";
 
 pub(super) struct PlanningOptions {
     pub(super) sql: String,
@@ -256,15 +259,18 @@ impl Location {
         Ok(())
     }
 
+    #[cfg(feature = "s3")]
+    fn s3_builder(&self) -> AmazonS3Builder {
+        // The URI supplies the bucket. Connection settings come from the environment.
+        AmazonS3Builder::from_env()
+            .with_bucket_name(self.0.host_str().expect("S3 locations have a bucket"))
+    }
+
     fn store(&self) -> Result<Arc<dyn ObjectStore>> {
         Ok(match self.0.scheme() {
             "file" => Arc::new(LocalFileSystem::new()),
             #[cfg(feature = "s3")]
-            "s3" => Arc::new(
-                AmazonS3Builder::from_env()
-                    .with_url(self.origin())
-                    .build()?,
-            ),
+            "s3" => Arc::new(self.s3_builder().build()?),
             scheme => return plan_err!("Unsupported object store binding: {scheme}"),
         })
     }
@@ -275,6 +281,10 @@ impl Location {
 }
 
 fn session() -> Result<SessionContext> {
+    #[cfg(not(feature = "ai-http"))]
+    if std::env::var_os(PROVIDERS_ENV).is_some() {
+        return plan_err!("{PROVIDERS_ENV} requires the ai-http feature");
+    }
     let mut config = SessionConfig::new().with_target_partitions(1);
     config.options_mut().optimizer.repartition_file_scans = false;
     #[cfg(feature = "ai")]
@@ -307,15 +317,20 @@ fn codecs() -> Result<DistCodecs> {
 }
 
 #[cfg(feature = "ai")]
-fn llm_registry() -> Result<LlmProviderRegistry> {
-    fn env(name: &str) -> Result<Option<String>> {
-        match std::env::var(name) {
-            Ok(value) => Ok(Some(value)),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(std::env::VarError::NotUnicode(_)) => plan_err!("{name} must be UTF-8"),
-        }
+fn env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => plan_err!("{name} must be UTF-8"),
     }
+}
 
+#[cfg(feature = "ai")]
+fn llm_registry() -> Result<LlmProviderRegistry> {
+    #[cfg(feature = "ai-http")]
+    if let Some(providers) = env(PROVIDERS_ENV)? {
+        return named_providers(&providers, env("DF_DIST_LLM_PROVIDER")?);
+    }
     let registry = LlmProviderRegistry::default();
     let provider = env("DF_DIST_LLM_PROVIDER")?.unwrap_or_else(|| "default".into());
     let backend: Arc<dyn LlmBackend> = match env("DF_DIST_LLM_BACKEND")?.as_deref() {
@@ -326,9 +341,12 @@ fn llm_registry() -> Result<LlmProviderRegistry> {
                 .unwrap_or_else(|| "https://api.openai.com/v1".into()),
             api_key: env("OPENAI_API_KEY")?,
             api_key_env: None,
-            ca_cert_pem: std::env::var_os("OPENAI_CA_CERT_FILE")
-                .map(std::fs::read)
-                .transpose()?,
+            ca_cert_pem: match env("OPENAI_CA_CERT_PEM")? {
+                Some(pem) => Some(pem.into_bytes()),
+                None => std::env::var_os("OPENAI_CA_CERT_FILE")
+                    .map(std::fs::read)
+                    .transpose()?,
+            },
         })?),
         #[cfg(not(feature = "ai-http"))]
         Some("openai") => {
@@ -338,6 +356,144 @@ fn llm_registry() -> Result<LlmProviderRegistry> {
     };
     registry.register(provider, backend)?;
     Ok(registry)
+}
+
+#[cfg(feature = "ai-http")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamedProvider {
+    base_url: String,
+    api_key_env: String,
+    ca_cert_env: Option<String>,
+}
+
+#[cfg(feature = "ai-http")]
+fn named_providers(
+    json: &str,
+    default_name: Option<String>,
+) -> Result<LlmProviderRegistry> {
+    let providers: BTreeMap<String, NamedProvider> =
+        serde_json::from_str(json).map_err(|_| {
+            plan_datafusion_err!("Invalid {PROVIDERS_ENV} JSON configuration")
+        })?;
+    if providers.is_empty() || providers.keys().any(|name| name.trim().is_empty()) {
+        return plan_err!(
+            "{PROVIDERS_ENV} requires at least one non-empty provider name"
+        );
+    }
+    if let Some(name) = &default_name
+        && !providers.contains_key(name)
+    {
+        return plan_err!("DF_DIST_LLM_PROVIDER must name a provider in {PROVIDERS_ENV}");
+    }
+    let registry = LlmProviderRegistry::empty_with_default(
+        default_name.unwrap_or_else(|| "default".into()),
+    );
+    for (name, config) in providers {
+        validate_env_name(&config.api_key_env, "api_key_env")?;
+        if env(&config.api_key_env)?.is_none_or(|key| key.trim().is_empty()) {
+            return plan_err!(
+                "Missing or empty API key environment variable {}",
+                config.api_key_env
+            );
+        }
+        let ca_cert_pem = config
+            .ca_cert_env
+            .as_deref()
+            .map(|variable| {
+                validate_env_name(variable, "ca_cert_env")?;
+                let read_error =
+                    || plan_datafusion_err!("Could not read CA from {variable}");
+                let value = std::env::var_os(variable).ok_or_else(read_error)?;
+                if value
+                    .as_encoded_bytes()
+                    .starts_with(b"-----BEGIN CERTIFICATE-----")
+                {
+                    Ok(value.into_encoded_bytes())
+                } else {
+                    std::fs::read(value).map_err(|_| read_error())
+                }
+            })
+            .transpose()?;
+        let backend = OpenAiHttpBackend::try_new(OpenAiHttpConfig {
+            base_url: config.base_url,
+            api_key: None,
+            api_key_env: Some(config.api_key_env),
+            ca_cert_pem,
+        })
+        .map_err(|error| {
+            plan_datafusion_err!("Invalid {PROVIDERS_ENV} configuration: {error}")
+        })?;
+        registry.register(name, Arc::new(backend))?;
+    }
+    Ok(registry)
+}
+
+#[cfg(feature = "ai-http")]
+fn validate_env_name(name: &str, field: &str) -> Result<()> {
+    let mut bytes = name.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return plan_err!("{PROVIDERS_ENV} {field} must be an environment variable name");
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "s3"))]
+mod s3_tests {
+    use std::process::Command;
+
+    use object_store::{ClientConfigKey, aws::AmazonS3ConfigKey};
+
+    use super::*;
+
+    #[test]
+    fn s3_builder_preserves_environment() -> Result<()> {
+        if std::env::var_os("DF_DIST_TEST_S3_CONFIG").is_none() {
+            const TEST: &str = "job::s3_tests::s3_builder_preserves_environment";
+            let result = Command::new(std::env::current_exe()?)
+                .args(["--exact", TEST, "--nocapture"])
+                .env_clear()
+                .envs([
+                    ("DF_DIST_TEST_S3_CONFIG", "1"),
+                    ("AWS_BUCKET", "environment-bucket"),
+                    ("AWS_ENDPOINT", "http://host:80"),
+                    ("AWS_ALLOW_HTTP", "true"),
+                    ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "false"),
+                    ("AWS_REGION", "us-west-2"),
+                    ("AWS_ACCESS_KEY_ID", "test-key"),
+                    ("AWS_SECRET_ACCESS_KEY", "test-secret"),
+                ])
+                .output()?;
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            assert!(
+                result.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return Ok(());
+        }
+
+        use AmazonS3ConfigKey::*;
+        let location = Location::parse("s3://stage-bucket/path/file.parquet")?;
+        let builder = location.s3_builder();
+        for (key, value) in [
+            (Bucket, "stage-bucket"),
+            (Endpoint, "http://host:80"),
+            (Client(ClientConfigKey::AllowHttp), "true"),
+            (VirtualHostedStyleRequest, "false"),
+            (Region, "us-west-2"),
+            (AccessKeyId, "test-key"),
+            (SecretAccessKey, "test-secret"),
+        ] {
+            assert_eq!(builder.get_config_value(&key).as_deref(), Some(value));
+        }
+        builder.build()?;
+        Ok(())
+    }
 }
 
 #[cfg(all(test, feature = "ai"))]
