@@ -32,9 +32,9 @@ mod tests;
 
 use routing::Routing;
 
-const CHECKPOINT_SCHEMA: &str = "df-checkpoint-v1";
-const MANIFEST_SCHEMA: &str = "df-stage-manifest-v1";
-const MANIFEST_FILE: &str = "STAGE_MANIFEST.json";
+pub(crate) const CHECKPOINT_SCHEMA: &str = "df-checkpoint-v1";
+pub(crate) const MANIFEST_SCHEMA: &str = "df-stage-manifest-v1";
+pub(crate) const MANIFEST_FILE: &str = "STAGE_MANIFEST.json";
 const DATA_FILE: &str = "data.parquet";
 const DLQ_FILE: &str = "dlq.parquet";
 
@@ -74,26 +74,26 @@ pub struct AttemptArtifact {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct ArtifactFiles {
-    data_rel_path: String,
+pub(crate) struct ArtifactFiles {
+    pub(crate) data_rel_path: String,
     data_sha256: String,
-    data_bytes: u64,
-    output_rows: u64,
-    dlq_rel_path: Option<String>,
+    pub(crate) data_bytes: u64,
+    pub(crate) output_rows: u64,
+    pub(crate) dlq_rel_path: Option<String>,
     dlq_sha256: Option<String>,
-    dlq_rows: u64,
+    pub(crate) dlq_rows: u64,
     dlq_by_code: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct SplitCheckpoint {
-    schema: String,
-    plan_fingerprint: String,
-    split_fingerprint: String,
-    split_id: u64,
-    winning_attempt_id: u32,
+pub(crate) struct SplitCheckpoint {
+    pub(crate) schema: String,
+    pub(crate) plan_fingerprint: String,
+    pub(crate) split_fingerprint: String,
+    pub(crate) split_id: u64,
+    pub(crate) winning_attempt_id: u32,
     #[serde(flatten)]
-    files: ArtifactFiles,
+    pub(crate) files: ArtifactFiles,
     #[serde(default)]
     metrics: SplitMetrics,
 }
@@ -105,9 +105,9 @@ struct SplitCheckpoint {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StageManifest {
-    schema: String,
-    plan_fingerprint: String,
-    splits: Vec<SplitCheckpoint>,
+    pub(crate) schema: String,
+    pub(crate) plan_fingerprint: String,
+    pub(crate) splits: Vec<SplitCheckpoint>,
     /// Total successful rows across the winning attempts.
     pub output_rows: u64,
     /// Total failed cells written to the dead-letter queue (one row per failure).
@@ -479,37 +479,9 @@ impl ParquetSplitSink {
                 split.split_id
             );
         }
-        let files = &checkpoint.files;
-        let expected_data =
-            attempt_path(split.split_id, checkpoint.winning_attempt_id, DATA_FILE);
-        let expected_dlq =
-            attempt_path(split.split_id, checkpoint.winning_attempt_id, DLQ_FILE);
-        let valid_dlq = match (&files.dlq_rel_path, &files.dlq_sha256) {
-            (None, None) => files.dlq_rows == 0,
-            (Some(path), Some(sha256)) => {
-                files.dlq_rows > 0 && *path == expected_dlq && is_sha256(sha256)
-            }
-            _ => false,
-        };
-        let dlq_total = files.dlq_by_code.values().try_fold(0_u64, |total, rows| {
-            if *rows == 0 {
-                None
-            } else {
-                total.checked_add(*rows)
-            }
-        });
-        if files.data_rel_path != expected_data
-            || !is_sha256(&files.data_sha256)
-            || files.data_bytes == 0
-            || !valid_dlq
-            || dlq_total != Some(files.dlq_rows)
-        {
-            return exec_err!(
-                "Invalid checkpoint files or statistics for split {}",
-                split.split_id
-            );
-        }
-        Ok(())
+        checkpoint
+            .files
+            .validate(split.split_id, checkpoint.winning_attempt_id)
     }
 
     async fn read_checkpoint(&self, split: &Split) -> Result<Option<SplitCheckpoint>> {
@@ -605,10 +577,46 @@ impl ParquetSplitSink {
     }
 
     fn stage_path(&self, relative_path: &str) -> Path {
-        relative_path
-            .split('/')
-            .fold(self.stage_root.clone(), |path, part| path.join(part))
+        stage_path(&self.stage_root, relative_path)
     }
+}
+
+impl ArtifactFiles {
+    pub(crate) fn validate(&self, split_id: u64, attempt_id: u32) -> Result<()> {
+        let expected_data = attempt_path(split_id, attempt_id, DATA_FILE);
+        let expected_dlq = attempt_path(split_id, attempt_id, DLQ_FILE);
+        let valid_dlq = match (&self.dlq_rel_path, &self.dlq_sha256) {
+            (None, None) => self.dlq_rows == 0,
+            (Some(path), Some(sha256)) => {
+                self.dlq_rows > 0 && *path == expected_dlq && is_sha256(sha256)
+            }
+            _ => false,
+        };
+        let dlq_total = self.dlq_by_code.values().try_fold(0_u64, |total, rows| {
+            if *rows == 0 {
+                None
+            } else {
+                total.checked_add(*rows)
+            }
+        });
+        if self.data_rel_path != expected_data
+            || !is_sha256(&self.data_sha256)
+            || self.data_bytes == 0
+            || !valid_dlq
+            || dlq_total != Some(self.dlq_rows)
+        {
+            return exec_err!(
+                "Invalid checkpoint files or statistics for split {split_id}"
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn stage_path(stage_root: &Path, relative_path: &str) -> Path {
+    relative_path
+        .split('/')
+        .fold(stage_root.clone(), |path, part| path.join(part))
 }
 
 fn validate_inventory(splits: &[Split]) -> Result<()> {
@@ -654,7 +662,7 @@ fn checksum(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn is_sha256(text: &str) -> bool {
+pub(crate) fn is_sha256(text: &str) -> bool {
     text.len() == 64
         && text
             .bytes()
