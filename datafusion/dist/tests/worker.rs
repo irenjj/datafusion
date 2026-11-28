@@ -20,6 +20,9 @@ use tempfile::tempdir;
 #[path = "worker/ai.rs"]
 mod ai;
 
+#[path = "worker/serve.rs"]
+mod serve;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn worker() -> Command {
